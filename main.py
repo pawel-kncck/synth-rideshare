@@ -27,72 +27,69 @@ class ScheduledEvent:
             self.owner.pending_events.discard(self)
 
 
-class DriverSession:
-    states = ("online", "waiting for order", "considering order", "driving to pickup",
-              "waiting for rider", "driving with rider", "offline")
+class Session:
+    """State and lifecycle shared by driver and rider sessions."""
 
-    def __init__(self, driver, location):
-        self.driver = driver
+    registry = None
+
+    def __init__(self, actor, location):
+        self.actor = actor
+        self.simulation = actor.simulation
         self.location = location
         self.state = "online"
         self.pending_events = set()
-        self.pending_offer = None
         self.current_order = None
 
+    def go_offline(self):
+        self.simulation.end_session(self)
+
+
+class DriverSession(Session):
+    states = ("online", "waiting for order", "considering order", "driving to pickup",
+              "waiting for rider", "driving with rider", "offline")
+    registry = "active_driver_sessions"
+
+    def __init__(self, driver, location):
+        super().__init__(driver, location)
+        self.pending_offer = None
+
+    driver = property(lambda self: self.actor)
+
     def wait_for_order(self):
-        simulation = self.driver.simulation
-        _require(simulation._is_active_event_owner(self),
+        _require(self.simulation._is_active_event_owner(self),
                  "Driver session must be active in this simulation")
         _require(self.pending_offer is None and self.current_order is None,
                  "Driver cannot wait while considering or serving an order")
         self.state = "waiting for order"
 
     def accept_order(self, offer):
-        return self.driver.simulation.accept_offer(self, offer)
+        return self.simulation.accept_offer(self, offer)
 
     def reject_order(self, offer):
-        return self.driver.simulation.reject_offer(self, offer)
+        return self.simulation.reject_offer(self, offer)
 
     def arrive_at_pickup(self, order):
-        return self.driver.simulation.arrive_at_pickup(self, order)
+        return self.simulation.arrive_at_pickup(self, order)
 
     def pick_up_rider(self, order):
-        return self.driver.simulation.pick_up_rider(self, order)
+        return self.simulation.pick_up_rider(self, order)
 
     def end_ride(self, order):
-        return self.driver.simulation.end_ride(self, order)
-
-    def go_offline(self):
-        self.driver.simulation.end_driver_session(self)
+        return self.simulation.end_ride(self, order)
 
 
-class Driver:
-    def __init__(self, driver_id, simulation):
-        self.id = driver_id
-        self.simulation = simulation
-        self.session = None
-
-    def go_online(self, location):
-        session = DriverSession(self, location)
-        self.simulation.register_driver_session(session)
-        self.session = session
-        print(f"[{self.simulation.current_time:>6.0f}s] Driver {self.id} went online at {tuple(location)}")
-        return self.session
-
-
-class RiderSession:
+class RiderSession(Session):
     states = ("online", "waiting for driver acceptance", "waiting for pickup",
               "driver has arrived", "riding", "offline")
+    registry = "active_rider_sessions"
 
     def __init__(self, rider, location, destination):
-        self.rider = rider
-        self.location = location
+        super().__init__(rider, location)
         self.destination = destination
-        self.state = "online"
         self.search_result = None
-        self.current_order = None
-        self.pending_events = set()
         self.order_event = None
+
+    rider = property(lambda self: self.actor)
 
     def search(self, destination):
         """Search immediately, replace the stored snapshot, and queue the automatic order."""
@@ -100,7 +97,7 @@ class RiderSession:
         _require(self.current_order is None,
                  "Cannot search while the rider session has an active order")
         self.destination = destination
-        self.search_result = self.rider.simulation.search(self)
+        self.search_result = self.simulation.search(self)
         self._schedule_order()
         return self.search_result
 
@@ -109,10 +106,10 @@ class RiderSession:
         if self.order_event is not None:
             self.order_event.cancel()
             self.order_event = None
-        delay = self.rider.simulation.order_delay_seconds
+        delay = self.simulation.order_delay_seconds
         if delay is None or not self.search_result.drivers_available:
             return
-        self.order_event = self.rider.simulation.schedule(delay, self._order_automatically, owner=self)
+        self.order_event = self.simulation.schedule(delay, self._order_automatically, owner=self)
 
     def _order_automatically(self):
         self.order_event = None
@@ -124,28 +121,60 @@ class RiderSession:
 
     def make_order(self):
         """Order using this session's latest available search response."""
-        return self.rider.simulation.create_order(self)
-
-    def go_offline(self):
-        self.rider.simulation.end_rider_session(self)
+        return self.simulation.create_order(self)
 
 
-class Rider:
-    def __init__(self, rider_id, simulation):
-        self.id = rider_id
+class Actor:
+    """A person with a stable id who opens transient sessions."""
+
+    id_prefix = ""
+    id_range = 0
+    session_class = None
+
+    def __init__(self, actor_id, simulation):
+        self.id = actor_id
         self.simulation = simulation
         self.session = None
 
-    def start_session(self, location, destination):
-        session = RiderSession(self, location, destination)
-        self.simulation.register_rider_session(session)
+    @classmethod
+    def generate(cls, simulation, count, seed):
+        rng = random.Random(seed)
+        return [
+            cls(int(f"{cls.id_prefix}{id_}"), simulation)
+            for id_ in rng.sample(range(1, cls.id_range), count)
+        ]
+
+    def _open_session(self, *args):
+        session = self.session_class(self, *args)
+        self.simulation.register_session(session)
         self.session = session
-        print(
-            f"[{self.simulation.current_time:>6.0f}s] Rider {self.id} started a session "
+        return session
+
+
+class Driver(Actor):
+    id_prefix = "9"
+    id_range = 1_000_000_000
+    session_class = DriverSession
+
+    def go_online(self, location):
+        session = self._open_session(location)
+        self.simulation._log(f"Driver {self.id} went online at {tuple(location)}")
+        return session
+
+
+class Rider(Actor):
+    id_prefix = "8"
+    id_range = 10_000_000_000
+    session_class = RiderSession
+
+    def start_session(self, location, destination):
+        session = self._open_session(location, destination)
+        self.simulation._log(
+            f"Rider {self.id} started a session "
             f"at {tuple(location)} heading to {tuple(destination)}"
         )
         session.search(destination)
-        return self.session
+        return session
 
 
 @dataclass(frozen=True)
@@ -167,7 +196,7 @@ class Order:
 
     def __init__(self, order_id, rider_session):
         self.id = order_id
-        self.simulation = rider_session.rider.simulation
+        self.simulation = rider_session.simulation
         self.rider_session = rider_session
         self.rider = rider_session.rider
         self.driver_session = None
@@ -179,11 +208,11 @@ class Order:
         self.price = quote.price
         self.created_at = self.simulation.current_time
         self.state = "searching for a driver"
-        self.cancellation_reason = None
         self.pending_events = set()
-        self.pending_offer = None
         self.offers = []
         self.attempted_driver_ids = set()
+        self.cancellation_reason = None
+        self.pending_offer = None
         self.accepted_at = None
         self.pickup_arrived_at = None
         self.boarded_at = None
@@ -208,38 +237,32 @@ class Offer:
         self.pending_events = set()
 
 
-def generate_drivers(simulation, count=10, seed=0):
-    rng = random.Random(seed)
-    return [
-        Driver(int(f"9{id_}"), simulation)
-        for id_ in rng.sample(range(1, 1_000_000_000), count)
-    ]
-
-
-def generate_riders(simulation, count=100, seed=0):
-    rng = random.Random(seed)
-    return [
-        Rider(int(f"8{id_}"), simulation)
-        for id_ in rng.sample(range(1, 10_000_000_000), count)
-    ]
-
-
 class Simulation:
     offer_timeout_seconds = 10
     max_offers_per_order = 5
 
+    # order state -> (rider state, driver state) for each stage of an accepted ride
+    ride_stages = {
+        "driver driving to pickup": ("waiting for pickup", "driving to pickup"),
+        "driver waiting for rider": ("driver has arrived", "waiting for rider"),
+        "driving with rider": ("riding", "driving with rider"),
+    }
+
     def __init__(self, driver_count=10, rider_count=100, seed=0, speed_kmh=30,
                  base_fare=2.0, price_per_km=1.5, boarding_delay_seconds=30,
                  order_delay_seconds=None, accept_delay_seconds=None):
+        def valid_delay(value, optional):
+            return (value is None and optional) or (
+                value is not None and math.isfinite(value) and value >= 0
+            )
+
         _require(speed_kmh > 0, "Driving speed must be positive")
         _require(base_fare >= 0 and price_per_km >= 0, "Fare values cannot be negative")
-        _require(math.isfinite(boarding_delay_seconds) and boarding_delay_seconds >= 0,
+        _require(valid_delay(boarding_delay_seconds, False),
                  "Boarding delay must be finite and nonnegative")
-        _require(order_delay_seconds is None
-                 or (math.isfinite(order_delay_seconds) and order_delay_seconds >= 0),
+        _require(valid_delay(order_delay_seconds, True),
                  "Order delay must be None or finite and nonnegative")
-        _require(accept_delay_seconds is None
-                 or (math.isfinite(accept_delay_seconds) and accept_delay_seconds >= 0),
+        _require(valid_delay(accept_delay_seconds, True),
                  "Accept delay must be None or finite and nonnegative")
 
         self.speed_kmh = speed_kmh
@@ -250,8 +273,8 @@ class Simulation:
         self.order_delay_seconds = order_delay_seconds
         # None leaves offers to the caller; a number accepts that long after each offer.
         self.accept_delay_seconds = accept_delay_seconds
-        self.drivers = generate_drivers(self, driver_count, seed)
-        self.riders = generate_riders(self, rider_count, seed)
+        self.drivers = Driver.generate(self, driver_count, seed)
+        self.riders = Rider.generate(self, rider_count, seed)
         self.active_driver_sessions = {}
         self.active_rider_sessions = {}
         self.active_orders = []
@@ -263,6 +286,9 @@ class Simulation:
         self._event_sequence = itertools.count()
         self._order_sequence = itertools.count(1)
         self._offer_sequence = itertools.count(1)
+
+    def _log(self, message):
+        print(f"[{self.current_time:>6.0f}s] {message}")
 
     def calculate_duration(self, distance_km):
         """Return travel duration in simulated seconds."""
@@ -290,17 +316,12 @@ class Simulation:
             ),
             default=None,
         )
-        eta_seconds = (
-            self.calculate_duration(pickup_distance_km)
-            if pickup_distance_km is not None
-            else None
-        )
-
         return SearchResult(
             distance_km=distance_km,
             duration_seconds=self.calculate_duration(distance_km),
             price=self.calculate_price(distance_km),
-            eta_seconds=eta_seconds,
+            eta_seconds=None if pickup_distance_km is None
+            else self.calculate_duration(pickup_distance_km),
             drivers_available=pickup_distance_km is not None,
         )
 
@@ -319,8 +340,8 @@ class Simulation:
         order = Order(next(self._order_sequence), rider_session)
         rider_session.current_order = order
         self.active_orders.append(order)
-        print(
-            f"[{self.current_time:>6.0f}s] Order {order.id} created by rider {order.rider.id}: "
+        self._log(
+            f"Order {order.id} created by rider {order.rider.id}: "
             f"{order.pickup_location} to {order.destination}, "
             f"{order.distance_km:.1f} km, price {order.price:.2f}"
         )
@@ -342,22 +363,20 @@ class Simulation:
         ):
             return order
 
-        if len(order.attempted_driver_ids) >= self.max_offers_per_order:
-            self.finalize_order(order, "canceled", "no drivers accepted")
-            return order
-
-        driver_session = min(
-            (
-                session
-                for session in self.active_driver_sessions.values()
-                if self._driver_is_eligible(session)
-                and session.driver.id not in order.attempted_driver_ids
-            ),
-            key=lambda session: (
-                math.dist(order.pickup_location, session.location), session.driver.id
-            ),
-            default=None,
-        )
+        driver_session = None
+        if len(order.attempted_driver_ids) < self.max_offers_per_order:
+            driver_session = min(
+                (
+                    session
+                    for session in self.active_driver_sessions.values()
+                    if self._driver_is_eligible(session)
+                    and session.driver.id not in order.attempted_driver_ids
+                ),
+                key=lambda session: (
+                    math.dist(order.pickup_location, session.location), session.driver.id
+                ),
+                default=None,
+            )
         if driver_session is None:
             self.finalize_order(order, "canceled", "no drivers accepted")
             return order
@@ -425,15 +444,21 @@ class Simulation:
             if self._is_active_event_owner(driver) and driver.current_order is None:
                 driver.state = "waiting for order"
 
-    def accept_offer(self, driver_session, offer):
-        """Accept this exact current offer strictly before its deadline."""
+    def _respond_to_offer(self, driver_session, offer, state):
+        """Resolve this exact current offer strictly before its deadline."""
         if (
             not self._is_current_offer(offer)
             or offer.driver_session is not driver_session
             or self.current_time >= offer.expires_at
         ):
             return False
-        self._resolve_offer(offer, "accepted")
+        self._resolve_offer(offer, state)
+        return True
+
+    def accept_offer(self, driver_session, offer):
+        """Accept this exact current offer strictly before its deadline."""
+        if not self._respond_to_offer(driver_session, offer, "accepted"):
+            return False
         order = offer.order
         order.driver_session = driver_session
         order.accepted_at = self.current_time
@@ -444,8 +469,8 @@ class Simulation:
         pickup_duration = self.calculate_duration(
             math.dist(driver_session.location, order.pickup_location)
         )
-        print(
-            f"[{self.current_time:>6.0f}s] Driver {driver_session.driver.id} accepted order {order.id} "
+        self._log(
+            f"Driver {driver_session.driver.id} accepted order {order.id} "
             f"from {driver_session.location}, pickup in {pickup_duration:.0f}s"
         )
         self._schedule_ride_action(
@@ -454,13 +479,8 @@ class Simulation:
         return True
 
     def reject_offer(self, driver_session, offer):
-        if (
-            not self._is_current_offer(offer)
-            or offer.driver_session is not driver_session
-            or self.current_time >= offer.expires_at
-        ):
+        if not self._respond_to_offer(driver_session, offer, "rejected"):
             return False
-        self._resolve_offer(offer, "rejected")
         self.dispatch_order(offer.order)
         return True
 
@@ -478,13 +498,13 @@ class Simulation:
         order.ride_event_at = self.current_time + delay_seconds
         order.ride_event = self.schedule(delay_seconds, callback, owner=order)
 
-    def _is_current_ride(self, driver_session, order, order_state, rider_state, driver_state):
+    def _is_current_ride(self, driver_session, order, order_state):
         """Guard direct actions as well as callbacks against early or stale transitions."""
+        rider_state, driver_state = self.ride_stages[order_state]
         return (
             isinstance(order, Order)
             and order.simulation is self
-            and order.driver_session is driver_session
-            and driver_session is not None
+            and order.driver_session is driver_session is not None
             and driver_session.current_order is order
             and order.pending_offer is None
             and driver_session.pending_offer is None
@@ -499,19 +519,15 @@ class Simulation:
 
     def arrive_at_pickup(self, driver_session, order):
         """Move the assigned driver to pickup when the scheduled travel is due."""
-        if not self._is_current_ride(
-            driver_session, order,
-            "driver driving to pickup", "waiting for pickup", "driving to pickup",
-        ):
+        if not self._is_current_ride(driver_session, order, "driver driving to pickup"):
             return False
         driver_session.location = order.pickup_location
         order.pickup_arrived_at = self.current_time
-        order.state = "driver waiting for rider"
-        order.rider_session.state = "driver has arrived"
-        driver_session.state = "waiting for rider"
-        print(
-            f"[{self.current_time:>6.0f}s] Driver {driver_session.driver.id} arrived at pickup "
-            f"{order.pickup_location} for order {order.id}, waiting {self.boarding_delay_seconds:.0f}s"
+        self._enter_ride_stage(order, "driver waiting for rider")
+        self._log(
+            f"Driver {driver_session.driver.id} arrived at pickup "
+            f"{order.pickup_location} for order {order.id}, "
+            f"waiting {self.boarding_delay_seconds:.0f}s"
         )
         self._schedule_ride_action(
             order, self.boarding_delay_seconds, lambda: driver_session.pick_up_rider(order)
@@ -520,17 +536,12 @@ class Simulation:
 
     def pick_up_rider(self, driver_session, order):
         """Board the rider after the deterministic waiting period."""
-        if not self._is_current_ride(
-            driver_session, order,
-            "driver waiting for rider", "driver has arrived", "waiting for rider",
-        ):
+        if not self._is_current_ride(driver_session, order, "driver waiting for rider"):
             return False
         order.boarded_at = self.current_time
-        order.state = "driving with rider"
-        order.rider_session.state = "riding"
-        driver_session.state = "driving with rider"
-        print(
-            f"[{self.current_time:>6.0f}s] Rider {order.rider.id} boarded with driver "
+        self._enter_ride_stage(order, "driving with rider")
+        self._log(
+            f"Rider {order.rider.id} boarded with driver "
             f"{driver_session.driver.id} for order {order.id}, trip to {order.destination} "
             f"takes {order.duration_seconds:.0f}s"
         )
@@ -539,27 +550,31 @@ class Simulation:
         )
         return True
 
+    def _enter_ride_stage(self, order, order_state):
+        """Move the order and both sessions into the next stage of an accepted ride."""
+        order.state = order_state
+        order.rider_session.state, order.driver_session.state = self.ride_stages[order_state]
+
     def end_ride(self, driver_session, order):
         """Complete the trip, end the rider session, and keep the driver available."""
-        if not self._is_current_ride(
-            driver_session, order, "driving with rider", "riding", "driving with rider",
-        ):
+        if not self._is_current_ride(driver_session, order, "driving with rider"):
             return False
         driver_session.location = order.destination
         order.rider_session.location = order.destination
         self.finalize_order(order, "completed")
-        print(
-            f"[{self.current_time:>6.0f}s] Order {order.id} completed: rider {order.rider.id} "
+        self._log(
+            f"Order {order.id} completed: rider {order.rider.id} "
             f"dropped off at {order.destination} by driver {driver_session.driver.id}, "
             f"{self.current_time - order.created_at:.0f}s after ordering, fare {order.price:.2f}"
         )
-        self.end_rider_session(order.rider_session)
+        self.end_session(order.rider_session)
         return True
 
     def finalize_order(self, order, state, cancellation_reason=None):
         """Archive once; physical ride completion is coordinated by end_ride()."""
         _require(order.simulation is self, "Order belongs to another simulation")
-        _require(state in Order.terminal_states, "Final order state must be completed or canceled")
+        _require(state in Order.terminal_states,
+                 "Final order state must be completed or canceled")
         if order.state in Order.terminal_states:
             return order
         _require(order in self.active_orders, "Order must be active in this simulation")
@@ -583,26 +598,19 @@ class Simulation:
         order.ride_event_at = None
         self.active_orders.remove(order)
         self.order_history.append(order)
-        if order.rider_session.current_order is order:
-            order.rider_session.current_order = None
-            if self._is_active_event_owner(order.rider_session):
-                order.rider_session.state = "online"
-        driver = order.driver_session
-        if driver is not None and driver.current_order is order:
-            driver.current_order = None
-            if self._is_active_event_owner(driver):
-                driver.state = "waiting for order"
+        for session, released_state in (
+            (order.rider_session, "online"), (order.driver_session, "waiting for order"),
+        ):
+            if session is not None and session.current_order is order:
+                session.current_order = None
+                if self._is_active_event_owner(session):
+                    session.state = released_state
         return order
 
     def _is_active_event_owner(self, owner):
-        if isinstance(owner, DriverSession):
+        if isinstance(owner, Session):
             return (
-                self.active_driver_sessions.get(owner.driver.id) is owner
-                and owner.state != "offline"
-            )
-        if isinstance(owner, RiderSession):
-            return (
-                self.active_rider_sessions.get(owner.rider.id) is owner
+                getattr(self, owner.registry).get(owner.actor.id) is owner
                 and owner.state != "offline"
             )
         if isinstance(owner, Order):
@@ -631,12 +639,13 @@ class Simulation:
         _require(owner is None or self._is_active_event_owner(owner),
                  "Event owner must be active in this simulation")
 
-        execution_time = self.current_time + delay_seconds
-        sequence = next(self._event_sequence)
         event = ScheduledEvent(callback, owner)
         if owner is not None:
             owner.pending_events.add(event)
-        heapq.heappush(self._events, (execution_time, sequence, event))
+        heapq.heappush(
+            self._events,
+            (self.current_time + delay_seconds, next(self._event_sequence), event),
+        )
         return event
 
     def advance_to(self, target_time):
@@ -656,49 +665,52 @@ class Simulation:
 
         self.current_time = target_time
 
-    def register_driver_session(self, session):
-        driver = session.driver
-        _require(driver.simulation is self, "Driver belongs to another simulation")
-        _require(driver.id not in self.active_driver_sessions,
-                 "Driver already has an active session")
-        self.active_driver_sessions[driver.id] = session
+    def register_session(self, session):
+        """Track a newly opened driver or rider session by its actor id."""
+        actor = session.actor
+        role = "Driver" if isinstance(session, DriverSession) else "Rider"
+        _require(actor.simulation is self, f"{role} belongs to another simulation")
+        active = getattr(self, session.registry)
+        _require(actor.id not in active, f"{role} already has an active session")
+        active[actor.id] = session
 
-    def register_rider_session(self, session):
-        rider = session.rider
-        _require(rider.simulation is self, "Rider belongs to another simulation")
-        _require(rider.id not in self.active_rider_sessions,
-                 "Rider already has an active session")
-        self.active_rider_sessions[rider.id] = session
+    register_driver_session = register_session
+    register_rider_session = register_session
 
-    def end_driver_session(self, session):
-        driver = session.driver
-        if self.active_driver_sessions.get(driver.id) is not session:
+    def end_session(self, session):
+        """Archive a session, canceling its work and releasing any pending offer."""
+        active = getattr(self, session.registry)
+        actor = session.actor
+        if active.get(actor.id) is not session:
             return
-        _require(session.current_order is None,
-                 "Cannot end a driver session during an accepted ride")
-        offer = session.pending_offer
+        offer = None
+        if isinstance(session, DriverSession):
+            _require(session.current_order is None,
+                     "Cannot end a driver session during an accepted ride")
+            offer = session.pending_offer
+        else:
+            _require(
+                session.current_order is None or session.current_order.driver_session is None,
+                "Cannot end a rider session during an accepted ride",
+            )
+            if session.current_order is not None:
+                self.finalize_order(session.current_order, "canceled", "rider ended session")
         self._cancel_pending_events(session)
         session.state = "offline"
-        del self.active_driver_sessions[driver.id]
-        driver.session = None
-        self.driver_session_history.append(session)
+        del active[actor.id]
+        actor.session = None
+        history = (
+            self.driver_session_history
+            if isinstance(session, DriverSession)
+            else self.rider_session_history
+        )
+        history.append(session)
         if offer is not None:
             self._resolve_offer(offer, "canceled")
             self.dispatch_order(offer.order)
 
-    def end_rider_session(self, session):
-        rider = session.rider
-        if self.active_rider_sessions.get(rider.id) is not session:
-            return
-        _require(session.current_order is None or session.current_order.driver_session is None,
-                 "Cannot end a rider session during an accepted ride")
-        if session.current_order is not None:
-            self.finalize_order(session.current_order, "canceled", "rider ended session")
-        self._cancel_pending_events(session)
-        session.state = "offline"
-        del self.active_rider_sessions[rider.id]
-        rider.session = None
-        self.rider_session_history.append(session)
+    end_driver_session = end_session
+    end_rider_session = end_session
 
     def run(self, start=6, end=23, seconds_per_hour=1):
         end_time = (end - start) * 3600
