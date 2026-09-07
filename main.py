@@ -3,7 +3,7 @@ import itertools
 import math
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -19,6 +19,18 @@ def _point(value, name):
     return point
 
 
+@dataclass(frozen=True)
+class SearchResult:
+    """Trip details and driver availability at the instant of a search."""
+
+    distance_km: float
+    duration_seconds: float
+    price: float
+    eta_seconds: Optional[float]
+    drivers_available: bool
+
+
+@dataclass(eq=False)
 class DriverSession:
     """A driver's time online. Its state follows the offer or order it holds."""
 
@@ -28,14 +40,13 @@ class DriverSession:
         "driving with rider": "driving with rider",
     }
 
-    def __init__(self, driver_id, location, started_at):
-        self.driver_id = driver_id
-        self.location = location
-        self.started_at = started_at
-        self.ended_at = None
-        self.pending_order = None  # order whose offer the driver is considering
-        self.current_order = None
-        self.shift_over = False  # set when the shift ends during a ride
+    driver_id: int
+    location: tuple
+    started_at: float
+    ended_at: Optional[float] = None
+    pending_order: Optional["Order"] = None  # order whose offer the driver is considering
+    current_order: Optional["Order"] = None
+    shift_over: bool = False  # set when the shift ends during a ride
 
     @property
     def state(self):
@@ -48,6 +59,7 @@ class DriverSession:
         return self.ride_states[self.current_order.state]
 
 
+@dataclass(eq=False)
 class RiderSession:
     """A rider's request for one trip. Its state follows the order it holds."""
 
@@ -59,15 +71,14 @@ class RiderSession:
         "driving with rider": "riding",
     }
 
-    def __init__(self, rider_id, location, destination, started_at):
-        self.rider_id = rider_id
-        self.location = location
-        self.destination = destination
-        self.started_at = started_at
-        self.ended_at = None
-        self.exit_reason = None
-        self.search_result = None
-        self.current_order = None
+    rider_id: int
+    location: tuple
+    destination: tuple
+    started_at: float
+    ended_at: Optional[float] = None
+    exit_reason: Optional[str] = None
+    search_result: Optional[SearchResult] = None
+    current_order: Optional["Order"] = None
 
     @property
     def state(self):
@@ -78,43 +89,28 @@ class RiderSession:
         return self.order_states[self.current_order.state]
 
 
-@dataclass(frozen=True)
-class SearchResult:
-    """Trip details and driver availability at the instant of a search."""
-
-    distance_km: float
-    duration_seconds: float
-    price: float
-    eta_seconds: Optional[float]
-    drivers_available: bool
-
-
+@dataclass(eq=False)
 class Order:
-    terminal_states = ("completed", "canceled")
-    states = (
-        "searching for a driver",
-        "waiting for driver to accept",
-        "driver driving to pickup",
-        "driver waiting for rider",
-        "driving with rider",
-    ) + terminal_states
+    """One trip request, from the accepted quote to completion or cancellation.
 
-    def __init__(self, order_id, rider_session):
-        self.id = order_id
-        self.rider_session = rider_session
-        self.rider_id = rider_session.rider_id
-        self.driver_session = None
-        self.pickup_location = rider_session.location
-        self.destination = rider_session.destination
-        quote = rider_session.search_result
-        self.distance_km = quote.distance_km
-        self.duration_seconds = quote.duration_seconds
-        self.price = quote.price
-        self.state = None
-        self.timeline = {}  # first time each state was entered
-        self.cancellation_reason = None
-        self.pending_offer = None
-        self.offers = []
+    States: searching for a driver, waiting for driver to accept, driver
+    driving to pickup, driver waiting for rider, driving with rider, then
+    completed or canceled.
+    """
+
+    terminal_states = ("completed", "canceled")
+
+    id: int
+    rider_session: RiderSession
+    pickup_location: tuple
+    destination: tuple
+    quote: SearchResult
+    driver_session: Optional[DriverSession] = None
+    state: Optional[str] = None
+    timeline: dict = field(default_factory=dict)  # first time each state was entered
+    cancellation_reason: Optional[str] = None
+    pending_offer: Optional["Offer"] = None
+    offers: list = field(default_factory=list)
 
 
 @dataclass
@@ -412,14 +408,17 @@ class Simulation:
         order.timeline.setdefault(state, self.current_time)
 
     def _create_order(self, session):
-        order = Order(next(self._order_sequence), session)
+        order = Order(
+            next(self._order_sequence), session,
+            session.location, session.destination, session.search_result,
+        )
         self._set_state(order, "searching for a driver")
         session.current_order = order
         self.active_orders.append(order)
         self._log(
-            f"Order {order.id} created by rider {order.rider_id}: "
+            f"Order {order.id} created by rider {session.rider_id}: "
             f"{order.pickup_location} to {order.destination}, "
-            f"{order.distance_km:.1f} km, price {order.price:.2f}"
+            f"{order.quote.distance_km:.1f} km, price {order.quote.price:.2f}"
         )
         self._dispatch_order(order)
 
@@ -467,7 +466,10 @@ class Simulation:
     def _abandon_order(self, order):
         """Cancel an order no driver accepted; the rider gives up and leaves."""
         self._finalize_order(order, "canceled", "no drivers accepted")
-        self._log(f"Order {order.id} canceled: no drivers accepted; rider {order.rider_id} left")
+        self._log(
+            f"Order {order.id} canceled: no drivers accepted; "
+            f"rider {order.rider_session.rider_id} left"
+        )
         self._end_rider_session(order.rider_session, "no drivers accepted")
 
     def _resolve_offer(self, order, state):
@@ -535,10 +537,11 @@ class Simulation:
         driver_session = order.driver_session
         self._set_state(order, "driving with rider")
         self._log(
-            f"Rider {order.rider_id} boarded with driver {driver_session.driver_id} "
-            f"for order {order.id}, trip to {order.destination} takes {order.duration_seconds:.0f}s"
+            f"Rider {order.rider_session.rider_id} boarded with driver {driver_session.driver_id} "
+            f"for order {order.id}, trip to {order.destination} "
+            f"takes {order.quote.duration_seconds:.0f}s"
         )
-        self._schedule(order.duration_seconds, lambda: self._end_ride(order))
+        self._schedule(order.quote.duration_seconds, lambda: self._end_ride(order))
 
     def _end_ride(self, order):
         """Complete the trip, end the rider session, and free or release the driver."""
@@ -548,10 +551,10 @@ class Simulation:
         driver_session.location = order.destination
         order.rider_session.location = order.destination
         self._log(
-            f"Order {order.id} completed: rider {order.rider_id} dropped off at "
+            f"Order {order.id} completed: rider {order.rider_session.rider_id} dropped off at "
             f"{order.destination} by driver {driver_session.driver_id}, "
             f"{self.current_time - order.timeline['searching for a driver']:.0f}s after ordering, "
-            f"fare {order.price:.2f}"
+            f"fare {order.quote.price:.2f}"
         )
         self._finalize_order(order, "completed")
         self._end_rider_session(order.rider_session, "trip completed")
