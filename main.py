@@ -7,6 +7,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 
+def _require(condition, message, exception=ValueError):
+    """Raise `exception(message)` unless `condition` holds."""
+    if not condition:
+        raise exception(message)
+
+
 class ScheduledEvent:
     """Handle for one queued callback; cancellation is safe to repeat."""
 
@@ -22,15 +28,8 @@ class ScheduledEvent:
 
 
 class DriverSession:
-    states = (
-        "online",
-        "waiting for order",
-        "considering order",
-        "driving to pickup",
-        "waiting for rider",
-        "driving with rider",
-        "offline",
-    )
+    states = ("online", "waiting for order", "considering order", "driving to pickup",
+              "waiting for rider", "driving with rider", "offline")
 
     def __init__(self, driver, location):
         self.driver = driver
@@ -42,10 +41,10 @@ class DriverSession:
 
     def wait_for_order(self):
         simulation = self.driver.simulation
-        if not simulation._is_active_event_owner(self):
-            raise ValueError("Driver session must be active in this simulation")
-        if self.pending_offer is not None or self.current_order is not None:
-            raise ValueError("Driver cannot wait while considering or serving an order")
+        _require(simulation._is_active_event_owner(self),
+                 "Driver session must be active in this simulation")
+        _require(self.pending_offer is None and self.current_order is None,
+                 "Driver cannot wait while considering or serving an order")
         self.state = "waiting for order"
 
     def accept_order(self, offer):
@@ -82,14 +81,8 @@ class Driver:
 
 
 class RiderSession:
-    states = (
-        "online",
-        "waiting for driver acceptance",
-        "waiting for pickup",
-        "driver has arrived",
-        "riding",
-        "offline",
-    )
+    states = ("online", "waiting for driver acceptance", "waiting for pickup",
+              "driver has arrived", "riding", "offline")
 
     def __init__(self, rider, location, destination):
         self.rider = rider
@@ -103,10 +96,9 @@ class RiderSession:
 
     def search(self, destination):
         """Search immediately, replace the stored snapshot, and queue the automatic order."""
-        if self.state == "offline":
-            raise ValueError("Cannot search after the rider session has ended")
-        if self.current_order is not None:
-            raise ValueError("Cannot search while the rider session has an active order")
+        _require(self.state != "offline", "Cannot search after the rider session has ended")
+        _require(self.current_order is None,
+                 "Cannot search while the rider session has an active order")
         self.destination = destination
         self.search_result = self.rider.simulation.search(self)
         self._schedule_order()
@@ -169,13 +161,9 @@ class SearchResult:
 
 class Order:
     terminal_states = ("completed", "canceled")
-    states = (
-        "searching for a driver",
-        "waiting for driver to accept",
-        "driver driving to pickup",
-        "driver waiting for rider",
-        "driving with rider",
-    ) + terminal_states
+    states = ("searching for a driver", "waiting for driver to accept",
+              "driver driving to pickup", "driver waiting for rider",
+              "driving with rider") + terminal_states
 
     def __init__(self, order_id, rider_session):
         self.id = order_id
@@ -206,8 +194,6 @@ class Order:
 
 
 class Offer:
-    states = ("pending", "accepted", "rejected", "expired", "canceled")
-
     def __init__(self, offer_id, order, driver_session, created_at, expires_at):
         self.id = offer_id
         self.order = order
@@ -242,32 +228,19 @@ class Simulation:
     offer_timeout_seconds = 10
     max_offers_per_order = 5
 
-    def __init__(
-        self,
-        driver_count=10,
-        rider_count=100,
-        seed=0,
-        speed_kmh=30,
-        base_fare=2.0,
-        price_per_km=1.5,
-        boarding_delay_seconds=30,
-        order_delay_seconds=None,
-        accept_delay_seconds=None,
-    ):
-        if speed_kmh <= 0:
-            raise ValueError("Driving speed must be positive")
-        if base_fare < 0 or price_per_km < 0:
-            raise ValueError("Fare values cannot be negative")
-        if not math.isfinite(boarding_delay_seconds) or boarding_delay_seconds < 0:
-            raise ValueError("Boarding delay must be finite and nonnegative")
-        if order_delay_seconds is not None and (
-            not math.isfinite(order_delay_seconds) or order_delay_seconds < 0
-        ):
-            raise ValueError("Order delay must be None or finite and nonnegative")
-        if accept_delay_seconds is not None and (
-            not math.isfinite(accept_delay_seconds) or accept_delay_seconds < 0
-        ):
-            raise ValueError("Accept delay must be None or finite and nonnegative")
+    def __init__(self, driver_count=10, rider_count=100, seed=0, speed_kmh=30,
+                 base_fare=2.0, price_per_km=1.5, boarding_delay_seconds=30,
+                 order_delay_seconds=None, accept_delay_seconds=None):
+        _require(speed_kmh > 0, "Driving speed must be positive")
+        _require(base_fare >= 0 and price_per_km >= 0, "Fare values cannot be negative")
+        _require(math.isfinite(boarding_delay_seconds) and boarding_delay_seconds >= 0,
+                 "Boarding delay must be finite and nonnegative")
+        _require(order_delay_seconds is None
+                 or (math.isfinite(order_delay_seconds) and order_delay_seconds >= 0),
+                 "Order delay must be None or finite and nonnegative")
+        _require(accept_delay_seconds is None
+                 or (math.isfinite(accept_delay_seconds) and accept_delay_seconds >= 0),
+                 "Accept delay must be None or finite and nonnegative")
 
         self.speed_kmh = speed_kmh
         self.base_fare = base_fare
@@ -293,22 +266,20 @@ class Simulation:
 
     def calculate_duration(self, distance_km):
         """Return travel duration in simulated seconds."""
-        if distance_km < 0:
-            raise ValueError("Distance cannot be negative")
+        _require(distance_km >= 0, "Distance cannot be negative")
         return distance_km / self.speed_kmh * 3600
 
     def calculate_price(self, distance_km):
         """Return the base fare plus the distance charge."""
-        if distance_km < 0:
-            raise ValueError("Distance cannot be negative")
+        _require(distance_km >= 0, "Distance cannot be negative")
         return self.base_fare + distance_km * self.price_per_km
 
     def search(self, rider_session):
         """Return an immediate quote without reserving drivers or creating orders."""
-        if self.active_rider_sessions.get(rider_session.rider.id) is not rider_session:
-            raise ValueError("Rider session must be active in this simulation")
-        if rider_session.current_order is not None:
-            raise ValueError("Cannot search while the rider session has an active order")
+        _require(self.active_rider_sessions.get(rider_session.rider.id) is rider_session,
+                 "Rider session must be active in this simulation")
+        _require(rider_session.current_order is None,
+                 "Cannot search while the rider session has an active order")
 
         distance_km = math.dist(rider_session.location, rider_session.destination)
         pickup_distance_km = min(
@@ -335,16 +306,15 @@ class Simulation:
 
     def create_order(self, rider_session):
         """Register the accepted quote, then check current dispatch availability."""
-        if (
-            self.active_rider_sessions.get(rider_session.rider.id) is not rider_session
-            or rider_session.state == "offline"
-        ):
-            raise ValueError("Rider session must be active in this simulation")
-        if rider_session.current_order is not None:
-            raise ValueError("Rider session already has an active order")
+        _require(
+            self.active_rider_sessions.get(rider_session.rider.id) is rider_session
+            and rider_session.state != "offline",
+            "Rider session must be active in this simulation",
+        )
+        _require(rider_session.current_order is None, "Rider session already has an active order")
         quote = rider_session.search_result
-        if quote is None or not quote.drivers_available:
-            raise ValueError("Search with available drivers is required before ordering")
+        _require(quote is not None and quote.drivers_available,
+                 "Search with available drivers is required before ordering")
 
         order = Order(next(self._order_sequence), rider_session)
         rider_session.current_order = order
@@ -359,14 +329,12 @@ class Simulation:
 
     def dispatch_order(self, order):
         """Offer to the nearest untried eligible driver, up to five total offers."""
-        if order.simulation is not self:
-            raise ValueError("Order belongs to another simulation")
+        _require(order.simulation is self, "Order belongs to another simulation")
         if order.state in Order.terminal_states:
             return order
-        if order not in self.active_orders:
-            raise ValueError("Order must be active in this simulation")
-        if not self._is_active_event_owner(order):
-            raise ValueError("Order must belong to the current active rider session")
+        _require(order in self.active_orders, "Order must be active in this simulation")
+        _require(self._is_active_event_owner(order),
+                 "Order must belong to the current active rider session")
         if (
             order.state != "searching for a driver"
             or order.pending_offer is not None
@@ -590,18 +558,15 @@ class Simulation:
 
     def finalize_order(self, order, state, cancellation_reason=None):
         """Archive once; physical ride completion is coordinated by end_ride()."""
-        if order.simulation is not self:
-            raise ValueError("Order belongs to another simulation")
-        if state not in Order.terminal_states:
-            raise ValueError("Final order state must be completed or canceled")
+        _require(order.simulation is self, "Order belongs to another simulation")
+        _require(state in Order.terminal_states, "Final order state must be completed or canceled")
         if order.state in Order.terminal_states:
             return order
-        if order not in self.active_orders:
-            raise ValueError("Order must be active in this simulation")
-        if state == "canceled" and not cancellation_reason:
-            raise ValueError("Canceled orders require a cancellation reason")
-        if state == "completed" and cancellation_reason is not None:
-            raise ValueError("Completed orders cannot have a cancellation reason")
+        _require(order in self.active_orders, "Order must be active in this simulation")
+        _require(state != "canceled" or cancellation_reason,
+                 "Canceled orders require a cancellation reason")
+        _require(state != "completed" or cancellation_reason is None,
+                 "Completed orders cannot have a cancellation reason")
 
         if order.pending_offer is not None:
             self._resolve_offer(order.pending_offer, "canceled")
@@ -662,10 +627,9 @@ class Simulation:
 
     def schedule(self, delay_seconds, callback, *, owner=None):
         """Return a cancelable handle tied to an optional active session/order/offer."""
-        if delay_seconds < 0:
-            raise ValueError("Cannot schedule an event in the past")
-        if owner is not None and not self._is_active_event_owner(owner):
-            raise ValueError("Event owner must be active in this simulation")
+        _require(delay_seconds >= 0, "Cannot schedule an event in the past")
+        _require(owner is None or self._is_active_event_owner(owner),
+                 "Event owner must be active in this simulation")
 
         execution_time = self.current_time + delay_seconds
         sequence = next(self._event_sequence)
@@ -676,8 +640,7 @@ class Simulation:
         return event
 
     def advance_to(self, target_time):
-        if target_time < self.current_time:
-            raise ValueError("Cannot move time backwards")
+        _require(target_time >= self.current_time, "Cannot move time backwards")
 
         while self._events and self._events[0][0] <= target_time:
             execution_time, _, event = heapq.heappop(self._events)
@@ -695,26 +658,24 @@ class Simulation:
 
     def register_driver_session(self, session):
         driver = session.driver
-        if driver.simulation is not self:
-            raise ValueError("Driver belongs to another simulation")
-        if driver.id in self.active_driver_sessions:
-            raise ValueError("Driver already has an active session")
+        _require(driver.simulation is self, "Driver belongs to another simulation")
+        _require(driver.id not in self.active_driver_sessions,
+                 "Driver already has an active session")
         self.active_driver_sessions[driver.id] = session
 
     def register_rider_session(self, session):
         rider = session.rider
-        if rider.simulation is not self:
-            raise ValueError("Rider belongs to another simulation")
-        if rider.id in self.active_rider_sessions:
-            raise ValueError("Rider already has an active session")
+        _require(rider.simulation is self, "Rider belongs to another simulation")
+        _require(rider.id not in self.active_rider_sessions,
+                 "Rider already has an active session")
         self.active_rider_sessions[rider.id] = session
 
     def end_driver_session(self, session):
         driver = session.driver
         if self.active_driver_sessions.get(driver.id) is not session:
             return
-        if session.current_order is not None:
-            raise ValueError("Cannot end a driver session during an accepted ride")
+        _require(session.current_order is None,
+                 "Cannot end a driver session during an accepted ride")
         offer = session.pending_offer
         self._cancel_pending_events(session)
         session.state = "offline"
@@ -729,8 +690,8 @@ class Simulation:
         rider = session.rider
         if self.active_rider_sessions.get(rider.id) is not session:
             return
-        if session.current_order is not None and session.current_order.driver_session is not None:
-            raise ValueError("Cannot end a rider session during an accepted ride")
+        _require(session.current_order is None or session.current_order.driver_session is None,
+                 "Cannot end a rider session during an accepted ride")
         if session.current_order is not None:
             self.finalize_order(session.current_order, "canceled", "rider ended session")
         self._cancel_pending_events(session)
@@ -741,10 +702,9 @@ class Simulation:
 
     def run(self, start=6, end=23, seconds_per_hour=1):
         end_time = (end - start) * 3600
-        if end_time < self.current_time:
-            raise ValueError("Run end time is before the current simulation time")
-        if seconds_per_hour < 0:
-            raise ValueError("Playback speed cannot be negative")
+        _require(end_time >= self.current_time,
+                 "Run end time is before the current simulation time")
+        _require(seconds_per_hour >= 0, "Playback speed cannot be negative")
 
         self.advance_to(self.current_time)
         while self.current_time < end_time:
