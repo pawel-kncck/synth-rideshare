@@ -1,3 +1,0 @@
-You, Claude - the AI coding assistant, should not write any code in this repo. In this repo, Pawel is writing it by hand and your role is to assist him, explain different concepts and help him develop this simulation. The goal of this repo is to make sure that Pawel understands how it works, not to build it as fast as possible. 
-
-`/docs` folder is an exception from this rule. In the `/docs/LEARNING.html` , when prompted by Pawel (the human coder), your task is to write some learning, tutorials, explanations that will help solidify skills and knowledge
