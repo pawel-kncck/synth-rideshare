@@ -155,18 +155,6 @@ class Simulation:
         order_delay_seconds=5,
         accept_delay_seconds=3,
     ):
-        if speed_kmh <= 0:
-            raise ValueError("Driving speed must be positive")
-        if base_fare < 0 or price_per_km < 0:
-            raise ValueError("Fare values cannot be negative")
-        for name, value in (
-            ("Boarding delay", boarding_delay_seconds),
-            ("Order delay", order_delay_seconds),
-            ("Accept delay", accept_delay_seconds),
-        ):
-            if not math.isfinite(value) or value < 0:
-                raise ValueError(f"{name} must be finite and nonnegative")
-
         self.speed_kmh = speed_kmh
         self.base_fare = base_fare
         self.price_per_km = price_per_km
@@ -204,10 +192,6 @@ class Simulation:
         if driver_id not in self.drivers:
             raise ValueError(f"Unknown driver {driver_id!r}")
         location = _point(location, "Location")
-        if shift_seconds is not None and (
-            not math.isfinite(shift_seconds) or shift_seconds <= 0
-        ):
-            raise ValueError("Shift length must be None or a positive number of seconds")
         self._schedule_at(
             at_seconds, lambda: self._start_driver_session(driver_id, location, shift_seconds)
         )
@@ -243,8 +227,6 @@ class Simulation:
         end_time = (end - start) * 3600
         if end_time < self.current_time:
             raise ValueError("Run end time is before the current simulation time")
-        if seconds_per_hour < 0:
-            raise ValueError("Playback speed cannot be negative")
 
         self.advance_to(self.current_time)
         while self.current_time < end_time:
@@ -286,14 +268,10 @@ class Simulation:
 
     def calculate_duration(self, distance_km):
         """Return travel duration in simulated seconds."""
-        if distance_km < 0:
-            raise ValueError("Distance cannot be negative")
         return distance_km / self.speed_kmh * 3600
 
     def calculate_price(self, distance_km):
         """Return the base fare plus the distance charge."""
-        if distance_km < 0:
-            raise ValueError("Distance cannot be negative")
         return self.base_fare + distance_km * self.price_per_km
 
     # ----------------------------------------------------------------------
