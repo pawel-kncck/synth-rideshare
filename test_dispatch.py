@@ -428,8 +428,8 @@ class DispatchScenarios(unittest.TestCase):
             with self.subTest(action=action), self.assertRaises(ValueError):
                 action()
         for action in (drivers[0].arrive_at_pickup, drivers[0].pick_up_rider, drivers[0].end_ride):
-            with self.subTest(action=action), self.assertRaises(NotImplementedError):
-                action()
+            with self.subTest(action=action):
+                self.assertFalse(action(order))
 
         self.assertIs(drivers[0].current_order, order)
         self.assertIs(riders[0].current_order, order)

@@ -106,7 +106,7 @@ Also verify that a second rider can use that same driver session, ended sessions
 
 ## Milestone 1 implementation notes
 
-Milestones 1–3 are implemented. Milestone 4 remains pending; Phase 1 is not yet complete.
+Milestones 1–4 are implemented; Phase 1 is complete. The earlier notes below describe each milestone's implementation at the time. See the Milestone 4 notes for the final ride APIs and behavior.
 
 - `RiderSession.make_order()` delegates to `Simulation.create_order(rider_session)` and returns the new order, including an immediately canceled order if supply disappeared after search. Both creation APIs require the exact active session, a stored positive search response, and no current order. Invalid actions raise `ValueError`; an unavailable response must be replaced by another explicit search. Both search APIs reject searches during an active order, and a rejected session search preserves its destination and response.
 - `RiderSession.current_order` links to its active order. `Simulation.active_orders` and `Simulation.order_history` are lists. Order IDs start at 1 within each simulation and are never reused there.
@@ -154,4 +154,54 @@ assert order.accepted_at == 2
 assert order.state == "driver driving to pickup"
 ```
 
-Verification: `python3 -B -m unittest -v test_search test_orders test_scheduler test_dispatch` passes all 55 scenarios on Python 3.9.6. The 20 new dispatch scenarios cover nearest-driver and tie selection, reservation exclusivity, rejection and timeout retries, the strict five-offer limit, responses around the deadline in both insertion orders, session reopening, stale callbacks, and terminal cleanup. `git diff --check` passes. The completed-phase commit remains due after Milestone 4.
+Verification: `python3 -B -m unittest -v test_search test_orders test_scheduler test_dispatch` passes all 55 scenarios on Python 3.9.6. The 20 new dispatch scenarios cover nearest-driver and tie selection, reservation exclusivity, rejection and timeout retries, the strict five-offer limit, responses around the deadline in both insertion orders, session reopening, stale callbacks, and terminal cleanup. `git diff --check` passes.
+
+## Milestone 4 implementation notes and Phase 1 handoff
+
+- `Simulation(..., boarding_delay_seconds=30)` configures the deterministic wait at pickup. The delay must be finite and nonnegative. Zero pickup distance, zero boarding delay, and zero trip duration use queued events at the same simulated time, preserving scheduler insertion order.
+- Acceptance now schedules pickup travel from the accepted driver's current location to `Order.pickup_location`, using the simulation speed at acceptance. Arrival changes the driver's location to that immutable pickup snapshot. Boarding is scheduled using the configured delay at arrival, then completion uses the order's original quoted `duration_seconds`. Later speed/fare changes do not recalculate an already scheduled arrival or the accepted trip quote.
+- `DriverSession.arrive_at_pickup(order)`, `pick_up_rider(order)`, and `end_ride(order)` delegate to the matching `Simulation` methods, whose arguments are `(driver_session, order)`. Scheduled ride events invoke these same APIs automatically. Each action requires the exact order and assigned active sessions, their expected states, and a live ride action whose due time has been reached. It returns `True` when it transitions the ride, otherwise `False` without changes. Requiring an explicit order prevents old actions on a continuing driver session from operating on its next ride; checking due times also prevents direct actions from shortening scheduled travel or boarding.
+- `Order.ride_event` holds the next cancelable ride action, also tracked in `Order.pending_events`; `ride_event_at` is its due time in elapsed simulated seconds. Advancing a ride stage cancels the preceding handle. Finalization cancels all remaining order work and clears both fields. Callbacks independently check session/order identity and all three states in addition to scheduler ownership, so directly invoking a stale callback cannot change a later ride or replacement session.
+
+The final coordinated states are:
+
+| Event | Rider session | Order | Driver session |
+| --- | --- | --- | --- |
+| Offer pending | `waiting for driver acceptance` | `waiting for driver to accept` | `considering order` |
+| Driver accepts | `waiting for pickup` | `driver driving to pickup` | `driving to pickup` |
+| Driver arrives | `driver has arrived` | `driver waiting for rider` | `waiting for rider` |
+| Rider boards | `riding` | `driving with rider` | `driving with rider` |
+| Ride ends | `offline` | `completed` | `waiting for order` |
+
+- Completion moves both session locations to the order's destination, archives the order exactly once, clears both sessions' live order references, and ends/archives the rider session, canceling its remaining actions. The same driver session stays registered and available at the destination; its unrelated session-owned work remains valid. Historical orders retain their pickup/destination and quote snapshots, offer history, and original session references even when that driver serves another rider.
+- Lifecycle metrics on `Order` are `created_at`, `accepted_at`, `pickup_arrived_at`, `boarded_at`, `completed_at`, and `canceled_at`, all in elapsed simulated seconds. Unreached milestones remain `None`. Cancellation records its timestamp for dispatch exhaustion, stale-positive searches, and rider-session termination. Repeated terminal cleanup preserves the first outcome, timestamps, and reason.
+- Session-ending policies remain unchanged: a rider leaving before acceptance cancels with `"rider ended session"`; a driver leaving during an offer releases it and continues dispatch. Both participants' ordinary offline requests raise `ValueError` throughout an accepted ride. `wait_for_order()` cannot reset a serving driver.
+- Compatibility detail: `Simulation.finalize_order()` remains the low-level terminal cleanup API introduced in earlier milestones. It records the terminal timestamp and releases references/events, but does not itself move participants or end the rider session. Normal physical completion always goes through `end_ride()`, which coordinates those effects. No broader mid-ride actor cancellation policy was added.
+- Search assertions and setup already used real offers and needed no changes. The dispatch fixture now verifies that early ride actions return `False`, replacing its temporary `NotImplementedError` expectation. `run()` remains unchanged; all ride processing uses active registries and scheduled events. There are no Phase 2 behavior additions or other scope deviations.
+
+A complete deterministic ride using the public APIs:
+
+```python
+from main import Simulation
+
+simulation = Simulation(driver_count=1, rider_count=1, boarding_delay_seconds=30)
+driver = simulation.drivers[0].go_online((0, 1))
+driver.wait_for_order()
+rider = simulation.riders[0].start_session((0, 0), (3, 4))
+order = rider.make_order()
+offer = order.pending_offer
+simulation.schedule(2, lambda: driver.accept_order(offer), owner=offer)
+simulation.advance_to(752)
+
+assert (order.created_at, order.accepted_at, order.pickup_arrived_at,
+        order.boarded_at, order.completed_at) == (0, 2, 122, 152, 752)
+assert order.state == "completed" and rider.state == "offline"
+assert driver.state == "waiting for order" and driver.location == (3, 4)
+assert driver.driver.session is driver
+assert simulation.order_history == [order]
+assert simulation.rider_session_history == [rider]
+```
+
+Verification: `python3 -B -m unittest -v test_search test_orders test_scheduler test_dispatch test_rides` passes all 68 scenarios on Python 3.9.6. The 13 ride scenarios cover the concrete timeline, changed pickup estimates with preserved quotes, configurable/zero delays and zero-length trips, driver reuse, search eligibility during rides, offline rejection, early/foreign/duplicate actions, equal-time direct actions, stale callbacks and replacement-session guards, cleanup at every ride stage, preserved history, and cancellation timestamps. `git diff --check` passes.
+
+Remaining work is [Phase 2](phase-2-autonomous-simulation.md): reproducible scenario configuration, scheduled population activation, rider and driver decision policies, shift endings after rides, autonomous market/horizon integration, metrics, and measured population scaling. This handoff completes Phase 1 only; no new session is created automatically.
