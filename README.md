@@ -63,7 +63,7 @@ sim = Simulation(driver_count=2, rider_count=5, seed=0,
 sim.schedule_driver_session(0,    sim.drivers[0], (2, 2), shift_seconds=8 * 3600)
 sim.schedule_rider_session(1000,  sim.riders[0], (2, 2), (5, 8))
 
-sim.run()                            # 06:00 to 23:00, printing each lifecycle step
+sim.run(time_scale=3600)              # 06:00 to 23:00; one simulated hour per runtime second
 ```
 
 `schedule_driver_session(at, driver_id, location, shift_seconds=None)` brings
@@ -73,6 +73,28 @@ has a rider appear wanting to travel. `sim.drivers` and `sim.riders` are the
 lists of ids in the population. Scheduling a session for someone who will
 still be in one at that time raises an error when the clock gets there.
 
-`sim.run(seconds_per_hour=0)` skips the playback delay. `sim.advance_to(t)`
-jumps straight to a simulated time with no delay or output beyond the
-lifecycle prints.
+`time_scale` is the number of simulated seconds per runtime second:
+
+- `1` runs in real time.
+- Values between `0` and `1` slow playback down: `0.5` takes two runtime
+  seconds for each simulated second.
+- Values above `1` speed playback up: `60` plays one simulated minute per
+  runtime second. The default, `3600`, preserves the sample's fast playback.
+- `False` runs as fast as possible without calling `time.sleep`.
+
+Numeric zero, negative values, nonfinite values, and `True` are rejected.
+
+Every `sim.run()` creates a unique timestamped `.log` file in `logs/` under
+the current working directory. Pass `log_dir="path/to/logs"` to choose another
+directory; `sim.log_path` holds the latest log's absolute path. Lifecycle
+events go to this file. When the run reaches its end time, it prints a summary
+of simulated and runtime duration, sessions, order outcomes, riders leaving
+without a ride, completed trip distance and fares, average order-to-pickup
+wait, and the log path. The summary is also saved in the log. Failed or
+interrupted runs log the exception and do not print a completion summary.
+
+Summary activity counts cover that call to `run()`; active counts show what
+remains at its end time. Pending events and active sessions or orders are
+left in place, so a later run can continue them. `sim.advance_to(t)` jumps
+straight to a simulated time without delay; called outside `run()`, it does
+not create a log or print a summary.

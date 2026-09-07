@@ -1,9 +1,13 @@
 import heapq
 import itertools
+import logging
 import math
 import random
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Optional
 
 
@@ -155,6 +159,7 @@ class Simulation:
         order_delay_seconds=5,
         accept_delay_seconds=3,
     ):
+        self.seed = seed
         self.speed_kmh = speed_kmh
         self.base_fare = base_fare
         self.price_per_km = price_per_km
@@ -177,6 +182,11 @@ class Simulation:
         self._event_sequence = itertools.count()
         self._order_sequence = itertools.count(1)
         self._offer_sequence = itertools.count(1)
+        self.log_path = None
+        # A private logger keeps lifecycle events out of the console, even if
+        # the application using this simulator configures the root logger.
+        self._logger = logging.Logger(__name__, level=logging.INFO)
+        self._logger.propagate = False
 
     # ----------------------------------------------------------------------
     # External interface: scheduling sessions and moving the clock
@@ -222,17 +232,112 @@ class Simulation:
 
         self.current_time = target_time
 
-    def run(self, start=6, end=23, seconds_per_hour=1):
-        """Play the clock from the start hour to the end hour."""
+    def run(self, start=6, end=23, time_scale=3600, log_dir="logs"):
+        """Play the clock, write a fresh event log, and print a run summary.
+
+        time_scale is simulated seconds per runtime second: 1 is real time,
+        0.5 is half speed, and 60 plays a simulated minute in one second.
+        False skips sleeping entirely. Numeric zero is invalid.
+        """
+        if time_scale is not False and (
+            isinstance(time_scale, bool)
+            or not isinstance(time_scale, (int, float))
+            or not math.isfinite(time_scale)
+            or time_scale <= 0
+        ):
+            raise ValueError("time_scale must be a finite positive number or False")
         end_time = (end - start) * 3600
+        if not math.isfinite(end_time):
+            raise ValueError("Run duration must be finite")
         if end_time < self.current_time:
             raise ValueError("Run end time is before the current simulation time")
 
-        self.advance_to(self.current_time)
-        while self.current_time < end_time:
-            next_time = min(self.current_time + 60, end_time)
-            time.sleep((next_time - self.current_time) * seconds_per_hour / 3600)
-            self.advance_to(next_time)
+        initial_time = self.current_time
+        initial_totals = self._run_totals()
+        directory = Path(log_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        # The random suffix guarantees separate files for repeated runs,
+        # including runs started during the same second.
+        with NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory,
+            prefix=f"simulation-{datetime.now():%Y%m%d-%H%M%S}-",
+            suffix=".log", delete=False,
+        ) as log_file:
+            self.log_path = Path(log_file.name).resolve()
+            handler = logging.StreamHandler(log_file)
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            self._logger.addHandler(handler)
+            started_at = time.perf_counter()
+            try:
+                self._log(
+                    f"Run started: hours {start:g} to {end:g}, end at {end_time:g}s, "
+                    f"time_scale={time_scale}, seed={self.seed}, "
+                    f"drivers={len(self.drivers)}, riders={len(self.riders)}"
+                )
+                if time_scale is False:
+                    self.advance_to(end_time)
+                else:
+                    self.advance_to(self.current_time)
+                    while self.current_time < end_time:
+                        next_time = min(self._events[0][0], end_time) if self._events else end_time
+                        time.sleep((next_time - self.current_time) / time_scale)
+                        self.advance_to(next_time)
+
+                summary = self._run_summary(
+                    initial_totals, initial_time, time.perf_counter() - started_at, time_scale
+                )
+                self._logger.info("%s", summary)
+            except BaseException:
+                self._logger.exception("Run stopped at simulated time %gs", self.current_time)
+                raise
+            finally:
+                self._logger.removeHandler(handler)
+                handler.close()
+
+        print(summary)
+
+    def _run_totals(self):
+        return {
+            "driver_sessions": len(self.driver_session_history) + len(self.active_driver_sessions),
+            "rider_sessions": len(self.rider_session_history) + len(self.active_rider_sessions),
+            "orders": len(self.order_history) + len(self.active_orders),
+            "finished_orders": len(self.order_history),
+            "ended_rider_sessions": len(self.rider_session_history),
+        }
+
+    def _run_summary(self, initial_totals, initial_time, runtime, time_scale):
+        totals = self._run_totals()
+        finished = self.order_history[initial_totals["finished_orders"]:]
+        completed = [order for order in finished if order.state == "completed"]
+        canceled = sum(order.state == "canceled" for order in finished)
+        unserved = sum(
+            session.exit_reason in ("no drivers available", "no drivers accepted")
+            for session in self.rider_session_history[initial_totals["ended_rider_sessions"]:]
+        )
+        distance = sum(order.quote.distance_km for order in completed)
+        fares = sum(order.quote.price for order in completed)
+        pickup_waits = [
+            order.timeline["driver waiting for rider"] - order.timeline["searching for a driver"]
+            for order in completed
+        ]
+        pickup_wait = f"{sum(pickup_waits) / len(pickup_waits):.2f}s" if pickup_waits else "n/a"
+        simulated = self.current_time - initial_time
+        playback = "as fast as possible (no sleep)" if time_scale is False else f"{time_scale:g}x"
+        return "\n".join([
+            "Simulation run summary",
+            f"  Simulated: {simulated:.2f}s ({simulated / 3600:.2f}h); "
+            f"runtime: {runtime:.3f}s; speed: {playback}",
+            f"  Driver sessions: {totals['driver_sessions'] - initial_totals['driver_sessions']} started; "
+            f"{len(self.active_driver_sessions)} active at end",
+            f"  Rider sessions: {totals['rider_sessions'] - initial_totals['rider_sessions']} started; "
+            f"{len(self.active_rider_sessions)} active at end",
+            f"  Orders: {totals['orders'] - initial_totals['orders']} created; "
+            f"{len(completed)} completed; {canceled} canceled; {len(self.active_orders)} active at end",
+            f"  Riders leaving without a ride: {unserved}",
+            f"  Completed trips: {distance:.2f} km; total fares: {fares:.2f}",
+            f"  Average order-to-pickup wait (completed trips): {pickup_wait}",
+            f"  Log: {self.log_path}",
+        ])
 
     # ----------------------------------------------------------------------
     # Scheduler
@@ -260,7 +365,7 @@ class Simulation:
         )
 
     def _log(self, message):
-        print(f"[{self.current_time:>6.0f}s] {message}")
+        self._logger.info("[%6.0fs] %s", self.current_time, message)
 
     # ----------------------------------------------------------------------
     # Pricing
