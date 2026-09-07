@@ -333,9 +333,7 @@ class Simulation:
             )
         else:
             self._log(f"Rider {rider_id} quoted {quote.distance_km:.1f} km, no drivers available")
-        self._schedule(
-            self.order_delay_seconds, lambda: self._decide_on_quote(session)
-        )
+        self._schedule(self.order_delay_seconds, lambda: self._decide_on_quote(session))
 
     def _search(self, session):
         """Quote the trip and the nearest waiting driver without reserving anyone."""
@@ -402,11 +400,7 @@ class Simulation:
 
     def _dispatch_order(self, order):
         """Offer to the nearest untried waiting driver, up to the offer limit."""
-        if (
-            order.state != "searching for a driver"
-            or order.pending_offer is not None
-            or order.driver_session is not None
-        ):
+        if order.state != "searching for a driver":
             return
         if len(order.offers) >= self.max_offers_per_order:
             self._abandon_order(order)
@@ -519,8 +513,8 @@ class Simulation:
             self._log(
                 f"Order {order.id} completed: rider {rider.rider_id} dropped off at "
                 f"{order.destination} by driver {driver.driver_id}, "
-                f"{self.current_time - order.timeline['searching for a driver']:.0f}s after ordering, "
-                f"fare {order.quote.price:.2f}"
+                f"{self.current_time - order.timeline['searching for a driver']:.0f}s "
+                f"after ordering, fare {order.quote.price:.2f}"
             )
             self._finalize_order(order, "completed")
             self._end_rider_session(rider, "trip completed")

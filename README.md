@@ -66,11 +66,12 @@ sim.schedule_rider_session(1000,  sim.riders[0], (2, 2), (5, 8))
 sim.run()                            # 06:00 to 23:00, printing each lifecycle step
 ```
 
-`schedule_driver_session(at, driver, location, shift_seconds=None)` brings a
-driver online at that time; without a shift length the driver stays online
-until the run ends. `schedule_rider_session(at, rider, location, destination)`
-has a rider appear wanting to travel. Scheduling a session for someone who
-will still be in one at that time raises an error when the clock gets there.
+`schedule_driver_session(at, driver_id, location, shift_seconds=None)` brings
+a driver online at that time; without a shift length the driver stays online
+until the run ends. `schedule_rider_session(at, rider_id, location, destination)`
+has a rider appear wanting to travel. `sim.drivers` and `sim.riders` are the
+lists of ids in the population. Scheduling a session for someone who will
+still be in one at that time raises an error when the clock gets there.
 
 `sim.run(seconds_per_hour=0)` skips the playback delay. `sim.advance_to(t)`
 jumps straight to a simulated time with no delay or output beyond the
