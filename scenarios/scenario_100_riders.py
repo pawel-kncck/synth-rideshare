@@ -19,7 +19,7 @@ locations = [(x, y) for x in range(11) for y in range(11)]
 for driver_id in sim.drivers:
     sim.schedule_driver_session(0, driver_id, rng.choice(locations), shift_seconds=17 * 3600)
 
-# Each rider requests one trip between 06:00 and 22:00, leaving the last
+# Each rider searches once between 06:00 and 22:00, leaving the last
 # hour for remaining trips to finish. Pickup and destination are distinct.
 for rider_id in sim.riders:
     at_seconds = rng.randint(0, 16 * 3600)

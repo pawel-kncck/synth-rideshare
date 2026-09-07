@@ -89,6 +89,7 @@ class RunTests(unittest.TestCase):
     def test_summary_counts_outcomes_and_remaining_work(self):
         sim = Simulation(
             driver_count=1, rider_count=4, speed_kmh=3600,
+            rider_order_probability=1, driver_acceptance_probability=1,
             order_delay_seconds=1, accept_delay_seconds=1, boarding_delay_seconds=2,
         )
         sim.schedule_driver_session(0, sim.drivers[0], (0, 0), shift_seconds=10)
@@ -112,6 +113,7 @@ class RunTests(unittest.TestCase):
     def test_continuation_writes_new_log_and_counts_only_that_run(self):
         sim = Simulation(
             driver_count=1, rider_count=1, speed_kmh=3600,
+            rider_order_probability=1, driver_acceptance_probability=1,
             order_delay_seconds=1, accept_delay_seconds=1, boarding_delay_seconds=2,
         )
         sim.schedule_driver_session(0, sim.drivers[0], (0, 0))
@@ -156,7 +158,8 @@ class RunTests(unittest.TestCase):
                 self.assertEqual(sim._logger.handlers, [])
 
     def setup_driver_hours_trip(self, shift_seconds=7200):
-        sim = Simulation(driver_count=1, rider_count=1, speed_kmh=60, boarding_delay_seconds=900)
+        sim = Simulation(driver_count=1, rider_count=1, speed_kmh=60, boarding_delay_seconds=900,
+                         rider_order_probability=1, driver_acceptance_probability=1)
         sim.schedule_driver_session(0, sim.drivers[0], (0, 0), shift_seconds=shift_seconds)
         # Accepted at 1800s; pickup at 2700s; boarding at 3600s; drop-off at 5400s.
         sim.schedule_rider_session(1792, sim.riders[0], (15, 0), (45, 0))
@@ -213,7 +216,8 @@ class RunTests(unittest.TestCase):
         self.assertIn("utilization: 66.67%", self.stdout.getvalue())
 
     def test_unaccepted_offers_are_idle_time(self):
-        sim = Simulation(driver_count=1, rider_count=1, accept_delay_seconds=10)
+        sim = Simulation(driver_count=1, rider_count=1, accept_delay_seconds=10,
+                         rider_order_probability=1, driver_acceptance_probability=1)
         sim.schedule_driver_session(0, sim.drivers[0], (0, 0), shift_seconds=3600)
         sim.schedule_rider_session(0, sim.riders[0], (0, 0), (3, 0))
         self.run_simulation(sim, end_seconds=3600)

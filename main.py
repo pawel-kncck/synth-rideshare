@@ -10,7 +10,8 @@ from pathlib import Path
 from tempfile import mkdtemp
 from typing import Optional
 
-from metrics import INTERVAL_MINUTES
+from behavior import decision_probability, finite_number
+from metrics import INTERVAL_MINUTES, aggregate_intervals, summarize_intervals
 
 
 def _point(value, name):
@@ -97,6 +98,7 @@ class RiderSession:
     location: tuple
     destination: tuple
     started_at: float
+    id: int = 0
     ended_at: Optional[float] = None
     exit_reason: Optional[str] = None
     search_result: Optional[SearchResult] = None
@@ -143,8 +145,10 @@ class Offer:
     driver_session: DriverSession
     created_at: float
     expires_at: float
-    state: str = "pending"  # then accepted, expired, or canceled
+    state: str = "pending"  # then accepted, rejected, expired, or canceled
     resolved_at: Optional[float] = None
+    eta_seconds: Optional[float] = None
+    acceptance_probability: Optional[float] = None
 
 
 def generate_ids(prefix, count, upper, seed):
@@ -176,15 +180,43 @@ class Simulation:
         boarding_delay_seconds=30,
         order_delay_seconds=5,
         accept_delay_seconds=3,
+        rider_order_probability=0.55,
+        driver_acceptance_probability=0.70,
+        rider_price_sensitivity=1.0,
+        driver_price_sensitivity=1.0,
+        rider_eta_sensitivity=0.5,
+        driver_eta_sensitivity=0.5,
+        reference_price=10.0,
+        reference_eta_seconds=300,
     ):
+        for name, value in (
+            ("rider_order_probability", rider_order_probability),
+            ("driver_acceptance_probability", driver_acceptance_probability),
+        ):
+            finite_number(value, name, maximum=1)
+            setattr(self, name, value)
+        for name, value in (
+            ("rider_price_sensitivity", rider_price_sensitivity),
+            ("driver_price_sensitivity", driver_price_sensitivity),
+            ("rider_eta_sensitivity", rider_eta_sensitivity),
+            ("driver_eta_sensitivity", driver_eta_sensitivity),
+        ):
+            finite_number(value, name)
+            setattr(self, name, value)
+        for name, value in (("reference_price", reference_price),
+                            ("reference_eta_seconds", reference_eta_seconds)):
+            finite_number(value, name, strictly_positive=True)
+            setattr(self, name, value)
         self.seed = seed
+        # Behavior never consumes the scenario's or the ID generator's RNG.
+        self._decision_rng = random.Random(seed)
         self.speed_kmh = speed_kmh
         self.base_fare = base_fare
         self.price_per_km = price_per_km
         self.boarding_delay_seconds = boarding_delay_seconds
         # How long a rider thinks about a quote before ordering or leaving.
         self.order_delay_seconds = order_delay_seconds
-        # How long a driver takes to accept an offer. At or past the offer
+        # How long a driver takes to answer an offer. At or past the offer
         # timeout the offer expires first and the next driver is tried.
         self.accept_delay_seconds = accept_delay_seconds
         self.drivers = generate_ids(9, driver_count, 1_000_000_000, seed)
@@ -196,12 +228,15 @@ class Simulation:
         self.driver_session_history = []
         self.rider_session_history = []
         self.search_history = []
+        self.market_history = []
+        self.scenario_parameters = {}
         self.session_schedule = []
         self.current_time = 0
         self._events = []
         self._event_sequence = itertools.count()
         self._order_sequence = itertools.count(1)
         self._offer_sequence = itertools.count(1)
+        self._rider_session_sequence = itertools.count(1)
         self.log_path = None
         self.run_directory = None
         self.report_path = None
@@ -235,9 +270,8 @@ class Simulation:
     def schedule_rider_session(self, at_seconds, rider_id, location, destination):
         """Have a rider appear at a simulated time wanting to travel.
 
-        The rider searches immediately, then orders after the order delay if a
-        driver was available or leaves if none was. The session ends at
-        drop-off or when no driver accepts.
+        The rider searches immediately, then weighs price and pickup ETA
+        after the order delay. They may leave without placing an order.
         """
         if rider_id not in self.riders:
             raise ValueError(f"Unknown rider {rider_id!r}")
@@ -343,6 +377,7 @@ class Simulation:
             "finished_orders": len(self.order_history),
             "ended_rider_sessions": len(self.rider_session_history),
             "searches": len(self.search_history),
+            "market_events": len(self.market_history),
         }
 
     def _driver_hours(self, initial_time):
@@ -376,7 +411,7 @@ class Simulation:
         completed = [order for order in finished if order.state == "completed"]
         canceled = sum(order.state == "canceled" for order in finished)
         unserved = sum(
-            session.exit_reason in ("no drivers available", "no drivers accepted")
+            session.exit_reason in ("no drivers available", "no drivers accepted", "quote declined")
             for session in self.rider_session_history[initial_totals["ended_rider_sessions"]:]
         )
         distance = sum(order.quote.distance_km for order in completed)
@@ -393,6 +428,11 @@ class Simulation:
         searches = self.search_history[initial_totals["searches"]:]
         covered = sum(search.drivers_available for search in searches)
         coverage = f"{covered / len(searches):.2%}" if searches else "n/a"
+        market = summarize_intervals(aggregate_intervals(
+            self.market_history[initial_totals["market_events"]:], initial_time, self.current_time
+        ))
+        conversion = f"{market['session_to_order_pct']:.2f}%" if market['rider_sessions'] else "n/a"
+        acceptance = f"{market['offer_acceptance_pct']:.2f}%" if market['offers'] else "n/a"
         return "\n".join([
             "Simulation run summary",
             f"  Simulated: {simulated:.2f}s ({simulated / 3600:.2f}h); "
@@ -404,6 +444,12 @@ class Simulation:
             f"  Rider sessions: {totals['rider_sessions'] - initial_totals['rider_sessions']} started; "
             f"{len(self.active_rider_sessions)} active at end",
             f"  Search coverage: {coverage} ({covered} of {len(searches)} searches)",
+            f"  Session-to-order: {conversion} ({market['converted_sessions']} of "
+            f"{market['rider_sessions']} sessions; {market['undecided_sessions']} undecided)",
+            f"  Offer acceptance: {acceptance} ({market['accepted_offers']} of "
+            f"{market['offers']} offers; {market['rejected_offers']} rejected; "
+            f"{market['expired_offers']} expired; {market['canceled_offers']} canceled; "
+            f"{market['pending_offers']} pending)",
             f"  Orders: {totals['orders'] - initial_totals['orders']} created; "
             f"{len(completed)} completed; {canceled} canceled; {len(self.active_orders)} active at end",
             f"  Riders leaving without a ride: {unserved}",
@@ -453,6 +499,30 @@ class Simulation:
         """Return the base fare plus the distance charge."""
         return self.base_fare + distance_km * self.price_per_km
 
+    def rider_order_chance(self, quote):
+        """Probability of ordering this quote; unavailable supply always gives zero."""
+        if not quote.drivers_available or quote.eta_seconds is None:
+            return 0.0
+        return decision_probability(
+            self.rider_order_probability, quote.price, quote.eta_seconds,
+            self.reference_price, self.reference_eta_seconds,
+            -self.rider_price_sensitivity, self.rider_eta_sensitivity,
+        )
+
+    def driver_acceptance_chance(self, price, eta_seconds):
+        """Use the offered fare and this driver's own travel time to pickup."""
+        return decision_probability(
+            self.driver_acceptance_probability, price, eta_seconds,
+            self.reference_price, self.reference_eta_seconds,
+            self.driver_price_sensitivity, self.driver_eta_sensitivity,
+        )
+
+    def _draw_decision(self, probability):
+        return probability == 1 or (probability > 0 and self._decision_rng.random() < probability)
+
+    def _record_market_event(self, kind, **values):
+        self.market_history.append({"type": kind, "at_seconds": self.current_time, **values})
+
     # ----------------------------------------------------------------------
     # Driver sessions
     # ----------------------------------------------------------------------
@@ -501,8 +571,10 @@ class Simulation:
     def _start_rider_session(self, rider_id, location, destination):
         if rider_id in self.active_rider_sessions:
             raise ValueError(f"Rider {rider_id} already has an active session")
-        rider_session = RiderSession(rider_id, location, destination, self.current_time)
+        rider_session = RiderSession(rider_id, location, destination, self.current_time,
+                                     id=next(self._rider_session_sequence))
         self.active_rider_sessions[rider_id] = rider_session
+        self._record_market_event("rider_session_started", session_id=rider_session.id, rider_id=rider_id)
         self._log(f"Rider {rider_id} started a session at {location} heading to {destination}")
         rider_session.search_result = quote = self._search(rider_session)
         if quote.drivers_available:
@@ -548,11 +620,19 @@ class Simulation:
     def _decide_on_quote(self, rider_session):
         if rider_session.state != "online" or rider_session.current_order is not None:
             return
-        if rider_session.search_result.drivers_available:
+        quote = rider_session.search_result
+        probability = self.rider_order_chance(quote)
+        ordered = self._draw_decision(probability)
+        self._record_market_event(
+            "rider_decision", session_id=rider_session.id, rider_id=rider_session.rider_id,
+            ordered=ordered, probability=probability, price=quote.price, eta_seconds=quote.eta_seconds,
+        )
+        if ordered:
             self._create_order(rider_session)
         else:
-            self._log(f"Rider {rider_session.rider_id} left: no drivers available")
-            self._end_rider_session(rider_session, "no drivers available")
+            reason = "quote declined" if quote.drivers_available else "no drivers available"
+            self._log(f"Rider {rider_session.rider_id} left: {reason} (order probability {probability:.3f})")
+            self._end_rider_session(rider_session, reason)
 
     def _end_rider_session(self, rider_session, reason):
         if rider_session.state == "offline":
@@ -613,6 +693,12 @@ class Simulation:
             next(self._offer_sequence), driver_session,
             self.current_time, self.current_time + self.offer_timeout_seconds,
         )
+        offer.eta_seconds = self.calculate_duration(math.dist(driver_session.location, order.pickup_location))
+        offer.acceptance_probability = self.driver_acceptance_chance(order.quote.price, offer.eta_seconds)
+        self._record_market_event(
+            "offer_created", offer_id=offer.id, order_id=order.id, driver_id=driver_session.driver_id,
+            price=order.quote.price, eta_seconds=offer.eta_seconds, probability=offer.acceptance_probability,
+        )
         order.offers.append(offer)
         order.pending_offer = offer
         self._set_state(order, "waiting for driver to accept")
@@ -620,7 +706,7 @@ class Simulation:
         # The timeout is queued first so a response due at the same instant
         # as the deadline finds the offer already expired.
         self._schedule(self.offer_timeout_seconds, lambda: self._expire_offer(order, offer))
-        self._schedule(self.accept_delay_seconds, lambda: self._accept_offer(order, offer))
+        self._schedule(self.accept_delay_seconds, lambda: self._decide_on_offer(order, offer))
 
     def _abandon_order(self, order):
         """Cancel an order no driver accepted; the rider gives up and leaves."""
@@ -636,10 +722,22 @@ class Simulation:
         offer = order.pending_offer
         offer.state = state
         offer.resolved_at = self.current_time
+        self._record_market_event("offer_resolved", offer_id=offer.id, order_id=order.id, state=state)
         offer.driver_session.pending_order = None
         order.pending_offer = None
         if order.state == "waiting for driver to accept":
             self._set_state(order, "searching for a driver")
+
+    def _decide_on_offer(self, order, offer):
+        if order.pending_offer is not offer or self.current_time >= offer.expires_at:
+            return
+        if self._draw_decision(offer.acceptance_probability):
+            self._accept_offer(order, offer)
+        else:
+            self._log(f"Driver {offer.driver_session.driver_id} rejected offer {offer.id} "
+                      f"for order {order.id} (acceptance probability {offer.acceptance_probability:.3f})")
+            self._resolve_offer(order, "rejected")
+            self._dispatch_order(order)
 
     def _accept_offer(self, order, offer):
         if order.pending_offer is not offer or self.current_time >= offer.expires_at:

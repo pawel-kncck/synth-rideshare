@@ -5,11 +5,19 @@ locations: (x, y) pairs of finite kilometres
 clock: cannot move backwards; a run cannot end before the current time
 playback: time_scale must be a finite positive number or False (no sleep); zero and True are rejected
 
-Everything else (speed, fares, delays, shift length) is taken as given and
+Decision probabilities must be finite in [0, 1], sensitivities nonnegative,
+and reference fare/ETA positive. Demand peak windows validate weekday and hour
+bounds and require multipliers >= 1.
+
+Other existing parameters (speed, fares, delays, shift length) are taken as given and
 misbehaves in the obvious way if nonsensical, e.g. a zero speed divides by zero.
 
-Realism:
-Not every session turns into an order --> in very healthy markets, session to order ratio is 50-60%
-Not every offer gets accepted by the driver --> it varies hugely between markets, but it's generally within the 60-80% range
-Both ratios reflect driver and rider decision. Those decision depend on price and ETA. For ETA both rider and driver prefer short time (time to pickup), for price - drivers prefer high prices, riders prefer low prices. 
-There are peak hours. morning peak and afternoon peak on working days + friday and saturday night
+Realism implemented:
+- Baselines: 55% session-to-order with supply, 70% offer acceptance at reference conditions.
+- Seeded decisions respond to fare and pickup ETA. Riders prefer cheaper fares,
+  drivers prefer higher fares; both prefer shorter pickup ETA.
+- Rejection tries the next eligible driver, separately from offer expiration.
+- scenarios/scenario_realistic_week.py adds weekday commute peaks and Friday/
+  Saturday nights through 03:00 the next day, with rotating eight-hour crews.
+- Reports expose observed conversion and acceptance, arrival counts, pending
+  outcomes, and the parameters used. These are synthetic assumptions, not calibration data.

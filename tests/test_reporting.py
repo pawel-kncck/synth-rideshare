@@ -1,6 +1,8 @@
 import csv
 import io
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -10,9 +12,57 @@ from unittest.mock import patch
 
 from main import Simulation
 from metrics import aggregate_intervals, summarize_intervals
+from reporting import dashboard_observations
 
 
 class MetricTests(unittest.TestCase):
+    def test_dashboard_observations_preserve_cohort_outcomes_and_continuous_spans(self):
+        records = [
+            {"type": "rider_session_started", "at_seconds": 899, "session_id": 1},
+            {"type": "rider_decision", "at_seconds": 901, "session_id": 1, "ordered": True, "eta_seconds": 30},
+            {"type": "offer_created", "at_seconds": 901, "offer_id": 1},
+            {"type": "offer_resolved", "at_seconds": 904, "offer_id": 1, "state": "accepted"},
+            {"type": "offer_created", "at_seconds": 909, "offer_id": 2},
+            {"type": "driver_online", "start_seconds": 100, "end_seconds": 1500},
+            # A carried resolution has no newly created offer cohort.
+            {"type": "offer_resolved", "at_seconds": 910, "offer_id": 0, "state": "rejected"},
+        ]
+        self.assertEqual(dashboard_observations(records), [
+            {"at_seconds": 899, "counts": {"rider_sessions": 1, "converted_sessions": 1}},
+            {"at_seconds": 901, "counts": {"offers": 1, "accepted_offers": 1}},
+            {"at_seconds": 909, "counts": {"offers": 1, "pending_offers": 1}},
+            {"start_seconds": 100, "end_seconds": 1500, "metric": "online_driver_seconds"},
+        ])
+
+    def test_decision_ratios_use_start_cohorts_and_preserve_pending_outcomes(self):
+        records = [
+            {"type": "rider_session_started", "at_seconds": 299, "session_id": 1},
+            {"type": "rider_session_started", "at_seconds": 300, "session_id": 2},
+            {"type": "rider_session_started", "at_seconds": 590, "session_id": 3},
+            {"type": "rider_decision", "at_seconds": 301, "session_id": 1, "ordered": True, "eta_seconds": 0},
+            {"type": "rider_decision", "at_seconds": 302, "session_id": 2, "ordered": False, "eta_seconds": None},
+            {"type": "offer_created", "at_seconds": 299, "offer_id": 1},
+            {"type": "offer_created", "at_seconds": 300, "offer_id": 2},
+            {"type": "offer_created", "at_seconds": 600, "offer_id": 3},
+            {"type": "offer_resolved", "at_seconds": 301, "offer_id": 1, "state": "accepted"},
+            {"type": "offer_resolved", "at_seconds": 600, "offer_id": 2, "state": "rejected"},
+            # Resolution after run end must not affect the current snapshot.
+            {"type": "offer_resolved", "at_seconds": 601, "offer_id": 3, "state": "accepted"},
+        ]
+        rows = aggregate_intervals(records, 0, 600, interval_minutes=5)
+        self.assertEqual([r["session_to_order_pct"] for r in rows], [100, 0])
+        self.assertEqual([r["offer_acceptance_pct"] for r in rows], [100, 0])
+        totals = summarize_intervals(rows)
+        self.assertAlmostEqual(totals["session_to_order_pct"], 100 / 3)
+        self.assertAlmostEqual(totals["offer_acceptance_pct"], 100 / 3)
+        self.assertEqual(totals["undecided_sessions"], 1)
+        self.assertEqual(totals["unavailable_sessions"], 1)
+        self.assertEqual(totals["pending_offers"], 1)
+        # New runs retain carried decisions as events, but have no new cohort.
+        continued = summarize_intervals(aggregate_intervals(records[-1:], 600, 900))
+        self.assertEqual(continued["accepted_offers"], 0)
+        self.assertIsNone(continued["offer_acceptance_pct"])
+
     def test_exact_durations_weighted_ratios_and_event_boundaries(self):
         records = [
             {"type": "driver_online", "start_seconds": 0, "end_seconds": 1800},
@@ -112,6 +162,7 @@ class ReportingTests(unittest.TestCase):
 
     def make_trip(self):
         sim = Simulation(driver_count=1, rider_count=2, speed_kmh=3600,
+                         rider_order_probability=1, driver_acceptance_probability=1,
                          order_delay_seconds=0, accept_delay_seconds=0, boarding_delay_seconds=0)
         sim.schedule_driver_session(0, sim.drivers[0], (0, 0))
         sim.schedule_rider_session(0, sim.riders[0], (0, 0), (300, 0))
@@ -127,10 +178,15 @@ class ReportingTests(unittest.TestCase):
         self.assertIs(configuration["run"]["time_scale"], False)
         self.assertEqual(configuration["run"]["status"], "completed")
         self.assertEqual(configuration["simulation"]["seed"], 0)
+        self.assertEqual(configuration["simulation"]["rider_order_probability"], 1)
+        self.assertEqual(configuration["simulation"]["driver_acceptance_probability"], 1)
+        self.assertEqual(configuration["simulation"]["reference_eta_seconds"], 300)
         self.assertEqual(len(configuration["scheduled_sessions"]), 2)
         self.assertEqual(summary["completed_orders"], 1)
         self.assertEqual(summary["coverage_pct"], 100)
         self.assertEqual(summary["utilization_pct"], 50)
+        self.assertEqual(summary["session_to_order_pct"], 100)
+        self.assertEqual(summary["offer_acceptance_pct"], 100)
         self.assertIn(str(sim.report_path), sim.log_path.read_text())
         with (sim.run_directory / "metrics.csv").open(newline="") as stream:
             rows = list(csv.DictReader(stream))
@@ -142,6 +198,8 @@ class ReportingTests(unittest.TestCase):
         parser.feed(sim.report_path.read_text())
         self.assertEqual(parser.external_scripts, [])
         payload = json.loads(parser.report_data)
+        self.assertTrue(payload["observations"])
+        self.assertNotIn("__DASHBOARD_SCRIPT__", sim.report_path.read_text())
         self.assertEqual(set(payload["series"]), {"5", "15", "30", "60"})
         self.assertEqual(payload["summary"], summary)
         for rows in payload["series"].values():
@@ -188,6 +246,25 @@ class ReportingTests(unittest.TestCase):
         for name in ("metrics.csv", "events.jsonl", "summary.json"):
             self.assertEqual((fast.run_directory / name).read_bytes(), (paced.run_directory / name).read_bytes())
 
+    def test_pending_decisions_across_runs_are_exported_once(self):
+        sim = Simulation(driver_count=1, rider_count=1,
+                         rider_order_probability=1, driver_acceptance_probability=1)
+        sim.schedule_driver_session(0, sim.drivers[0], (0, 0))
+        sim.schedule_rider_session(0, sim.riders[0], (0, 0), (1, 0))
+        first = self.run_simulation(sim, end_seconds=4, time_scale=False)
+        self.assertEqual(first["undecided_sessions"], 1)
+        self.assertEqual(first["session_to_order_pct"], 0)
+        second = self.run_simulation(sim, end_seconds=6, time_scale=False)
+        self.assertEqual(second["rider_sessions"], 0)
+        self.assertIsNone(second["session_to_order_pct"])
+        self.assertEqual(second["pending_offers"], 1)
+        third = self.run_simulation(sim, end_seconds=300, time_scale=False)
+        self.assertEqual(third["offers"], 0)
+        self.assertIsNone(third["offer_acceptance_pct"])
+        records = [json.loads(line) for line in (sim.run_directory / "events.jsonl").read_text().splitlines()]
+        self.assertEqual(len([r for r in records if r["type"] == "offer_resolved"]), 1)
+        self.assertEqual(third["completed_orders"], 1)
+
     def test_empty_run_has_valid_report_with_gaps(self):
         sim = Simulation(driver_count=0, rider_count=0)
         summary = self.run_simulation(sim, end_seconds=0, time_scale=False)
@@ -195,6 +272,28 @@ class ReportingTests(unittest.TestCase):
         self.assertIsNone(summary["utilization_pct"])
         self.assertEqual(summary["completed_orders"], 0)
         self.assertTrue(sim.report_path.is_file())
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed for dashboard metric parity")
+    def test_dashboard_aggregation_matches_saved_python_series_at_every_interval(self):
+        sim = self.make_trip()
+        self.run_simulation(sim, time_scale=False)
+        parser = ScriptParser()
+        parser.feed(sim.report_path.read_text())
+        script = """
+const fs = require('node:fs');
+const dashboard = require('./report_dashboard.js');
+const payload = JSON.parse(fs.readFileSync(0, 'utf8'));
+const run = payload.configuration.run;
+const rows = Object.fromEntries([5, 15, 30, 60].map(minutes => [minutes,
+  dashboard.aggregate(payload.observations, run.initial_time_seconds,
+    run.end_time_seconds, minutes, run.end_time_seconds, run.start_hour)]));
+process.stdout.write(JSON.stringify(rows));
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-e", script], input=parser.report_data,
+            text=True, capture_output=True, check=True, cwd=Path(__file__).resolve().parent.parent,
+        )
+        self.assertEqual(json.loads(result.stdout), json.loads(parser.report_data)["series"])
 
     def test_failed_run_preserves_log_and_configuration_without_success_report(self):
         sim = Simulation(driver_count=1, rider_count=0)
