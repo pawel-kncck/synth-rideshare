@@ -34,7 +34,6 @@ are deliberately simple synthetic assumptions, not estimates of a real market.
 | Path | Contents |
 | --- | --- |
 | `main.py` | The whole simulator: actors, sessions, orders, offers, scheduler. |
-| `tests/` | Unit tests covering scheduling, search, orders, dispatch, and rides. |
 | `scenarios/` | Runnable scripts that set up a population and play out a day. |
 | `plans/` | Phased implementation plans and design notes. |
 
@@ -43,7 +42,6 @@ are deliberately simple synthetic assumptions, not estimates of a real market.
 Requires Python 3.9 or newer.
 
 ```sh
-python3 -m unittest                  # run the test suite
 python3 scenarios/scenario.py        # play out the sample scenario
 ```
 
