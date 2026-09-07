@@ -6,13 +6,15 @@ from main import SearchResult, Simulation
 
 class SearchScenarios(unittest.TestCase):
     def test_nearest_waiting_driver_determines_eta(self):
-        simulation = Simulation(driver_count=4, rider_count=1)
+        simulation = Simulation(driver_count=4, rider_count=2)
         far = simulation.drivers[0].go_online((0, 3))
         far.wait_for_order()
         near = simulation.drivers[1].go_online((0, 1))
         near.wait_for_order()
         busy = simulation.drivers[2].go_online((0, 0))
-        busy.accept_order()
+        busy.wait_for_order()
+        busy_rider = simulation.riders[1].start_session((0, 0), (3, 4))
+        busy.accept_order(busy_rider.make_order().pending_offer)
         simulation.drivers[3].go_online((0, 0))
 
         rider = simulation.riders[0].start_session((0, 0), (3, 4))
@@ -64,7 +66,7 @@ class SearchScenarios(unittest.TestCase):
             rider = simulation.riders[0].start_session((0, 0), (3, 4))
             initial_result = rider.search_result
             simulation.schedule(10, make_driver_available)
-            simulation.schedule(30, lambda: rider.search((3, 4)))
+            simulation.schedule(30, lambda: rider.search((3, 4)), owner=rider)
 
             simulation.advance_to(20)
             self.assertEqual(search.call_count, 1)

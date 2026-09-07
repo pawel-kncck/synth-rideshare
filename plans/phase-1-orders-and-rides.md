@@ -103,3 +103,55 @@ Also verify that a second rider can use that same driver session, ended sessions
 - Add focused standard-library scenario tests for dispatch, timeout handling, cancellation, and ride completion. Run the search suite and the new suites explicitly; avoid collecting the older `archive/test.py` by accident.
 - Run `git diff --check`, review the final changes, and document the actual public APIs, selected state names, and any justified deviations at the end of this file.
 - When implementing this phase, commit the completed, verified phase and report the commit hash and remaining Phase 2 work. Do not create a new session automatically.
+
+## Milestone 1 implementation notes
+
+Milestones 1–3 are implemented. Milestone 4 remains pending; Phase 1 is not yet complete.
+
+- `RiderSession.make_order()` delegates to `Simulation.create_order(rider_session)` and returns the new order, including an immediately canceled order if supply disappeared after search. Both creation APIs require the exact active session, a stored positive search response, and no current order. Invalid actions raise `ValueError`; an unavailable response must be replaced by another explicit search. Both search APIs reject searches during an active order, and a rejected session search preserves its destination and response.
+- `RiderSession.current_order` links to its active order. `Simulation.active_orders` and `Simulation.order_history` are lists. Order IDs start at 1 within each simulation and are never reused there.
+- `Order` exposes `id`, `simulation`, `rider_session`, `rider`, `driver_session`, `pickup_location`, `destination`, `distance_km`, `duration_seconds`, `price`, `created_at`, `state`, and `cancellation_reason`. Coordinates are copied to tuples at creation. Distance, duration, and price come from the latest search response and are not recomputed when simulation settings change or dispatch is retried. `created_at` is elapsed simulated seconds.
+- `Simulation.dispatch_order(order)` rechecks active driver availability. Zero eligible drivers finalizes with state `"canceled"` and exact reason `"no drivers accepted"`, clears the rider's current order, and keeps the rider session online. Milestone 3 now adds driver selection, reservations, offers, and retries, described below. `driver_session` remains `None` until acceptance.
+- `Simulation.finalize_order(order, state, cancellation_reason=None)` accepts `"completed"` or `"canceled"`, removes the order from active processing, archives it once, and clears its session reference. Cancellation requires a reason; completion cannot have one. Repeated finalization preserves the original outcome and cannot clear a replacement order. This is order cleanup only; automatic ride completion and coordinated rider/driver transitions remain Milestone 4 work.
+- One small part of Milestone 4 was brought forward: ending a rider session cancels its current order with `"rider ended session"`. This prevents orphaned orders as soon as order creation is available. Milestone 3 extends this cleanup to pending offers and guards ordinary offline requests after acceptance.
+
+Verification: `python3 -B -m unittest -v test_search test_orders` passes all 18 scenarios on Python 3.9.6, including the six unchanged search scenarios. The order suite covers latest quotes, immutable coordinate snapshots, unchanged quoted fares/durations, creation validation, duplicate prevention, stale-positive dispatch failure, simulation-scoped IDs, session termination, and idempotent terminal cleanup. `git diff --check` passes.
+
+## Milestone 2 implementation notes
+
+- `Simulation.schedule(delay_seconds, callback, *, owner=None)` now returns a `ScheduledEvent` handle. `event.cancel()` sets `event.canceled` and is safe before execution, after execution, or repeatedly. It prevents a pending callback; it does not undo a callback that already ran. Callers can continue ignoring the return value.
+- The heap stores `(execution_time, insertion_sequence, event)`. `advance_to()` skips canceled events, runs live callbacks at their exact simulated times, and still advances to the requested target. Equal-time events retain insertion order, including zero-delay work added by another callback. Cancellation is lazy: canceled entries are discarded when reached in the heap.
+- Pass `owner=session`, `owner=order`, or (since Milestone 3) `owner=offer` for lifecycle work. These objects hold their handles in `pending_events`. Canceling or starting an event removes its handle from that set. Ending a session cancels its pending events; finalizing an order cancels its pending events. Rider-session termination also finalizes an unaccepted order. Unowned events remain available for global scripted actions such as future population activation; their lifetime is managed by the caller.
+- Scheduling rejects inactive or foreign owners with `ValueError`, and unsupported owner types with `TypeError`. Before invoking an owned callback, the scheduler checks active-registry identity and nonterminal status again. Order-owned events also require the rider's current-order identity, an active rider session, and an active driver session if assigned. This second check suppresses stale activity even if cancellation was missed.
+- The scheduled-search regression scenario now passes `owner=rider`; its search assertions are unchanged. Milestone 3 stores the timeout handle on each offer and checks the exact current offer plus its deadline inside response/timeout callbacks. Milestone 4 must retain ride-action handles and check the expected ride stage and coupled sessions inside each callback. Ownership checks supplement those lifecycle checks; the scheduler does not infer offer expiry or expected ride stages.
+
+Verification: `python3 -B -m unittest -v test_search test_orders test_scheduler` passes all 35 scenarios on Python 3.9.6. The 17 new scheduler scenarios cover cancellation, deterministic ordering, exact times and continuation, session/order cleanup, stale-owner guards, replacement protection, and cleanup after callback failure. No decision or deadline uses `time.sleep()`. `git diff --check` passes.
+
+## Milestone 3 implementation notes
+
+- Dispatch selects the nearest eligible session from `active_driver_sessions`, breaking distance ties by driver ID. Search and dispatch share eligibility: `"waiting for order"`, no `pending_offer`, and no `current_order`. Dispatch uses the order's pickup snapshot and never recalculates its quoted fare or duration.
+- `Order.pending_offer` and `DriverSession.pending_offer` reference the same `Offer` while the driver is reserved in `"considering order"`. The order is `"waiting for driver to accept"`; the rider is `"waiting for driver acceptance"`. Repeated dispatch calls cannot create overlapping offers.
+- `Offer` exposes a simulation-scoped `id`, `simulation`, `order`, `driver_session`, `created_at`, `expires_at`, `state`, `resolved_at`, `timeout_event`, and `pending_events`. Its states are `"pending"`, `"accepted"`, `"rejected"`, `"expired"`, and `"canceled"`. `Order.offers` preserves every offer in attempt order; `Order.attempted_driver_ids` prevents another offer to the same person even after reopening their driver session.
+- `DriverSession.accept_order(offer)` and `DriverSession.reject_order(offer)` delegate to `Simulation.accept_offer(driver_session, offer)` and `Simulation.reject_offer(driver_session, offer)`. They return `True` for a valid response, otherwise `False` with no effect. Responses must identify the exact current offer and its active driver session and arrive strictly before `expires_at`. Responses at the deadline are invalid regardless of scheduler insertion order.
+- Offers expire after 10 simulated seconds. Rejection or expiration invalidates the offer, cancels remaining offer-owned work, releases the driver, and immediately reevaluates supply. Five distinct drivers is the total limit, including the first offer. Exhaustion, or no eligible untried drivers, cancels with exact reason `"no drivers accepted"`; the rider returns to `"online"` and can search again. There are no autonomous responses.
+- Acceptance cancels pending offer work and connects `Order.driver_session` and `DriverSession.current_order`. It records `Order.accepted_at`, sets the order to `"driver driving to pickup"`, the driver to `"driving to pickup"`, and the rider to `"waiting for pickup"`. No arrival event is scheduled yet; travel, boarding, and automatic completion remain Milestone 4 work.
+- Session-ending policies from Milestone 4 were brought forward because reservations and accepted orders now exist. A driver leaving during an offer cancels that offer and continues dispatch. A rider leaving before acceptance cancels the order and releases the offer. Ordinary offline requests by either participant after acceptance raise `ValueError`. `wait_for_order()` rejects ended, reserved, or serving driver sessions. The legacy standalone `arrive_at_pickup()`, `pick_up_rider()`, and `end_ride()` state setters now raise `NotImplementedError` until Milestone 4 supplies coordinated transitions; they must not bypass the new bindings.
+- Low-level `finalize_order()` releases any pending offer or accepted driver's live reference, preserves historical driver/offer details, and remains idempotent. It still does not perform physical ride completion or end the rider session. Milestone 4 must add those coordinated effects and the remaining lifecycle timestamps.
+- Existing tests retain their search and order assertions, with setup updated for real acceptance, exclusive reservations, and live offer deadlines. The scheduler replacement-order scenario accepts its replacement offer so its own expiration does not interfere with the stale-event check.
+
+A scripted acceptance using the public APIs:
+
+```python
+simulation = Simulation(driver_count=1, rider_count=1)
+driver = simulation.drivers[0].go_online((0, 1))
+driver.wait_for_order()
+rider = simulation.riders[0].start_session((0, 0), (3, 4))
+order = rider.make_order()
+offer = order.pending_offer
+simulation.schedule(2, lambda: driver.accept_order(offer), owner=offer)
+simulation.advance_to(10)
+assert order.accepted_at == 2
+assert order.state == "driver driving to pickup"
+```
+
+Verification: `python3 -B -m unittest -v test_search test_orders test_scheduler test_dispatch` passes all 55 scenarios on Python 3.9.6. The 20 new dispatch scenarios cover nearest-driver and tie selection, reservation exclusivity, rejection and timeout retries, the strict five-offer limit, responses around the deadline in both insertion orders, session reopening, stale callbacks, and terminal cleanup. `git diff --check` passes. The completed-phase commit remains due after Milestone 4.
