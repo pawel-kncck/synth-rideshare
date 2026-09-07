@@ -488,3 +488,87 @@ class DispatchScenarios(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutomaticAcceptanceScenarios(unittest.TestCase):
+    def scenario(self, driver_count=1, **settings):
+        simulation = Simulation(driver_count=driver_count, rider_count=1, accept_delay_seconds=3, **settings)
+        drivers = [
+            simulation.drivers[index].go_online((0, index + 1)) for index in range(driver_count)
+        ]
+        for driver in drivers:
+            driver.wait_for_order()
+        rider = simulation.riders[0].start_session((0, 0), (3, 4))
+        return simulation, drivers, rider, rider.make_order()
+
+    def test_offer_is_accepted_after_the_delay_and_the_ride_completes(self):
+        simulation, (driver,), rider, order = self.scenario()
+        offer = order.pending_offer
+        self.assertIsNotNone(offer.response_event)
+        self.assertIn(offer.response_event, offer.pending_events)
+
+        simulation.advance_to(2.999)
+        self.assertEqual(offer.state, "pending")
+        self.assertIsNone(order.driver_session)
+        simulation.advance_to(3)
+
+        self.assertEqual(offer.state, "accepted")
+        self.assertEqual(order.accepted_at, 3)
+        self.assertIs(order.driver_session, driver)
+        self.assertEqual(offer.pending_events, set())
+        self.assertTrue(offer.timeout_event.canceled)
+        simulation.advance_to(3 + 120 + 30 + 600)
+        self.assertEqual(order.state, "completed")
+        self.assertEqual(order.completed_at, 753)
+
+    def test_manual_rejection_before_the_delay_moves_on_and_the_next_driver_accepts(self):
+        simulation, drivers, rider, order = self.scenario(driver_count=2)
+        first = order.pending_offer
+        simulation.advance_to(1)
+        self.assertTrue(drivers[0].reject_order(first))
+        second = order.pending_offer
+
+        self.assertTrue(first.response_event.canceled)
+        self.assertIs(second.driver_session, drivers[1])
+        simulation.advance_to(4)
+        self.assertEqual(first.state, "rejected")
+        self.assertEqual(second.state, "accepted")
+        self.assertEqual(order.accepted_at, 4)
+        self.assertEqual(simulation.active_orders, [order])
+
+    def test_rider_leaving_before_the_delay_cancels_the_acceptance(self):
+        simulation, (driver,), rider, order = self.scenario()
+        offer = order.pending_offer
+        simulation.advance_to(2)
+        rider.go_offline()
+
+        simulation.advance_to(10)
+
+        self.assertTrue(offer.response_event.canceled)
+        self.assertEqual(offer.state, "canceled")
+        self.assertEqual(order.state, "canceled")
+        self.assertIsNone(driver.current_order)
+        self.assertEqual(driver.state, "waiting for order")
+
+    def test_delay_at_or_beyond_the_timeout_lets_the_offer_expire(self):
+        simulation = Simulation(driver_count=1, rider_count=1, accept_delay_seconds=10)
+        driver = simulation.drivers[0].go_online((0, 1))
+        driver.wait_for_order()
+        order = simulation.riders[0].start_session((0, 0), (3, 4)).make_order()
+        offer = order.pending_offer
+
+        simulation.advance_to(10)
+
+        self.assertEqual(offer.state, "expired")
+        self.assertEqual(order.state, "canceled")
+        self.assertEqual(order.cancellation_reason, "no drivers accepted")
+
+    def test_default_leaves_offers_unanswered_and_invalid_delays_are_rejected(self):
+        simulation = Simulation(driver_count=1, rider_count=1)
+        simulation.drivers[0].go_online((0, 1)).wait_for_order()
+        order = simulation.riders[0].start_session((0, 0), (3, 4)).make_order()
+        self.assertIsNone(order.pending_offer.response_event)
+        self.assertEqual(order.pending_offer.pending_events, {order.pending_offer.timeout_event})
+        for delay in (-1, float("inf"), float("nan")):
+            with self.subTest(delay=delay), self.assertRaises(ValueError):
+                Simulation(accept_delay_seconds=delay)

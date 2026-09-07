@@ -253,3 +253,71 @@ class OrderScenarios(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutomaticOrderScenarios(unittest.TestCase):
+    def setUp(self):
+        self.simulation = Simulation(driver_count=1, rider_count=1, order_delay_seconds=5)
+        self.driver = self.simulation.drivers[0].go_online((0, 1))
+        self.driver.wait_for_order()
+
+    def test_order_is_created_after_the_delay_following_a_successful_search(self):
+        rider = self.simulation.riders[0].start_session((0, 0), (3, 4))
+        self.assertIsNotNone(rider.order_event)
+        self.assertIn(rider.order_event, rider.pending_events)
+
+        self.simulation.advance_to(4.999)
+        self.assertIsNone(rider.current_order)
+        self.simulation.advance_to(5)
+
+        order = rider.current_order
+        self.assertIsNotNone(order)
+        self.assertEqual(order.created_at, 5)
+        self.assertEqual(order.state, "waiting for driver to accept")
+        self.assertIsNone(rider.order_event)
+        self.assertEqual(rider.pending_events, set())
+
+    def test_new_search_restarts_the_delay_and_no_drivers_means_no_order(self):
+        rider = self.simulation.riders[0].start_session((0, 0), (3, 4))
+        first_event = rider.order_event
+        self.simulation.advance_to(3)
+        rider.search((0, 10))
+        self.assertTrue(first_event.canceled)
+
+        self.simulation.advance_to(7.999)
+        self.assertIsNone(rider.current_order)
+        self.simulation.advance_to(8)
+        self.assertEqual(rider.current_order.destination, (0, 10))
+
+        self.driver.go_offline()   # cancels the pending order through dispatch
+        self.assertIsNone(rider.current_order)
+        rider.search((3, 4))
+        self.assertIsNone(rider.order_event)
+        self.simulation.advance_to(20)
+        self.assertIsNone(rider.current_order)
+
+    def test_going_offline_and_manual_orders_cancel_the_automatic_order(self):
+        rider = self.simulation.riders[0].start_session((0, 0), (3, 4))
+        event = rider.order_event
+        manual = rider.make_order()
+        self.simulation.advance_to(9)   # past the automatic order, before the offer expires
+        self.assertIs(rider.current_order, manual)
+        self.assertEqual(self.simulation.active_orders, [manual])
+        self.assertIsNone(rider.order_event)
+        self.assertNotIn(event, rider.pending_events)
+
+        other = Simulation(driver_count=1, rider_count=1, order_delay_seconds=5)
+        other.drivers[0].go_online((0, 1)).wait_for_order()
+        leaving = other.riders[0].start_session((0, 0), (3, 4))
+        leaving_event = leaving.order_event
+        leaving.go_offline()
+        other.advance_to(10)
+        self.assertTrue(leaving_event.canceled)
+        self.assertEqual(other.active_orders, [])
+        self.assertEqual(other.order_history, [])
+
+    def test_invalid_order_delays_are_rejected(self):
+        for delay in (-1, float("inf"), float("nan")):
+            with self.subTest(delay=delay), self.assertRaises(ValueError):
+                Simulation(order_delay_seconds=delay)
+        self.assertIsNone(Simulation().order_delay_seconds)

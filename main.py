@@ -77,6 +77,7 @@ class Driver:
         session = DriverSession(self, location)
         self.simulation.register_driver_session(session)
         self.session = session
+        print(f"[{self.simulation.current_time:>6.0f}s] Driver {self.id} went online at {tuple(location)}")
         return self.session
 
 
@@ -98,16 +99,36 @@ class RiderSession:
         self.search_result = None
         self.current_order = None
         self.pending_events = set()
+        self.order_event = None
 
     def search(self, destination):
-        """Search immediately and replace the stored response snapshot."""
+        """Search immediately, replace the stored snapshot, and queue the automatic order."""
         if self.state == "offline":
             raise ValueError("Cannot search after the rider session has ended")
         if self.current_order is not None:
             raise ValueError("Cannot search while the rider session has an active order")
         self.destination = destination
         self.search_result = self.rider.simulation.search(self)
+        self._schedule_order()
         return self.search_result
+
+    def _schedule_order(self):
+        """Order after the configured delay; a newer search replaces the pending order."""
+        if self.order_event is not None:
+            self.order_event.cancel()
+            self.order_event = None
+        delay = self.rider.simulation.order_delay_seconds
+        if delay is None or not self.search_result.drivers_available:
+            return
+        self.order_event = self.rider.simulation.schedule(delay, self._order_automatically, owner=self)
+
+    def _order_automatically(self):
+        self.order_event = None
+        if self.current_order is not None or self.search_result is None:
+            return None
+        if not self.search_result.drivers_available:
+            return None
+        return self.make_order()
 
     def make_order(self):
         """Order using this session's latest available search response."""
@@ -127,6 +148,10 @@ class Rider:
         session = RiderSession(self, location, destination)
         self.simulation.register_rider_session(session)
         self.session = session
+        print(
+            f"[{self.simulation.current_time:>6.0f}s] Rider {self.id} started a session "
+            f"at {tuple(location)} heading to {tuple(destination)}"
+        )
         session.search(destination)
         return self.session
 
@@ -193,6 +218,7 @@ class Offer:
         self.state = "pending"
         self.resolved_at = None
         self.timeout_event = None
+        self.response_event = None
         self.pending_events = set()
 
 
@@ -225,6 +251,8 @@ class Simulation:
         base_fare=2.0,
         price_per_km=1.5,
         boarding_delay_seconds=30,
+        order_delay_seconds=None,
+        accept_delay_seconds=None,
     ):
         if speed_kmh <= 0:
             raise ValueError("Driving speed must be positive")
@@ -232,11 +260,23 @@ class Simulation:
             raise ValueError("Fare values cannot be negative")
         if not math.isfinite(boarding_delay_seconds) or boarding_delay_seconds < 0:
             raise ValueError("Boarding delay must be finite and nonnegative")
+        if order_delay_seconds is not None and (
+            not math.isfinite(order_delay_seconds) or order_delay_seconds < 0
+        ):
+            raise ValueError("Order delay must be None or finite and nonnegative")
+        if accept_delay_seconds is not None and (
+            not math.isfinite(accept_delay_seconds) or accept_delay_seconds < 0
+        ):
+            raise ValueError("Accept delay must be None or finite and nonnegative")
 
         self.speed_kmh = speed_kmh
         self.base_fare = base_fare
         self.price_per_km = price_per_km
         self.boarding_delay_seconds = boarding_delay_seconds
+        # None keeps ordering manual; a number orders that long after a successful search.
+        self.order_delay_seconds = order_delay_seconds
+        # None leaves offers to the caller; a number accepts that long after each offer.
+        self.accept_delay_seconds = accept_delay_seconds
         self.drivers = generate_drivers(self, driver_count, seed)
         self.riders = generate_riders(self, rider_count, seed)
         self.active_driver_sessions = {}
@@ -309,6 +349,11 @@ class Simulation:
         order = Order(next(self._order_sequence), rider_session)
         rider_session.current_order = order
         self.active_orders.append(order)
+        print(
+            f"[{self.current_time:>6.0f}s] Order {order.id} created by rider {order.rider.id}: "
+            f"{order.pickup_location} to {order.destination}, "
+            f"{order.distance_km:.1f} km, price {order.price:.2f}"
+        )
         self.dispatch_order(order)
         return order
 
@@ -363,6 +408,12 @@ class Simulation:
         offer.timeout_event = self.schedule(
             self.offer_timeout_seconds, lambda: self._expire_offer(offer), owner=offer
         )
+        if self.accept_delay_seconds is not None:
+            offer.response_event = self.schedule(
+                self.accept_delay_seconds,
+                lambda: driver_session.accept_order(offer),
+                owner=offer,
+            )
         return order
 
     def _driver_is_eligible(self, session):
@@ -425,6 +476,10 @@ class Simulation:
         pickup_duration = self.calculate_duration(
             math.dist(driver_session.location, order.pickup_location)
         )
+        print(
+            f"[{self.current_time:>6.0f}s] Driver {driver_session.driver.id} accepted order {order.id} "
+            f"from {driver_session.location}, pickup in {pickup_duration:.0f}s"
+        )
         self._schedule_ride_action(
             order, pickup_duration, lambda: driver_session.arrive_at_pickup(order)
         )
@@ -486,6 +541,10 @@ class Simulation:
         order.state = "driver waiting for rider"
         order.rider_session.state = "driver has arrived"
         driver_session.state = "waiting for rider"
+        print(
+            f"[{self.current_time:>6.0f}s] Driver {driver_session.driver.id} arrived at pickup "
+            f"{order.pickup_location} for order {order.id}, waiting {self.boarding_delay_seconds:.0f}s"
+        )
         self._schedule_ride_action(
             order, self.boarding_delay_seconds, lambda: driver_session.pick_up_rider(order)
         )
@@ -502,6 +561,11 @@ class Simulation:
         order.state = "driving with rider"
         order.rider_session.state = "riding"
         driver_session.state = "driving with rider"
+        print(
+            f"[{self.current_time:>6.0f}s] Rider {order.rider.id} boarded with driver "
+            f"{driver_session.driver.id} for order {order.id}, trip to {order.destination} "
+            f"takes {order.duration_seconds:.0f}s"
+        )
         self._schedule_ride_action(
             order, order.duration_seconds, lambda: driver_session.end_ride(order)
         )
@@ -516,6 +580,11 @@ class Simulation:
         driver_session.location = order.destination
         order.rider_session.location = order.destination
         self.finalize_order(order, "completed")
+        print(
+            f"[{self.current_time:>6.0f}s] Order {order.id} completed: rider {order.rider.id} "
+            f"dropped off at {order.destination} by driver {driver_session.driver.id}, "
+            f"{self.current_time - order.created_at:.0f}s after ordering, fare {order.price:.2f}"
+        )
         self.end_rider_session(order.rider_session)
         return True
 
@@ -678,24 +747,10 @@ class Simulation:
             raise ValueError("Playback speed cannot be negative")
 
         self.advance_to(self.current_time)
-        while True:
-            # The clock shows start time plus elapsed simulated seconds.
-            hour, minute = divmod(int(start * 60 + self.current_time / 60), 60)
-            driver_states = " | ".join(
-                f"Driver {session.driver.id}: {session.state}"
-                for session in self.active_driver_sessions.values()
-            ) or "No active driver sessions"
-            print(
-                f"\r{hour:02}:{minute:02} | {driver_states:<60}",
-                end="",
-                flush=True,
-            )
-            if self.current_time >= end_time:
-                break
+        while self.current_time < end_time:
             next_time = min(self.current_time + 60, end_time)
             time.sleep((next_time - self.current_time) * seconds_per_hour / 3600)
             self.advance_to(next_time)
-        print()
 
 
 def run_simulation(start=6, end=23, seconds_per_hour=1):
