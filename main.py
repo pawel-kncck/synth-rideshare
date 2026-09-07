@@ -51,7 +51,7 @@ class DriverSession:
         self.location = location
         self.started_at = started_at
         self.ended_at = None
-        self.pending_offer = None
+        self.pending_order = None  # order whose offer the driver is considering
         self.current_order = None
         self.shift_over = False  # set when the shift ends during a ride
 
@@ -59,7 +59,7 @@ class DriverSession:
     def state(self):
         if self.ended_at is not None:
             return "offline"
-        if self.pending_offer is not None:
+        if self.pending_order is not None:
             return "considering order"
         if self.current_order is None:
             return "waiting for order"
@@ -133,7 +133,6 @@ class Order:
         self.cancellation_reason = None
         self.pending_offer = None
         self.offers = []
-        self.attempted_driver_ids = set()
         self.accepted_at = None
         self.pickup_arrived_at = None
         self.boarded_at = None
@@ -141,17 +140,16 @@ class Order:
         self.canceled_at = None
 
 
+@dataclass
 class Offer:
-    states = ("pending", "accepted", "expired", "canceled")
+    """One attempt to hand an order to a driver."""
 
-    def __init__(self, offer_id, order, driver_session, created_at, expires_at):
-        self.id = offer_id
-        self.order = order
-        self.driver_session = driver_session
-        self.created_at = created_at
-        self.expires_at = expires_at
-        self.state = "pending"
-        self.resolved_at = None
+    id: int
+    driver_session: DriverSession
+    created_at: float
+    expires_at: float
+    state: str = "pending"  # then accepted, expired, or canceled
+    resolved_at: Optional[float] = None
 
 
 def generate_drivers(simulation, count=10, seed=0):
@@ -369,15 +367,15 @@ class Simulation:
         """Take the driver offline, handing any pending offer to the next driver."""
         if session.state == "offline":
             return
-        offer = session.pending_offer
+        order = session.pending_order
         session.ended_at = self.current_time
         del self.active_driver_sessions[session.driver.id]
         session.driver.session = None
         self.driver_session_history.append(session)
         self._log(f"Driver {session.driver.id} went offline at {session.location}")
-        if offer is not None:
-            self._resolve_offer(offer, "canceled")
-            self._dispatch_order(offer.order)
+        if order is not None:
+            self._resolve_offer(order, "canceled")
+            self._dispatch_order(order)
 
     def _driver_is_eligible(self, session):
         return session.state == "waiting for order"
@@ -469,16 +467,16 @@ class Simulation:
             or order.driver_session is not None
         ):
             return
-        if len(order.attempted_driver_ids) >= self.max_offers_per_order:
+        if len(order.offers) >= self.max_offers_per_order:
             self._abandon_order(order)
             return
 
+        tried = {offer.driver_session.driver.id for offer in order.offers}
         driver_session = min(
             (
                 session
                 for session in self.active_driver_sessions.values()
-                if self._driver_is_eligible(session)
-                and session.driver.id not in order.attempted_driver_ids
+                if self._driver_is_eligible(session) and session.driver.id not in tried
             ),
             key=lambda session: (
                 math.dist(order.pickup_location, session.location), session.driver.id
@@ -490,18 +488,17 @@ class Simulation:
             return
 
         offer = Offer(
-            next(self._offer_sequence), order, driver_session,
+            next(self._offer_sequence), driver_session,
             self.current_time, self.current_time + self.offer_timeout_seconds,
         )
-        order.attempted_driver_ids.add(driver_session.driver.id)
         order.offers.append(offer)
         order.pending_offer = offer
         order.state = "waiting for driver to accept"
-        driver_session.pending_offer = offer
+        driver_session.pending_order = order
         # The timeout is queued first so a response due at the same instant
         # as the deadline finds the offer already expired.
-        self._schedule(self.offer_timeout_seconds, lambda: self._expire_offer(offer))
-        self._schedule(self.accept_delay_seconds, lambda: self._accept_offer(offer))
+        self._schedule(self.offer_timeout_seconds, lambda: self._expire_offer(order, offer))
+        self._schedule(self.accept_delay_seconds, lambda: self._accept_offer(order, offer))
 
     def _abandon_order(self, order):
         """Cancel an order no driver accepted; the rider gives up and leaves."""
@@ -509,22 +506,20 @@ class Simulation:
         self._log(f"Order {order.id} canceled: no drivers accepted; rider {order.rider.id} left")
         self._end_rider_session(order.rider_session, "no drivers accepted")
 
-    def _resolve_offer(self, offer, state):
-        """Close the offer and release only the references it still holds."""
-        if offer.state != "pending":
-            return
+    def _resolve_offer(self, order, state):
+        """Close the order's pending offer and release the driver it reserved."""
+        offer = order.pending_offer
         offer.state = state
         offer.resolved_at = self.current_time
-        offer.order.pending_offer = None
-        offer.driver_session.pending_offer = None
-        if offer.order.state == "waiting for driver to accept":
-            offer.order.state = "searching for a driver"
+        offer.driver_session.pending_order = None
+        order.pending_offer = None
+        if order.state == "waiting for driver to accept":
+            order.state = "searching for a driver"
 
-    def _accept_offer(self, offer):
-        if offer.state != "pending" or self.current_time >= offer.expires_at:
+    def _accept_offer(self, order, offer):
+        if order.pending_offer is not offer or self.current_time >= offer.expires_at:
             return
-        self._resolve_offer(offer, "accepted")
-        order = offer.order
+        self._resolve_offer(order, "accepted")
         driver_session = offer.driver_session
         order.driver_session = driver_session
         order.accepted_at = self.current_time
@@ -539,15 +534,15 @@ class Simulation:
         )
         self._schedule(pickup_duration, lambda: self._arrive_at_pickup(order))
 
-    def _expire_offer(self, offer):
-        if offer.state != "pending":
+    def _expire_offer(self, order, offer):
+        if order.pending_offer is not offer:
             return
         self._log(
             f"Driver {offer.driver_session.driver.id} did not answer offer {offer.id} "
-            f"for order {offer.order.id} in time"
+            f"for order {order.id} in time"
         )
-        self._resolve_offer(offer, "expired")
-        self._dispatch_order(offer.order)
+        self._resolve_offer(order, "expired")
+        self._dispatch_order(order)
 
     # ----------------------------------------------------------------------
     # Rides
@@ -606,7 +601,7 @@ class Simulation:
         if order.state in Order.terminal_states:
             return
         if order.pending_offer is not None:
-            self._resolve_offer(order.pending_offer, "canceled")
+            self._resolve_offer(order, "canceled")
         order.state = state
         order.cancellation_reason = cancellation_reason
         if state == "completed":
