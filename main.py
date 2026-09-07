@@ -497,7 +497,9 @@ class Simulation:
             f"Driver {driver_session.driver_id} accepted order {order.id} "
             f"from {driver_session.location}, pickup in {pickup_duration:.0f}s"
         )
-        self._schedule(pickup_duration, lambda: self._arrive_at_pickup(order))
+        self._schedule(
+            pickup_duration, lambda: self._advance_ride(order, "driver driving to pickup")
+        )
 
     def _expire_offer(self, order, offer):
         if order.pending_offer is not offer:
@@ -513,53 +515,42 @@ class Simulation:
     # Rides
     # ----------------------------------------------------------------------
 
-    def _ride_is_at(self, order, order_state):
-        """True while the accepted ride is still at the step a callback expects."""
-        return order.state == order_state and order.driver_session is not None
-
-    def _arrive_at_pickup(self, order):
-        if not self._ride_is_at(order, "driver driving to pickup"):
+    def _advance_ride(self, order, expected_state):
+        """Run one ride step (arrival, boarding, or drop-off) if the ride is still there."""
+        if order.state != expected_state or order.driver_session is None:
             return
-        driver_session = order.driver_session
-        driver_session.location = order.pickup_location
-        self._set_state(order, "driver waiting for rider")
-        self._log(
-            f"Driver {driver_session.driver_id} arrived at pickup {order.pickup_location} "
-            f"for order {order.id}, waiting {self.boarding_delay_seconds:.0f}s"
-        )
-        self._schedule(
-            self.boarding_delay_seconds, lambda: self._pick_up_rider(order)
-        )
-
-    def _pick_up_rider(self, order):
-        if not self._ride_is_at(order, "driver waiting for rider"):
+        driver, rider = order.driver_session, order.rider_session
+        if expected_state == "driver driving to pickup":
+            driver.location = order.pickup_location
+            self._set_state(order, "driver waiting for rider")
+            self._log(
+                f"Driver {driver.driver_id} arrived at pickup {order.pickup_location} "
+                f"for order {order.id}, waiting {self.boarding_delay_seconds:.0f}s"
+            )
+            delay = self.boarding_delay_seconds
+        elif expected_state == "driver waiting for rider":
+            self._set_state(order, "driving with rider")
+            self._log(
+                f"Rider {rider.rider_id} boarded with driver {driver.driver_id} "
+                f"for order {order.id}, trip to {order.destination} "
+                f"takes {order.quote.duration_seconds:.0f}s"
+            )
+            delay = order.quote.duration_seconds
+        else:
+            driver.location = rider.location = order.destination
+            self._log(
+                f"Order {order.id} completed: rider {rider.rider_id} dropped off at "
+                f"{order.destination} by driver {driver.driver_id}, "
+                f"{self.current_time - order.timeline['searching for a driver']:.0f}s after ordering, "
+                f"fare {order.quote.price:.2f}"
+            )
+            self._finalize_order(order, "completed")
+            self._end_rider_session(rider, "trip completed")
+            if driver.shift_over:
+                self._end_driver_session(driver)
             return
-        driver_session = order.driver_session
-        self._set_state(order, "driving with rider")
-        self._log(
-            f"Rider {order.rider_session.rider_id} boarded with driver {driver_session.driver_id} "
-            f"for order {order.id}, trip to {order.destination} "
-            f"takes {order.quote.duration_seconds:.0f}s"
-        )
-        self._schedule(order.quote.duration_seconds, lambda: self._end_ride(order))
-
-    def _end_ride(self, order):
-        """Complete the trip, end the rider session, and free or release the driver."""
-        if not self._ride_is_at(order, "driving with rider"):
-            return
-        driver_session = order.driver_session
-        driver_session.location = order.destination
-        order.rider_session.location = order.destination
-        self._log(
-            f"Order {order.id} completed: rider {order.rider_session.rider_id} dropped off at "
-            f"{order.destination} by driver {driver_session.driver_id}, "
-            f"{self.current_time - order.timeline['searching for a driver']:.0f}s after ordering, "
-            f"fare {order.quote.price:.2f}"
-        )
-        self._finalize_order(order, "completed")
-        self._end_rider_session(order.rider_session, "trip completed")
-        if driver_session.shift_over:
-            self._end_driver_session(driver_session)
+        next_state = order.state
+        self._schedule(delay, lambda: self._advance_ride(order, next_state))
 
     def _finalize_order(self, order, state, cancellation_reason=None):
         """Archive the order once and release the rider and driver it held."""
