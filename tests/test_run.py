@@ -135,7 +135,7 @@ class RunTests(unittest.TestCase):
         self.assertIn("Orders: 0 created; 0 completed; 0 canceled; 0 active at end", third_log)
         self.assertIn("total fares: 0.00", third_log)
         self.assertIn("Average order-to-pickup wait (completed trips): n/a", third_log)
-        self.assertEqual(len(list(self.log_dir.glob("*.log"))), 3)
+        self.assertEqual(len(list(self.log_dir.rglob("*.log"))), 3)
 
     def test_failure_and_interrupt_are_logged_without_success_summary(self):
         for error in (RuntimeError("callback failed"), KeyboardInterrupt()):
@@ -244,7 +244,7 @@ class RunTests(unittest.TestCase):
                 self.run_simulation(sim, end_seconds=0, time_scale=1)
             sleep.assert_not_called()
             self.assertIn("Simulated: 0.00s", sim.log_path.read_text(encoding="utf-8"))
-        self.assertEqual(len(list(self.log_dir.glob("*.log"))), 2)
+        self.assertEqual(len(list(self.log_dir.rglob("*.log"))), 2)
 
     def test_direct_advance_is_silent_and_does_not_create_a_run_log(self):
         sim = Simulation(driver_count=1, rider_count=0)

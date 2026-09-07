@@ -1,7 +1,8 @@
 # synth-rideshare
 
 A small discrete-event simulator of a ride-hailing marketplace, written in
-plain Python with no dependencies beyond the standard library.
+Python. The simulation uses the standard library; interactive run reports
+use Plotly.
 
 The goal is a synthetic, deterministic model of how riders and drivers
 interact over a simulated day: riders search for a ride, order, get matched
@@ -37,12 +38,22 @@ are deliberately simple synthetic assumptions, not estimates of a real market.
 | Path | Contents |
 | --- | --- |
 | `main.py` | The whole simulator: actors, sessions, orders, offers, scheduler. |
+| `metrics.py` | Exact time-interval aggregation of searches, driver time, and completions. |
+| `reporting.py`, `report_template.html` | Run exports and offline interactive charts. |
 | `scenarios/` | Runnable scripts that set up a population and play out a day. |
 | `plans/` | Phased implementation plans and design notes. |
 
 ## Running
 
 Requires Python 3.9 or newer.
+
+Install the reporting dependency once, then activate the environment:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+source .venv/bin/activate
+```
 
 ```sh
 python3 scenarios/scenario.py        # play out the sample scenario
@@ -90,10 +101,11 @@ still be in one at that time raises an error when the clock gets there.
 
 Numeric zero, negative values, nonfinite values, and `True` are rejected.
 
-Every `sim.run()` creates a unique timestamped `.log` file in `logs/` under
+Every `sim.run()` creates a unique timestamped folder in `logs/` under
 the current working directory. Pass `log_dir="path/to/logs"` to choose another
-directory; `sim.log_path` holds the latest log's absolute path. Lifecycle
-events go to this file. When the run reaches its end time, it prints a summary
+parent directory; `sim.run_directory` and `sim.log_path` hold the latest run
+folder and its `simulation.log` path. Lifecycle events go to this file.
+When the run reaches its end time, it prints a summary
 of simulated and runtime duration, sessions, order outcomes, riders leaving
 without a ride, completed trip distance and fares, average order-to-pickup
 wait, and the log path. The summary is also saved in the log. Failed or
@@ -112,3 +124,57 @@ remains at its end time. Pending events and active sessions or orders are
 left in place, so a later run can continue them. `sim.advance_to(t)` jumps
 straight to a simulated time without delay; called outside `run()`, it does
 not create a log or print a summary.
+
+## Run reports
+
+Each completed run automatically creates `report.html`. Open the path printed
+in the console (also available as `sim.report_path`) in a browser. The file
+contains Plotly and all chart data, so the charts work offline and the HTML
+can be copied or shared by itself. Generating charts happens after the
+simulation finishes; reported runtime excludes report generation.
+
+Three line charts share a zoomable simulated clock axis:
+
+| Metric | Per-interval definition |
+| --- | --- |
+| Search coverage | Searches finding an eligible idle driver / all searches, as a percentage. |
+| Driver utilization | Total active driver seconds / total online driver seconds, as a percentage. |
+| Completed orders | Orders completed during the interval, assigned by drop-off time. |
+
+The default interval is 15 minutes. Use `sim.run(time_scale=False,
+interval_minutes=5)` to start with 5 minutes, or choose 5, 15, 30, or 60 minutes
+in the report without rerunning the simulation. Completed orders can also
+be displayed cumulatively. Hover shows search counts and driver-hour totals;
+the download button exports the currently selected interval as CSV.
+
+Intervals start at the current run's initial simulated time. Events on an
+internal boundary belong to the following interval; events exactly at the
+run's end belong to its last interval, matching the simulator's clock.
+The final interval may be shorter. Driver sessions and accepted-order time
+are split exactly across intervals, including rides still in progress.
+Intervals with no searches or no online driver time show gaps, and undefined
+percentages are empty in CSV and `null` in JSON. Whole-run percentages use
+total counts/time rather than averaging interval percentages. Continued runs
+count only newly observed searches and completions, and only driver time
+within that call to `run()`.
+
+Each run folder contains:
+
+- `simulation.log`: lifecycle messages and the console summary.
+- `config.json`: run bounds, status, seed, behavior parameters, actual scheduled
+  sessions, metric definitions, Plotly version, and source-file hashes.
+- `events.jsonl`: individual search observations, driver online/active intervals
+  clipped to this run, and completion events. Each line has a `type` field;
+  records are grouped by type, not sorted by time.
+- `metrics.csv`: interval data using the run's selected default interval.
+- `summary.json`: whole-run totals for the chart metrics.
+- `report.html`: the standalone interactive report.
+
+Searches are recorded individually in `sim.search_history`, including repeated
+searches by one rider. Coverage currently means an eligible idle driver
+anywhere on the map; it does not impose a maximum pickup ETA. Reporting does
+not change availability, scheduling, behavior, or random-number generation.
+Failed or interrupted runs retain their log and configuration with a failed
+status, without printing a success summary or producing a completion report.
+
+Run the tests with `.venv/bin/python -m unittest discover -s tests -v`.

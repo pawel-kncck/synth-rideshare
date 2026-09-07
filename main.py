@@ -7,8 +7,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+from tempfile import mkdtemp
 from typing import Optional
+
+from metrics import INTERVAL_MINUTES
 
 
 def _point(value, name):
@@ -32,6 +34,22 @@ class SearchResult:
     price: float
     eta_seconds: Optional[float]
     drivers_available: bool
+
+
+@dataclass(frozen=True)
+class SearchRecord:
+    """One search observation, retained even if the same rider searches again."""
+
+    at_seconds: float
+    rider_id: int
+    session_started_at: float
+    location: tuple
+    destination: tuple
+    drivers_available: bool
+    eta_seconds: Optional[float]
+    distance_km: float
+    duration_seconds: float
+    price: float
 
 
 @dataclass(eq=False)
@@ -177,12 +195,16 @@ class Simulation:
         self.order_history = []
         self.driver_session_history = []
         self.rider_session_history = []
+        self.search_history = []
+        self.session_schedule = []
         self.current_time = 0
         self._events = []
         self._event_sequence = itertools.count()
         self._order_sequence = itertools.count(1)
         self._offer_sequence = itertools.count(1)
         self.log_path = None
+        self.run_directory = None
+        self.report_path = None
         # A private logger keeps lifecycle events out of the console, even if
         # the application using this simulator configures the root logger.
         self._logger = logging.Logger(__name__, level=logging.INFO)
@@ -205,6 +227,10 @@ class Simulation:
         self._schedule_at(
             at_seconds, lambda: self._start_driver_session(driver_id, location, shift_seconds)
         )
+        self.session_schedule.append({
+            "type": "driver", "at_seconds": at_seconds, "driver_id": driver_id,
+            "location": location, "shift_seconds": shift_seconds,
+        })
 
     def schedule_rider_session(self, at_seconds, rider_id, location, destination):
         """Have a rider appear at a simulated time wanting to travel.
@@ -220,6 +246,10 @@ class Simulation:
         self._schedule_at(
             at_seconds, lambda: self._start_rider_session(rider_id, location, destination)
         )
+        self.session_schedule.append({
+            "type": "rider", "at_seconds": at_seconds, "rider_id": rider_id,
+            "location": location, "destination": destination,
+        })
 
     def advance_to(self, target_time):
         """Process every event due up to the target time, then set the clock there."""
@@ -232,8 +262,8 @@ class Simulation:
 
         self.current_time = target_time
 
-    def run(self, start=6, end=23, time_scale=3600, log_dir="logs"):
-        """Play the clock, write a fresh event log, and print a run summary.
+    def run(self, start=6, end=23, time_scale=3600, log_dir="logs", interval_minutes=15):
+        """Play the clock, save a run report and log, and print a run summary.
 
         time_scale is simulated seconds per runtime second: 1 is real time,
         0.5 is half speed, and 60 plays a simulated minute in one second.
@@ -251,19 +281,24 @@ class Simulation:
             raise ValueError("Run duration must be finite")
         if end_time < self.current_time:
             raise ValueError("Run end time is before the current simulation time")
+        if isinstance(interval_minutes, bool) or interval_minutes not in INTERVAL_MINUTES:
+            raise ValueError("interval_minutes must be 5, 15, 30, or 60")
+
+        # Load the reporting dependency before processing any simulation events.
+        from reporting import collect_records, run_configuration, write_json, write_report
 
         initial_time = self.current_time
         initial_totals = self._run_totals()
         directory = Path(log_dir)
         directory.mkdir(parents=True, exist_ok=True)
-        # The random suffix guarantees separate files for repeated runs,
-        # including runs started during the same second.
-        with NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=directory,
-            prefix=f"simulation-{datetime.now():%Y%m%d-%H%M%S}-",
-            suffix=".log", delete=False,
-        ) as log_file:
-            self.log_path = Path(log_file.name).resolve()
+        self.run_directory = Path(mkdtemp(
+            dir=directory, prefix=f"simulation-{datetime.now():%Y%m%d-%H%M%S}-"
+        )).resolve()
+        self.log_path = self.run_directory / "simulation.log"
+        self.report_path = None
+        configuration = run_configuration(self, start, end, time_scale, initial_time, int(interval_minutes))
+        write_json(self.run_directory / "config.json", configuration)
+        with self.log_path.open("w", encoding="utf-8") as log_file:
             handler = logging.StreamHandler(log_file)
             handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
             self._logger.addHandler(handler)
@@ -283,12 +318,16 @@ class Simulation:
                         time.sleep((next_time - self.current_time) / time_scale)
                         self.advance_to(next_time)
 
-                summary = self._run_summary(
-                    initial_totals, initial_time, time.perf_counter() - started_at, time_scale
-                )
+                runtime = time.perf_counter() - started_at
+                configuration["run"].update(status="completed", runtime_seconds=runtime)
+                records = collect_records(self, initial_totals, initial_time)
+                self.report_path = write_report(self.run_directory, configuration, records)
+                summary = self._run_summary(initial_totals, initial_time, runtime, time_scale)
                 self._logger.info("%s", summary)
             except BaseException:
                 self._logger.exception("Run stopped at simulated time %gs", self.current_time)
+                configuration["run"].update(status="failed", stopped_at_seconds=self.current_time)
+                write_json(self.run_directory / "config.json", configuration)
                 raise
             finally:
                 self._logger.removeHandler(handler)
@@ -303,6 +342,7 @@ class Simulation:
             "orders": len(self.order_history) + len(self.active_orders),
             "finished_orders": len(self.order_history),
             "ended_rider_sessions": len(self.rider_session_history),
+            "searches": len(self.search_history),
         }
 
     def _driver_hours(self, initial_time):
@@ -350,6 +390,9 @@ class Simulation:
         playback = "as fast as possible (no sleep)" if time_scale is False else f"{time_scale:g}x"
         online_hours, active_hours, idle_hours = self._driver_hours(initial_time)
         utilization = f"{active_hours / online_hours:.2%}" if online_hours else "n/a"
+        searches = self.search_history[initial_totals["searches"]:]
+        covered = sum(search.drivers_available for search in searches)
+        coverage = f"{covered / len(searches):.2%}" if searches else "n/a"
         return "\n".join([
             "Simulation run summary",
             f"  Simulated: {simulated:.2f}s ({simulated / 3600:.2f}h); "
@@ -360,12 +403,14 @@ class Simulation:
             f"{idle_hours:.2f} idle; utilization: {utilization}",
             f"  Rider sessions: {totals['rider_sessions'] - initial_totals['rider_sessions']} started; "
             f"{len(self.active_rider_sessions)} active at end",
+            f"  Search coverage: {coverage} ({covered} of {len(searches)} searches)",
             f"  Orders: {totals['orders'] - initial_totals['orders']} created; "
             f"{len(completed)} completed; {canceled} canceled; {len(self.active_orders)} active at end",
             f"  Riders leaving without a ride: {unserved}",
             f"  Completed trips: {distance:.2f} km; total fares: {fares:.2f}",
             f"  Average order-to-pickup wait (completed trips): {pickup_wait}",
             f"  Log: {self.log_path}",
+            f"  Report: {self.report_path}",
         ])
 
     # ----------------------------------------------------------------------
@@ -480,7 +525,7 @@ class Simulation:
             ),
             default=None,
         )
-        return SearchResult(
+        result = SearchResult(
             distance_km=distance_km,
             duration_seconds=self.calculate_duration(distance_km),
             price=self.calculate_price(distance_km),
@@ -491,6 +536,14 @@ class Simulation:
             ),
             drivers_available=pickup_distance_km is not None,
         )
+        self.search_history.append(SearchRecord(
+            at_seconds=self.current_time, rider_id=rider_session.rider_id,
+            session_started_at=rider_session.started_at,
+            location=rider_session.location, destination=rider_session.destination,
+            drivers_available=result.drivers_available, eta_seconds=result.eta_seconds,
+            distance_km=result.distance_km, duration_seconds=result.duration_seconds, price=result.price,
+        ))
+        return result
 
     def _decide_on_quote(self, rider_session):
         if rider_session.state != "online" or rider_session.current_order is not None:

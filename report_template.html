@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rideshare simulation report</title>
+  <style>
+    :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172b42; background: #f3f6fa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 1240px; margin: 0 auto; padding: 36px 28px; }
+    .eyebrow { color: #456583; font-size: 11px; font-weight: 750; letter-spacing: .16em; text-transform: uppercase; }
+    h1 { margin: 10px 0 8px; font-size: clamp(24px, 3vw, 34px); letter-spacing: -.035em; }
+    .muted { color: #60748a; font-size: 13px; line-height: 1.6; }
+    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin: 26px 0 22px; }
+    .card, .panel { background: white; border: 1px solid #dfe7f0; border-radius: 12px; }
+    .card { padding: 20px 22px; }
+    .card-label { font-size: 13px; font-weight: 600; }
+    .card-value { font-size: 33px; letter-spacing: -.04em; font-weight: 650; margin: 9px 0 4px; }
+    .coverage { color: #2563eb; } .utilization { color: #087f78; } .completed { color: #9155d7; }
+    .toolbar { display: flex; align-items: end; flex-wrap: wrap; gap: 16px; padding: 20px 22px; border-bottom: 1px solid #e8edf4; }
+    label { display: flex; flex-direction: column; gap: 7px; font-size: 12px; font-weight: 650; }
+    select, button { font: inherit; font-size: 13px; background: #fff; border: 1px solid #c8d5e4; color: #172b42; padding: 9px 12px; border-radius: 6px; cursor: pointer; }
+    select:focus-visible, button:focus-visible, a:focus-visible { outline: 3px solid #93b9ff; outline-offset: 2px; }
+    button { margin-left: auto; }
+    #charts { height: 880px; width: 100%; }
+    .chart-note { padding: 0 22px 18px; margin: 0; }
+    .footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin: 18px 0; }
+    .files { display: flex; flex-wrap: wrap; gap: 18px; }
+    a { color: #325e9a; text-decoration: none; } a:hover { text-decoration: underline; }
+    details { margin-top: 16px; } summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+    pre { max-height: 300px; overflow: auto; background: #eaf0f6; padding: 18px; border-radius: 8px; font-size: 12px; }
+    #run-id { overflow-wrap: anywhere; }
+    @media (max-width: 650px) {
+      main { padding: 24px 12px; } .cards { gap: 8px; }
+      .card { padding: 14px 10px; } .card-value { font-size: 25px; }
+      .card-label, .card .muted { font-size: 11px; }
+      .toolbar { padding: 16px 12px; gap: 12px; } #charts { height: 900px; }
+      button { margin-left: 0; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Synth rideshare / Run report</div>
+    <h1 id="heading">Simulation report</h1>
+    <div id="run-info" class="muted"></div>
+  </header>
+  <section class="cards" aria-label="Whole-run metrics">
+    <div class="card"><div class="card-label">Search coverage</div><div id="coverage-value" class="card-value coverage"></div><div id="coverage-detail" class="muted"></div></div>
+    <div class="card"><div class="card-label">Driver utilization</div><div id="utilization-value" class="card-value utilization"></div><div id="utilization-detail" class="muted"></div></div>
+    <div class="card"><div class="card-label">Completed orders</div><div id="completed-value" class="card-value completed"></div><div id="completed-detail" class="muted"></div></div>
+  </section>
+  <section class="panel" aria-label="Time series">
+    <div class="toolbar">
+      <label for="interval">Time interval<select id="interval"><option value="5">5 minutes</option><option value="15" selected>15 minutes</option><option value="30">30 minutes</option><option value="60">60 minutes</option></select></label>
+      <label for="completion-mode">Completed orders<select id="completion-mode"><option value="interval">Per interval</option><option value="cumulative">Cumulative</option></select></label>
+      <button id="download-csv" type="button">Download interval CSV</button>
+    </div>
+    <div id="charts" aria-label="Search coverage, utilization, and completed orders over simulated time"></div>
+    <p class="muted chart-note">Drag to zoom all three charts; double-click to reset. Hover for interval counts and driver hours. Gaps mean no searches or no online driver time. Whole-run metrics above remain unchanged when the interval changes.</p>
+  </section>
+  <div class="footer muted">
+    <span id="run-id"></span>
+    <nav class="files" aria-label="Run files"><a href="simulation.log">Log</a><a href="config.json">Configuration</a><a href="events.jsonl">Recorded events</a><a href="summary.json">Summary JSON</a></nav>
+  </div>
+  <details><summary>Metric definitions and run parameters</summary>
+    <p class="muted">Search coverage counts searches finding at least one eligible idle driver anywhere on the map. Driver utilization uses total active time divided by total online time within each interval. Active time includes pickup travel, boarding wait, and the trip; considering an offer is idle. Completions are assigned by drop-off time. Intervals start at this run's initial time; the final interval includes events exactly at the run end.</p>
+    <pre id="parameters"></pre>
+  </details>
+  <noscript>This interactive report requires JavaScript. The interval data is also available in metrics.csv.</noscript>
+</main>
+<script id="report-data" type="application/json">__REPORT_DATA__</script>
+<script>__PLOTLY_BUNDLE__</script>
+<script>
+  const report = JSON.parse(document.getElementById('report-data').textContent);
+  const {configuration, summary: totals, series} = report;
+  const run = configuration.run;
+  const params = configuration.simulation;
+  const intervalSelect = document.getElementById('interval');
+  const modeSelect = document.getElementById('completion-mode');
+  const text = (id, value) => { document.getElementById(id).textContent = value; };
+  const percent = value => value === null ? '—' : value.toFixed(2) + '%';
+  const clock = seconds => {
+    const day = Math.floor(seconds / 86400);
+    const hour = Math.floor(seconds / 3600) % 24;
+    const minute = Math.floor(seconds / 60) % 60;
+    return (day ? `D+${day} ` : '') + String(hour).padStart(2, '0') + ':' + String(minute).padStart(2, '0');
+  };
+  // A fixed date gives Plotly adaptive clock ticks; it is not a calendar date for this run.
+  const dateAt = seconds => new Date(Date.UTC(2000, 0, 1) + (run.start_hour * 3600 + seconds) * 1000).toISOString();
+  intervalSelect.value = String(configuration.report.default_interval_minutes);
+  text('heading', `${params.rider_count.toLocaleString()} riders · ${params.driver_count.toLocaleString()} drivers`);
+  document.title = `${params.rider_count} riders · ${params.driver_count} drivers — Simulation report`;
+  text('run-info', `${clock(run.start_hour * 3600 + run.initial_time_seconds)}–${clock(run.start_hour * 3600 + run.end_time_seconds)} simulated time · Seed ${params.seed} · ${run.time_scale === false ? 'No playback delay' : run.time_scale + '× playback'} · ${run.runtime_seconds.toFixed(3)}s simulation runtime`);
+  text('coverage-value', percent(totals.coverage_pct));
+  text('coverage-detail', `${totals.covered_searches.toLocaleString()} of ${totals.searches.toLocaleString()} searches covered`);
+  text('utilization-value', percent(totals.utilization_pct));
+  text('utilization-detail', `${totals.active_driver_hours.toFixed(2)} active / ${totals.online_driver_hours.toFixed(2)} online hours`);
+  text('completed-value', totals.completed_orders.toLocaleString());
+  text('completed-detail', 'Completed during this run');
+  text('run-id', run.id);
+  text('parameters', JSON.stringify(params, null, 2));
+
+  function render() {
+    const rows = series[intervalSelect.value];
+    const cumulative = modeSelect.value === 'cumulative';
+    const midpoints = rows.map(row => dateAt((row.start_seconds + row.end_seconds) / 2));
+    const windows = rows.map(row => `${row.clock_start}–${row.clock_end}`);
+    const trace = (name, color, values, axes, customdata, hovertemplate, x = midpoints) => ({
+      type: 'scatter', mode: 'lines+markers', name, x, y: values, ...axes,
+      line: {color, width: 2}, marker: {color, size: 4}, connectgaps: false,
+      customdata, hovertemplate: hovertemplate + '<extra></extra>'
+    });
+    const traces = [
+      trace('Search coverage', '#2563eb', rows.map(row => row.coverage_pct), {xaxis: 'x', yaxis: 'y'},
+        rows.map((row, i) => [windows[i], row.covered_searches, row.searches]),
+        '<b>%{customdata[0]}</b><br>Coverage: %{y:.2f}%<br>%{customdata[1]} of %{customdata[2]} searches covered'),
+      trace('Utilization', '#087f78', rows.map(row => row.utilization_pct), {xaxis: 'x2', yaxis: 'y2'},
+        rows.map((row, i) => [windows[i], row.active_driver_seconds / 3600, row.online_driver_seconds / 3600, row.idle_driver_seconds / 3600]),
+        '<b>%{customdata[0]}</b><br>Utilization: %{y:.2f}%<br>Active: %{customdata[1]:.3f}h<br>Online: %{customdata[2]:.3f}h<br>Idle: %{customdata[3]:.3f}h'),
+      trace('Completed orders', '#9155d7', rows.map(row => cumulative ? row.cumulative_completed_orders : row.completed_orders), {xaxis: 'x3', yaxis: 'y3'},
+        rows.map((row, i) => [windows[i], row.completed_orders, row.cumulative_completed_orders]),
+        '<b>%{customdata[0]}</b><br>Completed in interval: %{customdata[1]}<br>Cumulative: %{customdata[2]}',
+        cumulative ? rows.map(row => dateAt(row.end_seconds)) : midpoints)
+    ];
+    const xaxis = {
+      type: 'date', tickformat: '%H:%M', gridcolor: '#eef2f7', linecolor: '#dce5ef',
+      range: [dateAt(run.initial_time_seconds), dateAt(Math.max(run.end_time_seconds, run.initial_time_seconds + 1))],
+      showspikes: true, spikethickness: 1, spikecolor: '#a8b7c8', spikedash: 'dot'
+    };
+    const yaxis = {gridcolor: '#e9eff5', zerolinecolor: '#dce5ef', fixedrange: true, ticksuffix: '%', range: [-3, 103], dtick: 25};
+    const title = (label, y) => ({xref: 'paper', yref: 'paper', x: 0, y, xanchor: 'left', yanchor: 'bottom', text: `<b>${label}</b>`, showarrow: false, font: {size: 14, color: '#172b42'}});
+    const annotations = [title('Search coverage', 1.015), title('Driver utilization', .66), title(cumulative ? 'Completed orders · cumulative' : `Completed orders · per ${intervalSelect.value} minutes`, .305)];
+    if (rows.every(row => row.coverage_pct === null)) annotations.push({xref: 'paper', yref: 'paper', x: .5, y: .88, text: 'No searches in this run', showarrow: false, font: {color: '#60748a'}});
+    if (rows.every(row => row.utilization_pct === null)) annotations.push({xref: 'paper', yref: 'paper', x: .5, y: .52, text: 'No online driver time', showarrow: false, font: {color: '#60748a'}});
+    const layout = {
+      font: {family: '-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif', size: 11, color: '#60748a'},
+      margin: {l: 64, r: 28, t: 62, b: 58}, paper_bgcolor: '#fff', plot_bgcolor: '#fff',
+      showlegend: false, hovermode: 'closest', dragmode: 'zoom', uirevision: 'run-report',
+      hoverlabel: {bgcolor: '#172b42', bordercolor: '#172b42', font: {color: '#fff', size: 12}},
+      xaxis: {...xaxis, anchor: 'y', showticklabels: false},
+      xaxis2: {...xaxis, anchor: 'y2', matches: 'x', showticklabels: false},
+      xaxis3: {...xaxis, anchor: 'y3', matches: 'x', title: {text: 'Simulated clock', standoff: 14}},
+      yaxis: {...yaxis, domain: [.75, 1]}, yaxis2: {...yaxis, domain: [.395, .645], anchor: 'x2'},
+      yaxis3: {domain: [.04, .29], anchor: 'x3', gridcolor: '#e9eff5', zerolinecolor: '#dce5ef', fixedrange: true, rangemode: 'tozero', tickformat: ',d'},
+      annotations
+    };
+    return Plotly.react('charts', traces, layout, {
+      responsive: true, displaylogo: false, scrollZoom: false,
+      modeBarButtonsToRemove: ['lasso2d', 'select2d'],
+      toImageButtonOptions: {filename: run.id, format: 'png', scale: 2}
+    });
+  }
+
+  intervalSelect.addEventListener('change', render);
+  modeSelect.addEventListener('change', render);
+  document.getElementById('download-csv').addEventListener('click', () => {
+    const rows = series[intervalSelect.value];
+    const columns = Object.keys(rows[0]);
+    const cell = value => value === null ? '' : '"' + String(value).replaceAll('"', '""') + '"';
+    const csv = [columns.join(','), ...rows.map(row => columns.map(key => cell(row[key])).join(','))].join('\r\n') + '\r\n';
+    const url = URL.createObjectURL(new Blob([csv], {type: 'text/csv;charset=utf-8'}));
+    const link = document.createElement('a');
+    link.href = url; link.download = `${run.id}-${intervalSelect.value}min.csv`;
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+  render();
+</script>
+</body>
+</html>
