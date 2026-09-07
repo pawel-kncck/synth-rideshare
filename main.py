@@ -305,6 +305,31 @@ class Simulation:
             "ended_rider_sessions": len(self.rider_session_history),
         }
 
+    def _driver_hours(self, initial_time):
+        """Sum online and accepted-order time within this run's interval."""
+        def duration(started_at, ended_at):
+            end = self.current_time if ended_at is None else min(ended_at, self.current_time)
+            return max(0, end - max(started_at, initial_time))
+
+        online = math.fsum(
+            duration(session.started_at, session.ended_at)
+            for session in itertools.chain(
+                self.driver_session_history, self.active_driver_sessions.values()
+            )
+        ) / 3600
+        # Acceptance starts pickup travel. The driver remains active through
+        # boarding and the trip, until completion/cancellation or the run end.
+        active = math.fsum(
+            duration(
+                order.timeline["driver driving to pickup"],
+                order.timeline[order.state] if order.state in Order.terminal_states else None,
+            )
+            for order in itertools.chain(self.order_history, self.active_orders)
+            if "driver driving to pickup" in order.timeline
+        ) / 3600
+        # Considering an offer is idle: the driver has not accepted an order.
+        return online, active, online - active
+
     def _run_summary(self, initial_totals, initial_time, runtime, time_scale):
         totals = self._run_totals()
         finished = self.order_history[initial_totals["finished_orders"]:]
@@ -323,12 +348,16 @@ class Simulation:
         pickup_wait = f"{sum(pickup_waits) / len(pickup_waits):.2f}s" if pickup_waits else "n/a"
         simulated = self.current_time - initial_time
         playback = "as fast as possible (no sleep)" if time_scale is False else f"{time_scale:g}x"
+        online_hours, active_hours, idle_hours = self._driver_hours(initial_time)
+        utilization = f"{active_hours / online_hours:.2%}" if online_hours else "n/a"
         return "\n".join([
             "Simulation run summary",
             f"  Simulated: {simulated:.2f}s ({simulated / 3600:.2f}h); "
             f"runtime: {runtime:.3f}s; speed: {playback}",
             f"  Driver sessions: {totals['driver_sessions'] - initial_totals['driver_sessions']} started; "
             f"{len(self.active_driver_sessions)} active at end",
+            f"  Driver hours: {online_hours:.2f} online; {active_hours:.2f} active; "
+            f"{idle_hours:.2f} idle; utilization: {utilization}",
             f"  Rider sessions: {totals['rider_sessions'] - initial_totals['rider_sessions']} started; "
             f"{len(self.active_rider_sessions)} active at end",
             f"  Orders: {totals['orders'] - initial_totals['orders']} created; "

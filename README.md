@@ -46,7 +46,13 @@ Requires Python 3.9 or newer.
 
 ```sh
 python3 scenarios/scenario.py        # play out the sample scenario
+python3 scenarios/scenario_100_riders.py  # 100 riders, 10 drivers, no playback delay
+python3 scenarios/scenario_500_riders.py  # 500 riders, 10 drivers, no playback delay
 ```
+
+The 100- and 500-rider scenarios use seed `0` and a 10-by-10 km map. All ten
+drivers start at 06:00; each rider requests one trip by 22:00. Both runs end
+at 23:00 and use `time_scale=False`.
 
 A scenario only schedules when driver and rider sessions begin, then hands
 control to the clock. Everything after that (search, ordering, offers,
@@ -92,6 +98,14 @@ of simulated and runtime duration, sessions, order outcomes, riders leaving
 without a ride, completed trip distance and fares, average order-to-pickup
 wait, and the log path. The summary is also saved in the log. Failed or
 interrupted runs log the exception and do not print a completion summary.
+
+The summary also reports total driver online, active, and idle hours, plus
+utilization (`active / online`). Online hours sum all driver session durations
+within the run, including sessions still open at its end. Active hours cover
+driving to pickup, waiting for the rider, and driving to the destination,
+including unfinished rides up to the run's end. Idle hours are online hours
+minus active hours; they include waiting for orders and considering offers
+before acceptance. With no online time, utilization is `n/a`.
 
 Summary activity counts cover that call to `run()`; active counts show what
 remains at its end time. Pending events and active sessions or orders are

@@ -155,6 +155,88 @@ class RunTests(unittest.TestCase):
                 self.assertEqual(self.stdout.getvalue(), "")
                 self.assertEqual(sim._logger.handlers, [])
 
+    def setup_driver_hours_trip(self, shift_seconds=7200):
+        sim = Simulation(driver_count=1, rider_count=1, speed_kmh=60, boarding_delay_seconds=900)
+        sim.schedule_driver_session(0, sim.drivers[0], (0, 0), shift_seconds=shift_seconds)
+        # Accepted at 1800s; pickup at 2700s; boarding at 3600s; drop-off at 5400s.
+        sim.schedule_rider_session(1792, sim.riders[0], (15, 0), (45, 0))
+        return sim
+
+    def test_driver_hours_include_pickup_boarding_and_trip(self):
+        sim = self.setup_driver_hours_trip()
+        self.run_simulation(sim, end_seconds=7200)
+        self.assertEqual(sim._driver_hours(0), (2, 1, 1))
+        expected = "Driver hours: 2.00 online; 1.00 active; 1.00 idle; utilization: 50.00%"
+        self.assertIn(expected, self.stdout.getvalue())
+        self.assertIn(expected, sim.log_path.read_text(encoding="utf-8"))
+
+    def test_driver_hours_sum_repeated_overlapping_and_open_sessions(self):
+        sim = Simulation(driver_count=2, rider_count=0)
+        sim.schedule_driver_session(0, sim.drivers[0], (0, 0), shift_seconds=3600)
+        sim.schedule_driver_session(7200, sim.drivers[0], (0, 0), shift_seconds=3600)
+        sim.schedule_driver_session(1800, sim.drivers[1], (0, 0))
+        self.run_simulation(sim, end_seconds=10800)
+        self.assertEqual(sim._driver_hours(0), (4.5, 0, 4.5))
+        self.assertIn(
+            "Driver hours: 4.50 online; 0.00 active; 4.50 idle; utilization: 0.00%",
+            self.stdout.getvalue(),
+        )
+
+    def test_driver_hours_count_only_current_run_and_clip_each_active_phase(self):
+        sim = self.setup_driver_hours_trip()
+        initial_time = 0
+        for end_seconds, expected in (
+            (1800, (0.5, 0, 0.5)),
+            (2700, (0.25, 0.25, 0)),
+            (3600, (0.25, 0.25, 0)),
+            (4500, (0.25, 0.25, 0)),
+            (7200, (0.75, 0.25, 0.5)),
+            (10800, (0, 0, 0)),
+        ):
+            with self.subTest(end_seconds=end_seconds):
+                self.run_simulation(sim, end_seconds=end_seconds)
+                self.assertEqual(sim._driver_hours(initial_time), expected)
+                online, active, idle = expected
+                utilization = f"{active / online:.2%}" if online else "n/a"
+                self.assertIn(
+                    f"Driver hours: {online:.2f} online; {active:.2f} active; "
+                    f"{idle:.2f} idle; utilization: {utilization}",
+                    sim.log_path.read_text(encoding="utf-8"),
+                )
+                initial_time = end_seconds
+
+    def test_driver_hours_include_overtime_until_dropoff(self):
+        sim = self.setup_driver_hours_trip(shift_seconds=3600)
+        self.run_simulation(sim, end_seconds=7200)
+        self.assertEqual(sim.driver_session_history[0].ended_at, 5400)
+        self.assertEqual(sim._driver_hours(0), (1.5, 1, 0.5))
+        self.assertIn("utilization: 66.67%", self.stdout.getvalue())
+
+    def test_unaccepted_offers_are_idle_time(self):
+        sim = Simulation(driver_count=1, rider_count=1, accept_delay_seconds=10)
+        sim.schedule_driver_session(0, sim.drivers[0], (0, 0), shift_seconds=3600)
+        sim.schedule_rider_session(0, sim.riders[0], (0, 0), (3, 0))
+        self.run_simulation(sim, end_seconds=3600)
+        self.assertEqual(sim.order_history[0].state, "canceled")
+        self.assertEqual(sim._driver_hours(0), (1, 0, 1))
+        self.assertIn(
+            "Driver hours: 1.00 online; 0.00 active; 1.00 idle; utilization: 0.00%",
+            self.stdout.getvalue(),
+        )
+
+    def test_driver_hours_with_no_online_time(self):
+        for driver_count in (0, 1):
+            with self.subTest(driver_count=driver_count):
+                sim = Simulation(driver_count=driver_count, rider_count=0)
+                if driver_count:
+                    sim.schedule_driver_session(0, sim.drivers[0], (0, 0), shift_seconds=0)
+                self.run_simulation(sim)
+                self.assertEqual(sim._driver_hours(0), (0, 0, 0))
+                self.assertIn(
+                    "Driver hours: 0.00 online; 0.00 active; 0.00 idle; utilization: n/a",
+                    sim.log_path.read_text(encoding="utf-8"),
+                )
+
     def test_zero_duration_runs_create_distinct_logs(self):
         for _ in range(2):
             sim = Simulation(driver_count=0, rider_count=0)
