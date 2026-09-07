@@ -38,35 +38,44 @@ class Rider:
 
 
 class DriverSession:
-    states = (
-        "waiting for order",
-        "considering order",
-        "driving to pickup",
-        "waiting for rider",
-        "driving with rider",
-        "offline",
-    )
+    """A driver's time online. Its state follows the offer or order it holds."""
+
+    ride_states = {
+        "driver driving to pickup": "driving to pickup",
+        "driver waiting for rider": "waiting for rider",
+        "driving with rider": "driving with rider",
+    }
 
     def __init__(self, driver, location, started_at):
         self.driver = driver
         self.location = location
         self.started_at = started_at
         self.ended_at = None
-        self.state = "waiting for order"
         self.pending_offer = None
         self.current_order = None
         self.shift_over = False  # set when the shift ends during a ride
 
+    @property
+    def state(self):
+        if self.ended_at is not None:
+            return "offline"
+        if self.pending_offer is not None:
+            return "considering order"
+        if self.current_order is None:
+            return "waiting for order"
+        return self.ride_states[self.current_order.state]
+
 
 class RiderSession:
-    states = (
-        "online",
-        "waiting for driver acceptance",
-        "waiting for pickup",
-        "driver has arrived",
-        "riding",
-        "offline",
-    )
+    """A rider's request for one trip. Its state follows the order it holds."""
+
+    order_states = {
+        "searching for a driver": "waiting for driver acceptance",
+        "waiting for driver to accept": "waiting for driver acceptance",
+        "driver driving to pickup": "waiting for pickup",
+        "driver waiting for rider": "driver has arrived",
+        "driving with rider": "riding",
+    }
 
     def __init__(self, rider, location, destination, started_at):
         self.rider = rider
@@ -75,9 +84,16 @@ class RiderSession:
         self.started_at = started_at
         self.ended_at = None
         self.exit_reason = None
-        self.state = "online"
         self.search_result = None
         self.current_order = None
+
+    @property
+    def state(self):
+        if self.ended_at is not None:
+            return "offline"
+        if self.current_order is None:
+            return "online"
+        return self.order_states[self.current_order.state]
 
 
 @dataclass(frozen=True)
@@ -354,7 +370,6 @@ class Simulation:
         if session.state == "offline":
             return
         offer = session.pending_offer
-        session.state = "offline"
         session.ended_at = self.current_time
         del self.active_driver_sessions[session.driver.id]
         session.driver.session = None
@@ -365,11 +380,7 @@ class Simulation:
             self._dispatch_order(offer.order)
 
     def _driver_is_eligible(self, session):
-        return (
-            session.state == "waiting for order"
-            and session.pending_offer is None
-            and session.current_order is None
-        )
+        return session.state == "waiting for order"
 
     # ----------------------------------------------------------------------
     # Rider sessions and search
@@ -429,7 +440,6 @@ class Simulation:
     def _end_rider_session(self, session, reason):
         if session.state == "offline":
             return
-        session.state = "offline"
         session.ended_at = self.current_time
         session.exit_reason = reason
         del self.active_rider_sessions[session.rider.id]
@@ -487,9 +497,7 @@ class Simulation:
         order.offers.append(offer)
         order.pending_offer = offer
         order.state = "waiting for driver to accept"
-        order.rider_session.state = "waiting for driver acceptance"
         driver_session.pending_offer = offer
-        driver_session.state = "considering order"
         # The timeout is queued first so a response due at the same instant
         # as the deadline finds the offer already expired.
         self._schedule(self.offer_timeout_seconds, lambda: self._expire_offer(offer))
@@ -507,15 +515,10 @@ class Simulation:
             return
         offer.state = state
         offer.resolved_at = self.current_time
-        if offer.order.pending_offer is offer:
-            offer.order.pending_offer = None
-            if offer.order.state == "waiting for driver to accept":
-                offer.order.state = "searching for a driver"
-        driver = offer.driver_session
-        if driver.pending_offer is offer:
-            driver.pending_offer = None
-            if driver.state != "offline" and driver.current_order is None:
-                driver.state = "waiting for order"
+        offer.order.pending_offer = None
+        offer.driver_session.pending_offer = None
+        if offer.order.state == "waiting for driver to accept":
+            offer.order.state = "searching for a driver"
 
     def _accept_offer(self, offer):
         if offer.state != "pending" or self.current_time >= offer.expires_at:
@@ -526,9 +529,7 @@ class Simulation:
         order.driver_session = driver_session
         order.accepted_at = self.current_time
         order.state = "driver driving to pickup"
-        order.rider_session.state = "waiting for pickup"
         driver_session.current_order = order
-        driver_session.state = "driving to pickup"
         pickup_duration = self.calculate_duration(
             math.dist(driver_session.location, order.pickup_location)
         )
@@ -563,8 +564,6 @@ class Simulation:
         driver_session.location = order.pickup_location
         order.pickup_arrived_at = self.current_time
         order.state = "driver waiting for rider"
-        order.rider_session.state = "driver has arrived"
-        driver_session.state = "waiting for rider"
         self._log(
             f"Driver {driver_session.driver.id} arrived at pickup {order.pickup_location} "
             f"for order {order.id}, waiting {self.boarding_delay_seconds:.0f}s"
@@ -579,8 +578,6 @@ class Simulation:
         driver_session = order.driver_session
         order.boarded_at = self.current_time
         order.state = "driving with rider"
-        order.rider_session.state = "riding"
-        driver_session.state = "driving with rider"
         self._log(
             f"Rider {order.rider.id} boarded with driver {driver_session.driver.id} "
             f"for order {order.id}, trip to {order.destination} takes {order.duration_seconds:.0f}s"
@@ -618,13 +615,6 @@ class Simulation:
             order.canceled_at = self.current_time
         self.active_orders.remove(order)
         self.order_history.append(order)
-        rider_session = order.rider_session
-        if rider_session.current_order is order:
-            rider_session.current_order = None
-            if rider_session.state != "offline":
-                rider_session.state = "online"
-        driver_session = order.driver_session
-        if driver_session is not None and driver_session.current_order is order:
-            driver_session.current_order = None
-            if driver_session.state != "offline":
-                driver_session.state = "waiting for order"
+        order.rider_session.current_order = None
+        if order.driver_session is not None:
+            order.driver_session.current_order = None
