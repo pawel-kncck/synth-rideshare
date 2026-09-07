@@ -281,39 +281,39 @@ class Simulation:
     def _start_driver_session(self, driver_id, location, shift_seconds):
         if driver_id in self.active_driver_sessions:
             raise ValueError(f"Driver {driver_id} already has an active session")
-        session = DriverSession(driver_id, location, self.current_time)
-        self.active_driver_sessions[driver_id] = session
+        driver_session = DriverSession(driver_id, location, self.current_time)
+        self.active_driver_sessions[driver_id] = driver_session
         self._log(f"Driver {driver_id} went online at {location}")
         if shift_seconds is not None:
-            self._schedule(shift_seconds, lambda: self._end_shift(session))
+            self._schedule(shift_seconds, lambda: self._end_shift(driver_session))
 
-    def _end_shift(self, session):
-        if session.state == "offline":
+    def _end_shift(self, driver_session):
+        if driver_session.state == "offline":
             return
-        if session.current_order is not None:
-            session.shift_over = True
+        if driver_session.current_order is not None:
+            driver_session.shift_over = True
             self._log(
-                f"Driver {session.driver_id} finishes the shift after order "
-                f"{session.current_order.id}"
+                f"Driver {driver_session.driver_id} finishes the shift after order "
+                f"{driver_session.current_order.id}"
             )
             return
-        self._end_driver_session(session)
+        self._end_driver_session(driver_session)
 
-    def _end_driver_session(self, session):
+    def _end_driver_session(self, driver_session):
         """Take the driver offline, handing any pending offer to the next driver."""
-        if session.state == "offline":
+        if driver_session.state == "offline":
             return
-        order = session.pending_order
-        session.ended_at = self.current_time
-        del self.active_driver_sessions[session.driver_id]
-        self.driver_session_history.append(session)
-        self._log(f"Driver {session.driver_id} went offline at {session.location}")
+        order = driver_session.pending_order
+        driver_session.ended_at = self.current_time
+        del self.active_driver_sessions[driver_session.driver_id]
+        self.driver_session_history.append(driver_session)
+        self._log(f"Driver {driver_session.driver_id} went offline at {driver_session.location}")
         if order is not None:
             self._resolve_offer(order, "canceled")
             self._dispatch_order(order)
 
-    def _driver_is_eligible(self, session):
-        return session.state == "waiting for order"
+    def _driver_is_eligible(self, driver_session):
+        return driver_session.state == "waiting for order"
 
     # ----------------------------------------------------------------------
     # Rider sessions and search
@@ -322,10 +322,10 @@ class Simulation:
     def _start_rider_session(self, rider_id, location, destination):
         if rider_id in self.active_rider_sessions:
             raise ValueError(f"Rider {rider_id} already has an active session")
-        session = RiderSession(rider_id, location, destination, self.current_time)
-        self.active_rider_sessions[rider_id] = session
+        rider_session = RiderSession(rider_id, location, destination, self.current_time)
+        self.active_rider_sessions[rider_id] = rider_session
         self._log(f"Rider {rider_id} started a session at {location} heading to {destination}")
-        session.search_result = quote = self._search(session)
+        rider_session.search_result = quote = self._search(rider_session)
         if quote.drivers_available:
             self._log(
                 f"Rider {rider_id} quoted {quote.distance_km:.1f} km for {quote.price:.2f}, "
@@ -333,14 +333,14 @@ class Simulation:
             )
         else:
             self._log(f"Rider {rider_id} quoted {quote.distance_km:.1f} km, no drivers available")
-        self._schedule(self.order_delay_seconds, lambda: self._decide_on_quote(session))
+        self._schedule(self.order_delay_seconds, lambda: self._decide_on_quote(rider_session))
 
-    def _search(self, session):
+    def _search(self, rider_session):
         """Quote the trip and the nearest waiting driver without reserving anyone."""
-        distance_km = math.dist(session.location, session.destination)
+        distance_km = math.dist(rider_session.location, rider_session.destination)
         pickup_distance_km = min(
             (
-                math.dist(session.location, driver_session.location)
+                math.dist(rider_session.location, driver_session.location)
                 for driver_session in self.active_driver_sessions.values()
                 if self._driver_is_eligible(driver_session)
             ),
@@ -358,22 +358,22 @@ class Simulation:
             drivers_available=pickup_distance_km is not None,
         )
 
-    def _decide_on_quote(self, session):
-        if session.state != "online" or session.current_order is not None:
+    def _decide_on_quote(self, rider_session):
+        if rider_session.state != "online" or rider_session.current_order is not None:
             return
-        if session.search_result.drivers_available:
-            self._create_order(session)
+        if rider_session.search_result.drivers_available:
+            self._create_order(rider_session)
         else:
-            self._log(f"Rider {session.rider_id} left: no drivers available")
-            self._end_rider_session(session, "no drivers available")
+            self._log(f"Rider {rider_session.rider_id} left: no drivers available")
+            self._end_rider_session(rider_session, "no drivers available")
 
-    def _end_rider_session(self, session, reason):
-        if session.state == "offline":
+    def _end_rider_session(self, rider_session, reason):
+        if rider_session.state == "offline":
             return
-        session.ended_at = self.current_time
-        session.exit_reason = reason
-        del self.active_rider_sessions[session.rider_id]
-        self.rider_session_history.append(session)
+        rider_session.ended_at = self.current_time
+        rider_session.exit_reason = reason
+        del self.active_rider_sessions[rider_session.rider_id]
+        self.rider_session_history.append(rider_session)
 
     # ----------------------------------------------------------------------
     # Orders and offers
@@ -383,16 +383,16 @@ class Simulation:
         order.state = state
         order.timeline.setdefault(state, self.current_time)
 
-    def _create_order(self, session):
+    def _create_order(self, rider_session):
         order = Order(
-            next(self._order_sequence), session,
-            session.location, session.destination, session.search_result,
+            next(self._order_sequence), rider_session,
+            rider_session.location, rider_session.destination, rider_session.search_result,
         )
         self._set_state(order, "searching for a driver")
-        session.current_order = order
+        rider_session.current_order = order
         self.active_orders.append(order)
         self._log(
-            f"Order {order.id} created by rider {session.rider_id}: "
+            f"Order {order.id} created by rider {rider_session.rider_id}: "
             f"{order.pickup_location} to {order.destination}, "
             f"{order.quote.distance_km:.1f} km, price {order.quote.price:.2f}"
         )
@@ -409,12 +409,12 @@ class Simulation:
         tried = {offer.driver_session.driver_id for offer in order.offers}
         driver_session = min(
             (
-                session
-                for session in self.active_driver_sessions.values()
-                if self._driver_is_eligible(session) and session.driver_id not in tried
+                driver_session
+                for driver_session in self.active_driver_sessions.values()
+                if self._driver_is_eligible(driver_session) and driver_session.driver_id not in tried
             ),
-            key=lambda session: (
-                math.dist(order.pickup_location, session.location), session.driver_id
+            key=lambda driver_session: (
+                math.dist(order.pickup_location, driver_session.location), driver_session.driver_id
             ),
             default=None,
         )
@@ -491,35 +491,35 @@ class Simulation:
         """Run one ride step (arrival, boarding, or drop-off) if the ride is still there."""
         if order.state != expected_state or order.driver_session is None:
             return
-        driver, rider = order.driver_session, order.rider_session
+        driver_session, rider_session = order.driver_session, order.rider_session
         if expected_state == "driver driving to pickup":
-            driver.location = order.pickup_location
+            driver_session.location = order.pickup_location
             self._set_state(order, "driver waiting for rider")
             self._log(
-                f"Driver {driver.driver_id} arrived at pickup {order.pickup_location} "
+                f"Driver {driver_session.driver_id} arrived at pickup {order.pickup_location} "
                 f"for order {order.id}, waiting {self.boarding_delay_seconds:.0f}s"
             )
             delay = self.boarding_delay_seconds
         elif expected_state == "driver waiting for rider":
             self._set_state(order, "driving with rider")
             self._log(
-                f"Rider {rider.rider_id} boarded with driver {driver.driver_id} "
+                f"Rider {rider_session.rider_id} boarded with driver {driver_session.driver_id} "
                 f"for order {order.id}, trip to {order.destination} "
                 f"takes {order.quote.duration_seconds:.0f}s"
             )
             delay = order.quote.duration_seconds
         else:
-            driver.location = rider.location = order.destination
+            driver_session.location = rider_session.location = order.destination
             self._log(
-                f"Order {order.id} completed: rider {rider.rider_id} dropped off at "
-                f"{order.destination} by driver {driver.driver_id}, "
+                f"Order {order.id} completed: rider {rider_session.rider_id} dropped off at "
+                f"{order.destination} by driver {driver_session.driver_id}, "
                 f"{self.current_time - order.timeline['searching for a driver']:.0f}s "
                 f"after ordering, fare {order.quote.price:.2f}"
             )
             self._finalize_order(order, "completed")
-            self._end_rider_session(rider, "trip completed")
-            if driver.shift_over:
-                self._end_driver_session(driver)
+            self._end_rider_session(rider_session, "trip completed")
+            if driver_session.shift_over:
+                self._end_driver_session(driver_session)
             return
         next_state = order.state
         self._schedule(delay, lambda: self._advance_ride(order, next_state))
