@@ -67,6 +67,7 @@ python3 scenarios/scenario.py        # play out the sample scenario
 python3 scenarios/scenario_100_riders.py  # 100 riders, 10 drivers, no playback delay
 python3 scenarios/scenario_500_riders.py  # 500 riders, 10 drivers, no playback delay
 python3 scenarios/scenario_realistic_week.py  # weekly peaks, 3,500 riders, 30 drivers
+python3 scenarios/scenario_100k_week.py  # ~95,000 completed rides/week, ~72% utilization
 ```
 
 The 100- and 500-rider scenarios use seed `0` and a 10-by-10 km map. All ten
@@ -94,6 +95,29 @@ start_hour=0)` returns sorted offsets in seconds. It samples a fixed total
 number of sessions with relative hourly weights, including partial hours.
 Match these calendar arguments to the scenario's clock; the weekly script
 uses `run(start=0, end=169)` (end hours may exceed 24 for multi-day runs).
+
+The **100k-rides week** scenario targets **90,000–110,000 completed rides** and
+**70–75% weekly driver utilization**. With its defaults and seed `0`, the current
+simulator produces **94,773 completed rides** and **72.12% utilization**:
+
+- 30,000 riders make seven sessions each: 210,000 sessions sampled across the
+  week using the same commute and nightlife peaks. Sessions are assigned in
+  arrival order, rotating through the riders to space out their repeat trips.
+- 555 drivers form three crews of 185, each working eight hours every day on
+  the same 10-by-10 km map. Drivers finish accepted trips after shift end.
+- Default fares, travel speed, and probabilistic rider/driver decisions apply.
+  Only session demand and driver supply are calibrated to the targets.
+- The run covers exactly Monday 00:00 to the following Monday 00:00 (168 hours),
+  with no extra drain hour. Trips still in progress at the boundary are excluded
+  from completions; their active and online time is counted only within the week.
+
+Run it with `.venv/bin/python scenarios/scenario_100k_week.py`. It runs without
+sleeping and writes the usual dashboard and exports to `logs/`, with hourly
+charts by default. `build_scenario(seed=0, rider_count=30_000,
+drivers_per_shift=185)` allows experiments; changed parameters, seeds, or model
+behavior may move the outcomes outside the calibrated ranges. Utilization is
+total active driver time / total online driver time, including shift overtime
+within the week, rather than an average of hourly percentages.
 
 A scenario only schedules when driver and rider sessions begin, then hands
 control to the clock. Everything after that (search, ordering, offers,
