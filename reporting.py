@@ -61,7 +61,8 @@ def run_configuration(sim, start, end, time_scale, initial_time, interval_minute
         },
         "source_sha256": {
             name: hashlib.sha256((source_dir / name).read_bytes()).hexdigest()
-            for name in ("main.py", "behavior.py", "demand.py", "metrics.py", "reporting.py", "report_template.html", "report_dashboard.js")
+            for name in ("main.py", "event_engine.py", "behavior.py", "demand.py", "metrics.py",
+                         "reporting.py", "report_template.html", "report_dashboard.js")
         },
     }
 
@@ -82,7 +83,7 @@ def collect_records(sim, initial_totals, initial_time):
                 "start_seconds": left, "end_seconds": right,
                 "session_started_at": session.started_at, "session_ended_at": session.ended_at,
             })
-    for order in itertools.chain(sim.order_history, sim.active_orders):
+    for order in itertools.chain(sim.order_history, sim.active_orders.values()):
         accepted_at = order.timeline.get("driver driving to pickup")
         if accepted_at is None:
             continue
