@@ -28,8 +28,10 @@ from decimal import ROUND_HALF_UP, Decimal
 from types import MappingProxyType
 from typing import Any, Mapping, NamedTuple, Optional
 
+from policy_contracts import freeze
+
 MAX_COMMITMENTS = 2  # accepted, unfinished orders per driver across all platforms
-SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 2
 ROLES = ("rider", "driver")
 CANCELLATION_PARTIES = ("rider", "driver", "platform")
 OFFER_DISPOSITIONS = ("accepted", "rejected", "expired", "canceled", "acceptance_failed")
@@ -93,7 +95,8 @@ class World:
     def __post_init__(self):
         finite(self.speed_kmh, "speed_kmh", strictly_positive=True)
         finite(self.boarding_seconds, "boarding_seconds", minimum=0)
-        if isinstance(self.minor_units_per_major, bool) or self.minor_units_per_major < 1:
+        if (isinstance(self.minor_units_per_major, bool) or not isinstance(self.minor_units_per_major, int)
+                or self.minor_units_per_major < 1):
             raise CommandRejected("minor_units_per_major must be a positive integer")
 
     def travel_seconds(self, distance_km):
@@ -208,6 +211,7 @@ class Driver:
     shift_id: Optional[int] = None
     commitments: list = field(default_factory=list)  # accepted order ids in service order
     service_id: Optional[int] = None  # the physical service currently performed
+    accounts: set = field(default_factory=set)
 
 
 @dataclass
@@ -218,6 +222,7 @@ class Rider:
     open_apps: set = field(default_factory=set)
     intent_id: Optional[int] = None  # the live trip intent
     service_id: Optional[int] = None  # the ride they are onboard
+    accounts: set = field(default_factory=set)
 
 
 @dataclass
@@ -253,6 +258,10 @@ class Quote:
     distance_km: float
     duration_seconds: float
     eta_seconds: Optional[float]  # None means the platform offered no supply
+    expires_at: float
+    policy_version: str
+    selected_rule: str
+    campaign_id: Optional[str] = None
 
     @property
     def drivers_available(self):
@@ -288,6 +297,7 @@ class Order:
     timeline: dict = field(default_factory=dict)
     cancellation: Optional[dict] = None
     settlement_ids: list = field(default_factory=list)
+    eta_predictions: list = field(default_factory=list)
 
     @property
     def terminal(self):
@@ -320,6 +330,9 @@ class Offer:
     state: str = "pending"
     resolved_at: Optional[float] = None
     reason: Optional[str] = None
+    policy_version: str = 'direct-v1'
+    selected_rule: str = 'default'
+    campaign_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -459,25 +472,25 @@ class PlatformView:
         order = self._engine.orders[order_id]
         if order.platform_id != self.platform_id:
             raise CommandRejected(f"Order {order_id} belongs to another platform")
-        return order
+        return freeze(order)
 
     def offer(self, offer_id):
         offer = self._engine.offers[offer_id]
         if offer.platform_id != self.platform_id:
             raise CommandRejected(f"Offer {offer_id} belongs to another platform")
-        return offer
+        return freeze(offer)
 
     def quote(self, quote_id):
         quote = self._engine.quotes[quote_id]
         if quote.platform_id != self.platform_id:
             raise CommandRejected(f"Quote {quote_id} belongs to another platform")
-        return quote
+        return freeze(quote)
 
     def own_orders(self):
-        return [order for order in self._engine.orders.values() if order.platform_id == self.platform_id]
+        return [freeze(order) for order in self._engine.orders.values() if order.platform_id == self.platform_id]
 
     def own_offers(self):
-        return [offer for offer in self._engine.offers.values() if offer.platform_id == self.platform_id]
+        return [freeze(offer) for offer in self._engine.offers.values() if offer.platform_id == self.platform_id]
 
 
 @dataclass(frozen=True)
@@ -534,7 +547,7 @@ class DriverView:
         return result
 
     def pending_offers(self):
-        return [self._engine.offers[offer_id]
+        return [freeze(self._engine.offers[offer_id])
                 for offer_id in self._engine._pending_offers_to_driver(self.driver_id)]
 
 
@@ -556,16 +569,16 @@ class RiderView:
 
     @property
     def intent(self):
-        return self._engine.intents.get(self._rider.intent_id)
+        return freeze(self._engine.intents.get(self._rider.intent_id))
 
     def quotes(self):
         intent = self.intent
-        return [] if intent is None else [self._engine.quotes[quote_id] for quote_id in intent.quote_ids]
+        return [] if intent is None else [freeze(self._engine.quotes[quote_id]) for quote_id in intent.quote_ids]
 
     @property
     def order(self):
         intent = self.intent
-        return None if intent is None or intent.live_order_id is None else self._engine.orders[intent.live_order_id]
+        return None if intent is None or intent.live_order_id is None else freeze(self._engine.orders[intent.live_order_id])
 
 
 # ----------------------------------------------------------------------
@@ -673,22 +686,28 @@ class MarketplaceEngine:
         self.cars[car_id] = Car(car_id, self._membership(registrations, "Car registrations"))
         return self.cars[car_id]
 
-    def add_driver(self, driver_id, apps, car_id):
+    def add_driver(self, driver_id, apps, car_id, *, accounts=None):
         if driver_id in self.drivers:
             raise CommandRejected(f"Driver {driver_id!r} already exists")
         car = self._car(car_id)
         if car.driver_id is not None:
             raise CommandRejected(f"Car {car_id!r} already has driver {car.driver_id!r}")
         driver = Driver(driver_id, self._membership(apps, "Driver apps"), car_id)
+        driver.accounts = set(driver.apps if accounts is None else accounts)
+        if not driver.accounts <= driver.apps:
+            raise CommandRejected('Accounts require installed apps')
         car.driver_id = driver_id
         self.drivers[driver_id] = driver
         return driver
 
-    def add_rider(self, rider_id, apps, location=None):
+    def add_rider(self, rider_id, apps, location=None, *, accounts=None):
         if rider_id in self.riders:
             raise CommandRejected(f"Rider {rider_id!r} already exists")
         rider = Rider(rider_id, self._membership(apps, "Rider apps"),
                       None if location is None else point(location, "Location"))
+        rider.accounts = set(rider.apps if accounts is None else accounts)
+        if not rider.accounts <= rider.apps:
+            raise CommandRejected('Accounts require installed apps')
         self.riders[rider_id] = rider
         return rider
 
@@ -696,6 +715,12 @@ class MarketplaceEngine:
         """A download. It does not open the app or change preferences."""
         self._platform(platform_id)
         self._person(role, person_id).apps.add(platform_id)
+
+    def activate_account(self, role, person_id, platform_id):
+        person = self._person(role, person_id)
+        if platform_id not in person.apps:
+            raise CommandRejected('An account requires an installed app')
+        person.accounts.add(platform_id)
 
     def register_car(self, car_id, platform_id):
         self._platform(platform_id)
@@ -763,6 +788,8 @@ class MarketplaceEngine:
         platform = self._platform(platform_id)
         if platform_id not in person.apps:
             raise CommandRejected(f"{role.capitalize()} {person_id!r} has not installed {platform_id!r}")
+        if platform_id not in person.accounts:
+            raise CommandRejected('App requires a usable account')
         if not platform.launched:
             raise CommandRejected(f"Platform {platform_id!r} has not launched")
         if platform_id in person.open_apps:
@@ -807,7 +834,7 @@ class MarketplaceEngine:
         shift = self.shifts.get(driver.shift_id)
         return (
             shift is not None and shift.exit_requested_at is None
-            and platform_id in driver.open_apps
+            and platform_id in driver.open_apps and platform_id in driver.accounts
             and platform_id in self.cars[driver.car_id].registrations
             and self.platforms[platform_id].launched
         )
@@ -851,12 +878,16 @@ class MarketplaceEngine:
                      outcome=outcome, reason=reason)
 
     def issue_quote(self, platform_id, intent_id, gross_minor, discount_minor=0, *,
-                    distance_km, duration_seconds, eta_seconds):
+                    distance_km, duration_seconds, eta_seconds, expires_at,
+                    policy_version='direct-v1', selected_rule='default', campaign_id=None):
         """A platform's frozen price and supply estimate for a rider's request."""
         platform = self._platform(platform_id)
         intent = self._intent(intent_id)
         rider = self.riders[intent.rider_id]
         fare = FareTerms(gross_minor, discount_minor)
+        finite(expires_at, 'expires_at')
+        if expires_at <= self.now:
+            raise CommandRejected('Quote expiry must be after the current time')
         finite(distance_km, "distance_km", minimum=0)
         finite(duration_seconds, "duration_seconds", minimum=0)
         finite(eta_seconds, "eta_seconds", minimum=0, allow_none=True)
@@ -868,7 +899,8 @@ class MarketplaceEngine:
             raise CommandRejected(f"Trip intent {intent_id} has ended")
         with self._transition():
             quote = Quote(self._next_id("quote"), platform_id, intent_id, rider.id, self.now,
-                          fare, distance_km, duration_seconds, eta_seconds)
+                          fare, distance_km, duration_seconds, eta_seconds, expires_at,
+                          policy_version, selected_rule, campaign_id)
             self.quotes[quote.id] = quote
             intent.quote_ids.append(quote.id)
             self._notify("rider", rider.id, "quote_received", quote_id=quote.id,
@@ -880,6 +912,8 @@ class MarketplaceEngine:
         intent = self._intent(intent_id)
         quote = self._quote(quote_id)
         rider = self.riders[intent.rider_id]
+        if self.now >= quote.expires_at:
+            raise CommandRejected(f'Quote {quote_id} has expired')
         if quote.intent_id != intent_id:
             raise CommandRejected(f"Quote {quote_id} was not issued for trip intent {intent_id}")
         if not intent.live:
@@ -894,6 +928,9 @@ class MarketplaceEngine:
             order = Order(self._next_id("order"), quote.platform_id, intent_id, rider.id,
                           intent.origin, intent.destination, quote.id, quote.fare, self.now)
             order.timeline["created"] = self.now
+            order.eta_predictions.append({'at': quote.at, 'target': 'pickup_arrival',
+                'eta_seconds': quote.eta_seconds, 'policy_version': quote.policy_version,
+                'selected_rule': quote.selected_rule, 'source': 'quote', 'source_id': quote.id})
             self.orders[order.id] = order
             intent.order_ids.append(order.id)
             intent.live_order_id = order.id
@@ -910,7 +947,8 @@ class MarketplaceEngine:
     # ----------------------------------------------------------------------
 
     def create_offer(self, platform_id, order_id, driver_id, payout_minor, bonus_minor=0, *,
-                     expires_at, eta_seconds=None):
+                     expires_at, eta_seconds=None, policy_version='direct-v1',
+                     selected_rule='default', campaign_id=None):
         """Propose an order to a driver. Offers reserve nothing globally."""
         self._platform(platform_id)
         order = self._order(order_id)
@@ -931,7 +969,8 @@ class MarketplaceEngine:
                 raise CommandRejected(f"Driver {driver_id!r} already has a pending offer for order {order_id}")
         with self._transition():
             offer = Offer(self._next_id("offer"), platform_id, order_id, driver_id, self.now,
-                          expires_at, payout, eta_seconds)
+                          expires_at, payout, eta_seconds, policy_version=policy_version,
+                          selected_rule=selected_rule, campaign_id=campaign_id)
             self.offers[offer.id] = offer
             order.offer_ids.append(offer.id)
             self._pending_by_order.setdefault(order_id, set()).add(offer.id)
@@ -942,6 +981,19 @@ class MarketplaceEngine:
                          destination=order.destination, payout_minor=payout.driver_payout_minor,
                          eta_seconds=eta_seconds, expires_at=expires_at)
         return offer
+
+    def revise_pickup_eta(self, platform_id, order_id, eta_seconds, policy_version, selected_rule):
+        """A local prediction revision; never schedule physical arrival from an estimate."""
+        order = self._order(order_id)
+        finite(eta_seconds, 'eta_seconds', minimum=0)
+        if order.platform_id != platform_id or order.terminal or 'arrived' in order.timeline:
+            raise CommandRejected('ETA revisions require an own order awaiting pickup')
+        with self._transition():
+            order.eta_predictions.append({'at': self.now, 'target': 'pickup_arrival',
+                'eta_seconds': eta_seconds, 'policy_version': policy_version,
+                'selected_rule': selected_rule, 'source': 'revision', 'source_id': order.id})
+            self._notify('rider', order.rider_id, 'pickup_eta_revised', order_id=order.id,
+                         platform_id=platform_id, eta_seconds=eta_seconds)
 
     def respond_to_offer(self, offer_id, accept):
         """Resolve a pending offer. Returns its disposition, or 'stale' if already resolved.
@@ -976,6 +1028,9 @@ class MarketplaceEngine:
         order.state = "assigned"
         order.assignment = Assignment(driver.id, driver.car_id, offer.id, self.now, offer.payout)
         order.timeline["assigned"] = self.now
+        order.eta_predictions.append({'at': offer.created_at, 'target': 'pickup_arrival',
+            'eta_seconds': offer.eta_seconds, 'policy_version': offer.policy_version,
+            'selected_rule': offer.selected_rule, 'source': 'offer', 'source_id': offer.id})
         driver.commitments.append(order.id)
         for other_id in list(self._pending_by_order.get(order.id, ())):
             self._resolve_offer(self.offers[other_id], "canceled", "order_assigned")
@@ -1318,12 +1373,12 @@ def _car(item):
 
 def _driver(item):
     return Driver(item["id"], set(item["apps"]), item["car_id"], set(item["open_apps"]),
-                  item["shift_id"], list(item["commitments"]), item["service_id"])
+                  item["shift_id"], list(item["commitments"]), item["service_id"], set(item["accounts"]))
 
 
 def _rider(item):
     return Rider(item["id"], set(item["apps"]), _opt_point(item["location"]), set(item["open_apps"]),
-                 item["intent_id"], item["service_id"])
+                 item["intent_id"], item["service_id"], set(item["accounts"]))
 
 
 def _shift(item):
@@ -1340,7 +1395,8 @@ def _intent(item):
 
 def _quote(item):
     return Quote(item["id"], item["platform_id"], item["intent_id"], item["rider_id"], item["at"],
-                 FareTerms(**item["fare"]), item["distance_km"], item["duration_seconds"], item["eta_seconds"])
+                 FareTerms(**item["fare"]), item["distance_km"], item["duration_seconds"], item["eta_seconds"],
+                 item["expires_at"], item["policy_version"], item["selected_rule"], item["campaign_id"])
 
 
 def _order(item):
@@ -1351,13 +1407,13 @@ def _order(item):
     return Order(item["id"], item["platform_id"], item["intent_id"], item["rider_id"], tuple(item["pickup"]),
                  tuple(item["destination"]), item["quote_id"], FareTerms(**item["fare"]), item["created_at"],
                  item["state"], assignment, list(item["offer_ids"]), item["service_id"], dict(item["timeline"]),
-                 item["cancellation"], list(item["settlement_ids"]))
+                 item["cancellation"], list(item["settlement_ids"]), list(item["eta_predictions"]))
 
 
 def _offer(item):
     return Offer(item["id"], item["platform_id"], item["order_id"], item["driver_id"], item["created_at"],
                  item["expires_at"], PayoutTerms(**item["payout"]), item["eta_seconds"], item["state"],
-                 item["resolved_at"], item["reason"])
+                 item["resolved_at"], item["reason"], item["policy_version"], item["selected_rule"], item["campaign_id"])
 
 
 def _service(item):

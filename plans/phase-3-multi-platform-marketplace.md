@@ -1,9 +1,9 @@
 # Phase 3: Rebu, Blot, and Flyt on one physical market
 
-Status: the event engine and the marketplace engine are implemented
-(`event_engine.py`, `marketplace_engine.py`); `main.py` composes a Rebu-only
-simulation on them. Policies, scenario definitions, and the experiment runner
-remain design documents.
+Status: event engine, marketplace engine, marketplace policies and behavior
+policies are implemented. `main.py` assembles a multi-platform market through
+`policy_runtime.py`. General scenario definitions and the multi-replication
+experiment runner remain roadmap work.
 
 The simulator's purpose is to compare experiments. Scenarios should require
 little configuration, inherit versioned defaults, and replace models without
@@ -208,28 +208,24 @@ randomness or supply hidden feedback to policies.
 
 | Milestone | Deliverable and acceptance gate |
 | --- | --- |
-| 0. Refactor and characterize | Done: scheduling (`event_engine.py`) and domain transitions (`marketplace_engine.py`) are separate; `main.py` holds Rebu's policy, participant behavior, and run/report orchestration. Legacy single-platform results were a sanity check, not a compatibility requirement. |
+| 0. Refactor and characterize | Done: scheduling (`event_engine.py`) and domain transitions (`marketplace_engine.py`) are separate; `main.py` now holds population and run/report orchestration; the policy modules own platform and participant decisions. Legacy single-platform results were a sanity check, not a compatibility requirement. |
 | 1. Definition and experiment foundation | Versioned presets, resolver/compiler, immutable plans, fresh run state, and paired variants. Reproduce a saved small experiment with all defaults explicit. |
 | 2. Shared market and platform views | Done in the engine: cars, trajectories, access, and scoped views/notifications. Same location at the same time; no competitor order visibility. |
-| 3. Offers and queued commitments | Done in the engine: competing offers, atomic two-order capacity, same/cross-platform queues, cancellation, and deferred offline; the ETA fixture and third-order races are checked. Independent estimators beyond Rebu's own remain policy work. |
-| 4. Economics and rider funnel | Engine side done: frozen fare/payout terms in minor units and conserving settlements. Independent tariffs, incentives, bounded app search, and rider retries remain policy work. |
-| 5. Participation and evolution | No-offer timers, app retention, second-order willingness, exposure-aware learning, adoption, and interventions. Preserve commitments during updates. |
+| 3. Offers and queued commitments | Done in the engine: competing offers, atomic two-order capacity, same/cross-platform queues, cancellation, and deferred offline; the ETA fixture and third-order races are checked. Independent local estimators and pickup ETA histories are implemented. |
+| 4. Economics and rider funnel | Done: committed minor-unit fares/payouts, independent tariffs and incentives, conserving settlements, bounded app search, cancellation and rider retries. |
+| 5. Participation and evolution | Implemented initial policies: no-offer timers, app retention, second-order willingness, exposure-aware learning, adoption, and interventions. Preserve commitments during updates. |
 | 6. Comparison and scale | Platform/time reports, replicate uncertainty, continuation, and small/weekly/multiweek measurements. Pass all cross-layer gates below. |
 
 Scheduling lives in `event_engine.py` and domain transitions in
 `marketplace_engine.py`; `Simulation.run()` in `main.py` remains the
-orchestration entry point until the experiment runner exists. Rebu's quote,
-estimate, and dispatch policy and the participants' order/accept decisions
-are methods on `Simulation` that issue engine commands and react to engine
-notifications; the marketplace-policy and behavior-policy contracts will move
-them behind declared interfaces. Module names are implementation choices, not
-a required package API.
+orchestration entry point until the experiment runner exists. Commercial logic
+lives in `marketplace_policy.py`, participant logic in `behavior_policy.py`, and
+`policy_runtime.py` supplies immutable scoped contexts and applies typed proposals.
+The detailed implementation contracts are owned by the two policy documents.
 
-There is no separate legacy adapter. The bundled scenarios run on the modern
-engine with Rebu as the only platform, one car per driver, fares rounded to
-minor units, and back-to-back dispatch to drivers with a free own slot. Their
-figures therefore differ from the single-platform calibration recorded before
-the engine existed; that calibration is a reference, not a target.
+There is no legacy adapter. Bundled scenarios now use the modern three-platform
+preset and explicit policy configuration. Earlier calibration figures are
+historical observations, not compatibility targets.
 
 ## Cross-layer acceptance gates
 

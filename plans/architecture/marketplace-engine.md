@@ -1,7 +1,7 @@
 # Marketplace engine
 
-Status: implemented in `marketplace_engine.py`. `main.py` composes a Rebu-only
-simulation on it. This document defines the physical and contractual
+Status: implemented in `marketplace_engine.py`. `main.py` composes a multi-platform
+simulation through `policy_runtime.py`. This document defines the physical and contractual
 mechanics used by the [phase 3 roadmap](../phase-3-multi-platform-marketplace.md).
 
 There is one physical market and one marketplace engine. Rebu, Blot, and Flyt

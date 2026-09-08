@@ -1,17 +1,4 @@
-"""A single-platform ride-hailing simulation composed on the marketplace engine.
-
-`Simulation` is the scenario-facing entry point. It builds one physical
-market with one platform, Rebu, and plays three roles on top of the
-engine's commands and notifications:
-
-- the scenario and runner: who shows up when, playback, logs, reports;
-- Rebu's marketplace policy: quotes, nearest-driver dispatch, offer terms;
-- participants' behavior: whether a rider orders and a driver accepts.
-
-The engine (`marketplace_engine.py`) owns positions, commitments, physical
-service, settlements, and legality. Nothing here moves a car or finishes a
-ride directly; it asks, and the engine decides what is possible.
-"""
+"""Scenario scheduling and run/report orchestration over explicit policy layers."""
 
 import logging
 import math
@@ -21,7 +8,10 @@ from datetime import datetime
 from pathlib import Path
 from tempfile import mkdtemp
 
-from behavior import decision_probability, finite_number
+from behavior_policy import PersonProfile, RiderTraits, DriverTraits, EvolutionTraits
+from marketplace_policy import PlatformPolicy
+from policy_contracts import RandomValues, finite_number, plain
+from policy_runtime import PolicyRuntime
 from event_engine import HandlerFailure, HandlerRegistry, Scheduler
 from marketplace_engine import MarketplaceEngine, World
 from metrics import INTERVAL_MINUTES
@@ -42,99 +32,102 @@ class Simulation:
     and going offline) is triggered from inside the simulation.
     """
 
-    platform_id = "rebu"
-    offer_timeout_seconds = 10
-    max_offers_per_order = 5
-
-    def __init__(
-        self,
-        driver_count=10,
-        rider_count=100,
-        seed=0,
-        speed_kmh=30,
-        base_fare=2.0,
-        price_per_km=1.5,
-        commission_fraction=0.0,
-        boarding_delay_seconds=30,
-        order_delay_seconds=5,
-        accept_delay_seconds=3,
-        rider_order_probability=0.55,
-        driver_acceptance_probability=0.70,
-        rider_price_sensitivity=1.0,
-        driver_price_sensitivity=1.0,
-        rider_eta_sensitivity=0.5,
-        driver_eta_sensitivity=0.5,
-        reference_price=10.0,
-        reference_eta_seconds=300,
-    ):
-        for name, value in (
-            ("rider_order_probability", rider_order_probability),
-            ("driver_acceptance_probability", driver_acceptance_probability),
-            ("commission_fraction", commission_fraction),
-        ):
-            finite_number(value, name, maximum=1)
-            setattr(self, name, value)
-        for name, value in (
-            ("rider_price_sensitivity", rider_price_sensitivity),
-            ("driver_price_sensitivity", driver_price_sensitivity),
-            ("rider_eta_sensitivity", rider_eta_sensitivity),
-            ("driver_eta_sensitivity", driver_eta_sensitivity),
-            ("base_fare", base_fare),
-            ("price_per_km", price_per_km),
-        ):
-            finite_number(value, name)
-            setattr(self, name, value)
-        for name, value in (("reference_price", reference_price),
-                            ("reference_eta_seconds", reference_eta_seconds)):
-            finite_number(value, name, strictly_positive=True)
-            setattr(self, name, value)
+    def __init__(self, driver_count=10, rider_count=100, seed=0, *, world=None,
+                 platforms=None, rider_profiles=None, driver_profiles=None):
         self.seed = seed
-        # Behavior never consumes the scenario's or the ID generator's RNG.
-        self._decision_rng = random.Random(seed)
-        self.speed_kmh = speed_kmh
-        self.boarding_delay_seconds = boarding_delay_seconds
-        # How long a rider thinks about a quote before ordering or leaving.
-        self.order_delay_seconds = order_delay_seconds
-        # How long a driver takes to answer an offer. At or past the offer
-        # timeout the offer expires first and the next driver is tried.
-        self.accept_delay_seconds = accept_delay_seconds
-
-        self.world = World(speed_kmh=speed_kmh, boarding_seconds=boarding_delay_seconds)
-        self._seconds_per_km = 3600 / self.world.speed_kmh
+        self.world = world or World()
+        configs = ({p: PlatformPolicy() for p in ('rebu', 'blot', 'flyt')}
+                   if platforms is None else dict(platforms))
+        if not configs or any(not isinstance(c, PlatformPolicy) for c in configs.values()):
+            raise ValueError('platforms must map IDs to compiled PlatformPolicy values')
+        for name, count in (('driver_count', driver_count), ('rider_count', rider_count)):
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError(f'{name} must be a nonnegative integer')
         registry = HandlerRegistry()
         self.engine = MarketplaceEngine(self.world, registry)
-        for kind, handler in (
-            ("driver_session.start", self._on_driver_session_start),
-            ("driver_session.end_shift", self._on_shift_end),
-            ("rider_session.start", self._on_rider_session_start),
-            ("rider_session.decide", self._on_quote_decision),
-            ("offer.respond", self._on_offer_response),
-        ):
-            registry.register(kind, handler)
-        self.scheduler = Scheduler(registry)
-        self.engine.bind(self.scheduler)
-        self.engine.add_listener(self._on_notification)
-
-        self.engine.add_platform(self.platform_id, "Rebu")
+        for platform_id in configs:
+            self.engine.add_platform(platform_id)
         self.drivers = generate_ids(9, driver_count, 1_000_000_000, seed)
         self.riders = generate_ids(8, rider_count, 10_000_000_000, seed)
-        for driver_id in self.drivers:
-            # One car per driver, registered with the only platform; it shares the driver's id.
-            self.engine.add_car(driver_id, {self.platform_id})
-            self.engine.add_driver(driver_id, {self.platform_id}, car_id=driver_id)
-        for rider_id in self.riders:
-            self.engine.add_rider(rider_id, {self.platform_id})
+        profiles = {}
+        default = PersonProfile(apps=tuple(configs), preferred_app=next(iter(configs)), awareness=tuple(configs))
+        for role, ids, selected in (('rider', self.riders, rider_profiles), ('driver', self.drivers, driver_profiles)):
+            if selected is None:
+                selected = [default] * len(ids)
+            elif isinstance(selected, PersonProfile):
+                selected = [selected] * len(ids)
+            elif callable(selected):
+                selected = [selected(pid, RandomValues(seed, ('profile', role, pid))) for pid in ids]
+            if len(selected) != len(ids):
+                raise ValueError(f'{role}_profiles must have one profile per person')
+            for person_id, profile in zip(ids, selected):
+                if not isinstance(profile, PersonProfile):
+                    raise ValueError('Population profiles must be PersonProfile values')
+                if (set(profile.apps) | set(profile.awareness) | set(profile.registrations)
+                        | set(profile.disclosed_to)) - set(configs):
+                    raise ValueError('Profile references an unknown platform')
+                profiles[PolicyRuntime.key(role, person_id)] = profile
+                if role == 'driver':
+                    if profile.preferred_app not in profile.registrations:
+                        raise ValueError('Driver preferred app requires vehicle registration')
+                    self.engine.add_car(person_id, profile.registrations)
+                    self.engine.add_driver(person_id, profile.apps, person_id, accounts=profile.accounts)
+                else:
+                    self.engine.add_rider(person_id, profile.apps, accounts=profile.accounts)
+        self.policies = PolicyRuntime(self.engine, registry, seed, configs, profiles)
+        self._register_sessions(registry)
+        self.scheduler = Scheduler(registry)
+        self.engine.bind(self.scheduler)
+        self._initialize_runner()
 
-        self.decisions = []  # behavior diagnostics: each draw with its probability
+    def _initialize_runner(self):
+        self.decisions = self.policies.decisions
         self.scenario_parameters = {}
         self.session_schedule = []
-        self.log_path = None
-        self.run_directory = None
-        self.report_path = None
-        # A private logger keeps lifecycle events out of the console, even if
-        # the application using this simulator configures the root logger.
+        self.log_path = self.run_directory = self.report_path = None
         self._logger = logging.Logger(__name__, level=logging.INFO)
         self._logger.propagate = False
+        self.engine.add_listener(lambda n: self._log(f'{n.audience}:{n.audience_id} {n.kind} {dict(n.data)}'))
+
+    def _register_sessions(self, registry):
+        for kind, handler in (('driver_session.start', self._on_driver_session_start),
+                              ('driver_session.end_shift', self._on_shift_end),
+                              ('rider_session.start', self._on_rider_session_start)):
+            registry.register(kind, handler)
+
+    def snapshot(self):
+        """Serializable event-boundary checkpoint, including all private memory and random identities."""
+        return {'schema_version': 1, 'seed': self.seed, 'engine': self.engine.snapshot(),
+                'scheduler': self.scheduler.snapshot(), 'policies': self.policies.snapshot(),
+                'profiles': {key: plain(profile) for key, profile in self.policies.profiles.items()},
+                'drivers': self.drivers, 'riders': self.riders, 'scenario_parameters': self.scenario_parameters,
+                'session_schedule': self.session_schedule}
+
+    @classmethod
+    def restore(cls, snapshot):
+        import copy
+        snapshot = copy.deepcopy(snapshot)
+        if snapshot['schema_version'] != 1:
+            raise ValueError('Unsupported simulation checkpoint schema')
+        sim = cls.__new__(cls)
+        sim.seed = snapshot['seed']
+        registry = HandlerRegistry()
+        sim.engine = MarketplaceEngine.restore(snapshot['engine'], registry)
+        sim.world = sim.engine.world
+        sim.drivers, sim.riders = snapshot['drivers'], snapshot['riders']
+        configs = {p: PlatformPolicy.compile(overrides=c['parameters'], rules=c['rules'], campaigns=c['campaigns'],
+                    version=c['version'], fallback=c['fallback']) for p, c in snapshot['policies']['platforms'].items()}
+        profiles = {key: PersonProfile(**(p | {'rider': RiderTraits(**p['rider']), 'driver': DriverTraits(**p['driver']),
+                    'evolution': EvolutionTraits(**p['evolution'])})) for key, p in snapshot['profiles'].items()}
+        sim.policies = PolicyRuntime(sim.engine, registry, sim.seed, configs, profiles)
+        sim.policies.restore_memory(snapshot['policies'])
+        sim._register_sessions(registry)
+        sim.scheduler = Scheduler.restore(snapshot['scheduler'], registry)
+        sim.engine.bind(sim.scheduler)
+        sim._initialize_runner()
+        sim.scenario_parameters = snapshot['scenario_parameters']
+        sim.session_schedule = snapshot['session_schedule']
+        return sim
 
     # ----------------------------------------------------------------------
     # External interface: scheduling sessions and moving the clock
@@ -150,6 +143,8 @@ class Simulation:
         if driver_id not in self.engine.drivers:
             raise ValueError(f"Unknown driver {driver_id!r}")
         location = _point(location, "Location")
+        if shift_seconds is not None:
+            finite_number(shift_seconds, 'shift_seconds', strictly_positive=True)
         self.scheduler.schedule_at(at_seconds, "driver_session.start", {
             "driver_id": driver_id, "location": location, "shift_seconds": shift_seconds,
         })
@@ -275,7 +270,7 @@ class Simulation:
             "shifts": len(engine.shifts), "intents": len(engine.intents), "quotes": len(engine.quotes),
             "orders": len(engine.orders), "offers": len(engine.offers),
             "settlements": len(engine.settlements), "decisions": len(self.decisions),
-            "events": self.scheduler.processed_count,
+            "events": self.scheduler.processed_count, "observations": len(self.policies.observations),
         }
 
     def _new_records(self, table, cursor_count):
@@ -312,7 +307,8 @@ class Simulation:
         converted = sum(intent.converted_at is not None for intent in intents)
         offer_states = {state: sum(offer.state == state for offer in offers)
                         for state in ("accepted", "rejected", "expired", "canceled", "acceptance_failed", "pending")}
-        distance = sum(engine.quotes[order.quote_id].distance_km for order in completed)
+        distance = sum(math.dist(leg.origin, leg.destination) for order in completed
+                       for leg in engine.services[order.service_id].legs if leg.kind == 'transport')
         payments = sum(s.rider_payment_minor for s in settlements) / self.world.minor_units_per_major
         payouts = sum(s.driver_payout_minor for s in settlements) / self.world.minor_units_per_major
         contribution = sum(s.platform_contribution_minor for s in settlements) / self.world.minor_units_per_major
@@ -365,232 +361,21 @@ class Simulation:
     def _money(self, minor):
         return minor / self.world.minor_units_per_major
 
-    def _draw_decision(self, probability):
-        return probability == 1 or (probability > 0 and self._decision_rng.random() < probability)
-
-    # ----------------------------------------------------------------------
-    # Scenario events: shifts and trips begin
-    # ----------------------------------------------------------------------
-
     def _on_driver_session_start(self, event):
-        driver_id, shift_seconds = event.payload["driver_id"], event.payload["shift_seconds"]
-        location = tuple(event.payload["location"])
-        shift = self.engine.start_shift(driver_id, location)
-        self.engine.open_app("driver", driver_id, self.platform_id)
-        self._log(f"Driver {driver_id} started a shift at {location}")
-        if shift_seconds is not None:
-            self._schedule(shift_seconds, "driver_session.end_shift",
+        driver_id = event.payload['driver_id']
+        shift = self.engine.start_shift(driver_id, tuple(event.payload['location']))
+        if event.payload['shift_seconds'] is not None:
+            self._schedule(event.payload['shift_seconds'], 'driver_session.end_shift',
                            driver_id=driver_id, shift_id=shift.id)
 
     def _on_shift_end(self, event):
-        driver = self.engine.drivers[event.payload["driver_id"]]
-        if driver.shift_id != event.payload["shift_id"]:
-            return
-        shift = self.engine.end_shift(driver.id)
-        if shift.ended_at is None:
-            self._log(f"Driver {driver.id} finishes the shift after order(s) {driver.commitments}")
+        driver = self.engine.drivers[event.payload['driver_id']]
+        if driver.shift_id == event.payload['shift_id']:
+            self.engine.end_shift(driver.id)
 
     def _on_rider_session_start(self, event):
-        rider_id = event.payload["rider_id"]
-        location, destination = tuple(event.payload["location"]), tuple(event.payload["destination"])
-        intent = self.engine.begin_intent(rider_id, location, destination)
-        self._log(f"Rider {rider_id} wants to travel from {location} to {destination} (trip {intent.id})")
-        # Opening the app is what asks Rebu for a quote.
-        self.engine.open_app("rider", rider_id, self.platform_id)
-
-    # ----------------------------------------------------------------------
-    # Notification routing: the platform and the participants react here
-    # ----------------------------------------------------------------------
-
-    def _on_notification(self, notification):
-        kind, data = notification.kind, notification.data
-        if notification.audience == "platform":
-            if kind == "rider_app_opened" and data["request"] is not None:
-                self._platform_quote(data["request"])
-            elif kind == "order_created":
-                self._platform_dispatch(data["order_id"])
-            elif kind == "offer_resolved" and data["state"] != "accepted":
-                self._platform_dispatch(data["order_id"])
-            elif kind == "order_completed":
-                order = self.engine.orders[data["order_id"]]
-                settlement = self.engine.settlements[data["settlement_id"]]
-                self._log(
-                    f"Order {order.id} completed: rider {order.rider_id} dropped off at "
-                    f"{order.destination} by driver {order.assignment.driver_id}, "
-                    f"{self.current_time - order.created_at:.0f}s after ordering, "
-                    f"paid {self._money(settlement.rider_payment_minor):.2f}, "
-                    f"driver payout {self._money(settlement.driver_payout_minor):.2f}"
-                )
-        elif notification.audience == "driver":
-            if kind == "offer_received":
-                self._schedule(self.accept_delay_seconds, "offer.respond", offer_id=data["offer_id"])
-            elif kind == "commitment_added":
-                self._log(f"Driver {notification.audience_id} accepted order {data['order_id']}"
-                          + (" and queued it behind the current ride" if data["position"] > 1 else ""))
-            elif kind == "arrived_at_pickup":
-                self._log(f"Driver {notification.audience_id} arrived at pickup for order {data['order_id']}")
-            elif kind == "rider_boarded":
-                self._log(f"Rider boarded with driver {notification.audience_id} for order {data['order_id']}")
-            elif kind == "shift_ended":
-                self._log(f"Driver {notification.audience_id} went offline at {data['location']}")
-        elif notification.audience == "rider":
-            if kind == "quote_received":
-                self._schedule(self.order_delay_seconds, "rider_session.decide",
-                               intent_id=data["intent_id"], quote_id=data["quote_id"])
-            elif kind == "order_created":
-                order = self.engine.orders[data["order_id"]]
-                self._log(f"Order {order.id} placed by rider {order.rider_id}: {order.pickup} to "
-                          f"{order.destination}, fare {self._money(order.fare.rider_payment_minor):.2f}")
-            elif kind == "order_canceled":
-                # The default rider does not retry: they leave once the platform gives up.
-                self.engine.end_intent(self.engine.orders[data["order_id"]].intent_id, data["reason"])
-            elif kind == "intent_ended":
-                self.engine.close_app("rider", notification.audience_id, self.platform_id)
-
-    # ----------------------------------------------------------------------
-    # Rebu's marketplace policy: quotes, estimates, and dispatch
-    # ----------------------------------------------------------------------
-
-    def calculate_duration(self, distance_km):
-        """Rebu's travel-time estimate: straight-line at the world speed."""
-        return self.world.travel_seconds(distance_km)
-
-    def calculate_price(self, distance_km):
-        """Return the base fare plus the distance charge, in currency units."""
-        return self.base_fare + distance_km * self.price_per_km
-
-    def _platform_quote(self, request):
-        """Price the trip and estimate the best pickup ETA from Rebu's own knowledge."""
-        view = self.engine.platform_view(self.platform_id)
-        distance_km = math.dist(request.origin, request.destination)
-        eta_seconds = min(
-            (self._estimated_pickup_eta(view, driver, request.origin)
-             for driver in view.drivers() if self._is_candidate(driver)),
-            default=None,
-        )
-        quote = self.engine.issue_quote(
-            self.platform_id, request.intent_id, self.world.to_minor(self.calculate_price(distance_km)),
-            distance_km=distance_km, duration_seconds=self.calculate_duration(distance_km),
-            eta_seconds=eta_seconds,
-        )
-        if quote.drivers_available:
-            self._log(f"Rider {request.rider_id} quoted {distance_km:.1f} km for "
-                      f"{self._money(quote.fare.gross_minor):.2f}, nearest driver {eta_seconds:.0f}s away")
-        else:
-            self._log(f"Rider {request.rider_id} quoted {distance_km:.1f} km, no drivers available")
-
-    def _is_candidate(self, driver):
-        """Rebu's local eligibility: accepting, nothing pending here, and a free own slot."""
-        return driver.accepting and not driver.pending_offer_ids and len(driver.own_order_ids) < 2
-
-    def _estimated_pickup_eta(self, view, driver, pickup):
-        """Remaining known Rebu service, then travel from where it ends to the pickup.
-
-        Rebu knows only its own orders. If the driver is actually busy for
-        another platform, that time is invisible and the estimate is optimistic.
-        """
-        position, seconds_per_km = driver.position, self._seconds_per_km
-        if not driver.own_order_ids:
-            return math.dist(position, pickup) * seconds_per_km
-        remaining = 0.0
-        for order_id in driver.own_order_ids:
-            order = view.order(order_id)
-            if "boarded" not in order.timeline:  # still to pick up, then board
-                remaining += math.dist(position, order.pickup) * seconds_per_km + self.boarding_delay_seconds
-                position = order.pickup
-            remaining += math.dist(position, order.destination) * seconds_per_km
-            position = order.destination
-        return remaining + math.dist(position, pickup) * seconds_per_km
-
-    def _platform_dispatch(self, order_id):
-        """Offer to the nearest untried eligible driver, up to the attempt limit."""
-        view = self.engine.platform_view(self.platform_id)
-        order = view.order(order_id)
-        if order.state != "open":
-            return
-        if len(order.offer_ids) >= self.max_offers_per_order:
-            self._platform_gives_up(order)
-            return
-        tried = {view.offer(offer_id).driver_id for offer_id in order.offer_ids}
-        best = None
-        for driver in view.drivers():
-            if driver.driver_id in tried or not self._is_candidate(driver):
-                continue
-            key = (self._estimated_pickup_eta(view, driver, order.pickup), driver.driver_id)
-            if best is None or key < best[0]:
-                best = (key, driver)
-        if best is None:
-            self._platform_gives_up(order)
-            return
-        (eta_seconds, _), driver = best
-        payout_minor = self.world.to_minor(self._money(order.fare.gross_minor) * (1 - self.commission_fraction))
-        offer = self.engine.create_offer(
-            self.platform_id, order.id, driver.driver_id, payout_minor,
-            expires_at=self.current_time + self.offer_timeout_seconds, eta_seconds=eta_seconds,
-        )
-        self._log(f"Offer {offer.id} for order {order.id} sent to driver {driver.driver_id}, "
-                  f"payout {self._money(payout_minor):.2f}, estimated pickup in {eta_seconds:.0f}s")
-
-    def _platform_gives_up(self, order):
-        self.engine.cancel_order(order.id, by="platform", reason="no drivers accepted")
-        self._log(f"Order {order.id} canceled: no drivers accepted; rider {order.rider_id} left")
-
-    # ----------------------------------------------------------------------
-    # Participant behavior: ordering a quote and answering an offer
-    # ----------------------------------------------------------------------
-
-    def rider_order_chance(self, quote):
-        """Probability of ordering this quote; unavailable supply always gives zero."""
-        if not quote.drivers_available:
-            return 0.0
-        return decision_probability(
-            self.rider_order_probability, self._money(quote.fare.rider_payment_minor), quote.eta_seconds,
-            self.reference_price, self.reference_eta_seconds,
-            -self.rider_price_sensitivity, self.rider_eta_sensitivity,
-        )
-
-    def driver_acceptance_chance(self, offer):
-        """Use the offered payout and the platform's displayed pickup ETA."""
-        return decision_probability(
-            self.driver_acceptance_probability, self._money(offer.payout.driver_payout_minor),
-            offer.eta_seconds, self.reference_price, self.reference_eta_seconds,
-            self.driver_price_sensitivity, self.driver_eta_sensitivity,
-        )
-
-    def _on_quote_decision(self, event):
-        intent = self.engine.intents[event.payload["intent_id"]]
-        if not intent.live or intent.live_order_id is not None:
-            return
-        quote = self.engine.quotes[event.payload["quote_id"]]
-        probability = self.rider_order_chance(quote)
-        ordered = self._draw_decision(probability)
-        self.decisions.append({
-            "type": "rider_decision", "at_seconds": self.current_time, "session_id": intent.id,
-            "rider_id": intent.rider_id, "ordered": ordered, "probability": probability,
-            "price": self._money(quote.fare.rider_payment_minor), "eta_seconds": quote.eta_seconds,
-        })
-        if ordered:
-            self.engine.place_order(intent.id, quote.id)
-        else:
-            reason = "quote declined" if quote.drivers_available else "no drivers available"
-            self._log(f"Rider {intent.rider_id} left: {reason} (order probability {probability:.3f})")
-            self.engine.end_intent(intent.id, reason)
-
-    def _on_offer_response(self, event):
-        offer = self.engine.offers[event.payload["offer_id"]]
-        if offer.state != "pending":
-            return
-        probability = self.driver_acceptance_chance(offer)
-        accept = self._draw_decision(probability)
-        self.decisions.append({
-            "type": "driver_decision", "at_seconds": self.current_time, "offer_id": offer.id,
-            "driver_id": offer.driver_id, "accept": accept, "probability": probability,
-            "payout": self._money(offer.payout.driver_payout_minor), "eta_seconds": offer.eta_seconds,
-        })
-        disposition = self.engine.respond_to_offer(offer.id, accept)
-        if disposition != "accepted":
-            self._log(f"Driver {offer.driver_id} answered offer {offer.id} for order {offer.order_id}: "
-                      f"{disposition} (acceptance probability {probability:.3f})")
+        self.engine.begin_intent(event.payload['rider_id'], tuple(event.payload['location']),
+                                 tuple(event.payload['destination']))
 
 
 def _point(value, name):

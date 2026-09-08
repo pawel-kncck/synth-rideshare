@@ -1,6 +1,6 @@
 # Behavior policy
 
-Status: proposed design, not implemented. Part of the
+Status: implemented initial behavior layer. Part of the
 [phase 3 roadmap](../phase-3-multi-platform-marketplace.md).
 
 Behavior policies decide what riders and drivers do. They model personal
@@ -8,6 +8,165 @@ preferences, sensitivities, attention, learning, and willingness to accept a
 second order. [Marketplace policies](marketplace-policy.md) determine what each
 platform offers; the [marketplace engine](marketplace-engine.md) enforces which
 requested actions are physically and contractually valid.
+
+## Shipped implementation and population API
+
+This file is the single behavior specification, including the initial model
+choices, configuration, memory, and limitations. Executable models live in
+`behavior_policy.py`: `RiderPolicy`, `DriverPolicy`, and `EvolutionPolicy`.
+`behavior.py` is removed. `policy_runtime.py` translates their proposals into
+engine commands and owns notification delivery, explicit state and guarded
+scheduling. `main.py` only assembles the population and schedules exogenous
+sessions. There is no legacy probability model or scenario compatibility mode.
+
+`Simulation(rider_profiles=..., driver_profiles=...)` accepts a `PersonProfile`,
+a list with one profile per person, or a factory `(person_id, random_values)`.
+Factories run once during population construction, so a seeded factory can
+sample correlated segment traits without resampling them on each trip. Profiles
+are immutable. Learned scores and preferences live in per-person runtime state;
+trip memories and shift/search memories are separate.
+
+```python
+from behavior_policy import PersonProfile, RiderTraits, DriverTraits, EvolutionTraits
+from main import Simulation
+
+person = PersonProfile(
+    apps=("rebu", "blot"), preferred_app="rebu",
+    accounts=("rebu", "blot"), registrations=("rebu", "blot"),
+    awareness=("rebu", "blot", "flyt"),
+    segment="commuter", disclosed_to=("rebu",),
+    rider=RiderTraits(eta_tolerance_seconds=300, patience_seconds=240),
+    driver=DriverTraits(no_offer_seconds=60, second_order_probability=.8),
+    evolution=EvolutionTraits(adoption_rate_per_day=.02, learning_rate=.1,
+                              onboard_car=True),
+)
+sim = Simulation(rider_profiles=person, driver_profiles=person)
+sim.policies.schedule_checkpoint(86400)
+```
+
+Access supports every nonempty subset of the configured apps independently by
+role. `preferred_app` must be in installed apps and usable accounts; drivers also
+require its vehicle registration. `accounts` defaults to installed apps and
+`registrations` defaults to accounts. The default population has all configured
+apps and initially prefers the first configured app (Rebu in the modern preset).
+Only launched usable apps participate. `awareness` explicitly identifies apps a
+person can discover before installation. A profile's latent `segment` is exposed
+only to platforms in `disclosed_to`.
+
+Engine installation, account activation, app opening and car registration are
+separate commands. At adoption, the initial onboarding flow records a download
+and account activation separately, optionally registers the assigned vehicle
+when `onboard_car=True`, and leaves preference and open apps unchanged. Without
+vehicle onboarding, a driver can download an app but cannot use it for offers.
+
+### Initial rider model
+
+`RiderTraits` defines price/ETA tolerance and sensitivity, loyalty, search cost,
+purchase bias, outside utility and taste scale. The route reference is
+`reference_base_minor + reference_per_km_minor * straight_line_km`, independent
+of the platform's tariff and discount. The inspection probability is the
+exponential response below using price excess above `acceptable_price_ratio`
+and ETA excess above `eta_tolerance_seconds`. Missing supply forces inspection
+when an unseen app remains. A fixed inspection draw is reused within an intent.
+
+The purchase utility is:
+
+```text
+purchase_bias - price_sensitivity * net_price / route_reference
+- eta_sensitivity * pickup_eta / eta_tolerance
++ loyalty * is_preferred + learned_score
+- search_cost * app_visit_index + taste_scale * logit(platform_taste_draw)
+```
+
+Compare it with `outside_utility + taste_scale * logit(outside_draw)`. Both draw
+identities persist for the intent. Ties choose stable platform IDs and the most
+recent quote within that platform. Quotes are compared only while valid; a
+repeat of an identical quote cannot grant a new independent conversion draw.
+The next unseen app ranks personal preference, learned score and known announced
+incentives, never a hidden quote or supply count.
+
+Defaults are `decision_seconds=5`, `opening_seconds=2`, `retry_seconds=2`,
+`patience_seconds=300`, `cancellation_after_seconds=600`, `max_app_visits=3`,
+`max_quote_refreshes=1`, `max_order_attempts=3`, and `attempts_per_app=1`. Search
+patience has its own deadline event; it stops search but does not erase a live
+order. Order progress can request cancellation before boarding. The rider retries
+only after the engine publishes actual cancellation. A canceled attempt remains
+under the same trip intent, whose conversion timestamp is assigned just once.
+For deterministic purchase tests use `taste_scale=0` and a sufficiently high or
+low `purchase_bias`, with explicit supply and delay assumptions.
+
+### Initial driver model and clocks
+
+Drivers open their preferred usable app at shift start. `DriverTraits` selects
+`expansion="multi_app"` or `"exclusive_switch"`, `after_service="retain"` or
+`"preferred"`, and `expand_while_busy` (default false). Expansion tracks visited
+channels so exclusive switching cannot cycle indefinitely. The default no-offer
+threshold is 60 seconds and further opening delay is 30 seconds. Every offer
+receipt resets no-offer time, even when the offer is rejected; app opening does
+not. Phase, acceptance, offer, app and shift generations suppress stale events.
+Apps required by accepted commitments remain open under policy-driven switches.
+
+Responses execute after `response_seconds=3` and recheck private capacity. The
+acceptance score combines `acceptance_bias`, normalized payout, normalized private
+pickup delay, loyalty and the learned score. Its logistic probability is
+multiplied by `second_order_probability` for a second commitment. No slot, shift
+exit, or exceeding `max_private_pickup_seconds` forces rejection. The displayed
+ETA and private estimate are stored separately on the proposal; the private
+estimate includes the driver's own preceding service across all apps. The actual
+engine response is stored in response memory. A driver never treats a requested
+acceptance as a confirmed assignment.
+
+`cancel_after_seconds` bounds commitment patience before boarding.
+`shift_exit="drain"` stops acceptance and finishes accepted orders;
+`"cancel_queued"` additionally requests cancellation of queued orders. The
+engine remains responsible for service promotion, occupancy and final shift exit.
+
+Personal diagnostics retain phase-specific `opportunity_exposure`,
+`personal_offer`, `opportunity_wait_censored`, `commitment_wait`,
+`back_to_back_ready`, and `post_dropoff_offer_wait`. Only idle or busy-with-one-slot
+opportunities accrue exposure. Full-capacity offers are recorded separately.
+An unqueued completion begins a post-drop-off search; a queued promotion records
+readiness without creating an idle interval. Physical idle time is derived from
+engine shift and physical service spans, separately from these search clocks.
+
+### Initial evolution model and checkpoints
+
+`EvolutionTraits` defaults both `adoption_rate_per_day` and `learning_rate` to
+zero. `adoption_friction` attenuates the rate exponentially; dissatisfaction with
+the preferred platform increases it. Only known, launched, missing apps enter the
+combined hazard. At most one target is drawn per explicitly scheduled checkpoint.
+This is a coarse-time approximation at high rates; use finer checkpoints when
+multiple downloads per period would matter.
+
+Rider rewards combine route-normalized net price, pickup wait and ETA error.
+Driver rewards combine actual payout and physical service duration; overlapping
+queued commitment waits never count as additional working hours. Cancellations
+produce negative observations. Rewards and learned scores are bounded to
+`[-2, 2]` and smoothed at the configured learning rate. There is no second reward
+for discounts or bonuses already represented in money experienced.
+
+For drivers, offer rates use `prior_offer_rate_per_second` and
+`prior_exposure_seconds`, separately by platform and idle/busy phase. The inverse
+is the estimated phase wait. A time-weighted bounded wait penalty combines with
+service reward scores. Platforms without exposure retain their priors. Raw
+observations remain exported so this estimator can be replaced. Learning rate
+zero leaves score values and preferences unchanged, even with new observations.
+
+Preference changes require `preference_margin` and
+`preference_cooldown_seconds`. Use
+`sim.policies.schedule_intervention(at_seconds, role="rider", person_id=...,
+preferred_app="blot")` for explicit preference changes independently of learning.
+At a checkpoint, all due interventions are applied first, all decisions use the
+same population snapshot, and only then are adoption and learning results
+applied. Exogenous trip/shift schedules and population counts never change.
+
+The built-in declarations specify parameter types, permitted observations,
+typed proposals, hooks and JSON memory fields/version. `Simulation.snapshot()`
+and `Simulation.restore()` preserve profiles, preferences, private memories,
+exposure, pending decisions, interventions and random identities. A general
+custom-policy registry and scenario compiler remain separate roadmap work;
+initial restore binds the shipped implementations. Run the acceptance suite with
+`python -m unittest discover -s tests -v`.
 
 ## Decision contract and information
 

@@ -5,7 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # make main.py 
 
 from main import Simulation
 
-sim = Simulation(driver_count=2, rider_count=5, seed=0, order_delay_seconds=5, accept_delay_seconds=3)
+sim = Simulation(driver_count=2, rider_count=5, seed=0)
 
 # A scenario only decides who shows up when. Everything after that (searching,
 # ordering, offers, driving, boarding, drop-off) plays out inside the simulation.

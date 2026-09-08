@@ -1,6 +1,6 @@
 # Marketplace policy
 
-Status: proposed design, not implemented. Part of the
+Status: implemented initial policy layer. Part of the
 [phase 3 roadmap](../phase-3-multi-platform-marketplace.md).
 
 Marketplace policies describe how Rebu, Blot, and Flyt each operate. They choose
@@ -8,6 +8,97 @@ commercial and operational rules, including rules conditional on known rider or
 driver segments. The [marketplace engine](marketplace-engine.md) validates and
 executes their commands; [behavior policies](behavior-policy.md) decide how people
 respond. These are separate decisions with different information available.
+
+## Shipped implementation and configuration
+
+Executable platform logic lives in `marketplace_policy.py`; `policy_runtime.py`
+builds detached immutable contexts and applies the typed proposals through
+`marketplace_engine.py`. `main.py` contains no pricing, matching or dispatch
+model. `behavior.py` has been removed; participant model details are owned by
+[Behavior policy](behavior-policy.md).
+
+`PlatformPolicy.compile(defaults=..., overrides=..., rules=..., campaigns=...,
+version="modern-v1", fallback="default")` provides strict Python binding.
+Unknown parameters, invalid amounts, unsupported model names, duplicate rule
+priorities/IDs, duplicate campaign IDs and a local commitment ceiling over two
+are errors. Each rule has `id`, `priority`, `when` and `parameters`. Conditions
+use exact equality on `role`, `segment`, `new_user` or `completed_rides`. Segment
+is present only for platforms named in the person's `disclosed_to`; completion
+history is maintained separately by platform and role. The explicit fallback is
+the fully resolved default parameter set. This binder is not the full scenario
+compiler described in the roadmap.
+
+```python
+from marketplace_policy import PlatformPolicy
+
+rebu = PlatformPolicy.compile(
+    defaults={"per_km_minor": 150, "commission_fraction": .2},
+    overrides={"base_fare_minor": 200},
+    version="launch-v1",
+    rules=[{
+        "id": "new-rider", "priority": 10,
+        "when": {"role": "rider", "new_user": True},
+        "parameters": {"multiplier": .9},
+    }],
+    campaigns=[{
+        "id": "launch", "start": 0, "end": 86400,
+        "discount_fraction": .2, "discount_cap_minor": 500,
+        "bonus_minor": 100, "awareness": "announced",
+    }],
+)
+```
+
+Amounts ending in `_minor` are integer minor currency units. The physical world
+sets the currency subdivision once. Tariff inputs are `base_fare_minor`,
+`per_km_minor`, `per_minute_minor`, `minimum_fare_minor`, `multiplier` and
+`commission_fraction`. Rounding uses decimal half-up on gross, discount and base
+payout; fixed integer bonuses are already normalized. Campaigns choose either
+`discount_minor` or `discount_fraction`, optionally `discount_cap_minor`, and
+`bonus_minor`. They support `segment`, `new_user_only`, and `awareness` equal to
+`announced` or `in_app`. Public announcements affect discovery; committed terms
+are always visible in the quote or offer itself.
+
+Named alternatives are `matching="nearest"` or `"pickup_eta"`, and
+`estimator="own_service"` or `"current_position"`. Both use straight-line
+kilometres with independently configured `estimated_speed_kmh` and
+`estimated_boarding_seconds`; neither controls physical travel. A strict local
+policy selects `max_local_commitments=1`; modern back-to-back selects two with
+`back_to_back_within_seconds` (default 1800). The nearest matcher breaks ties by
+stable driver ID, numerically for numeric IDs. It never filters on private free
+slots. Quote ETA is the minimum estimated pickup time over local candidates.
+
+Dispatch uses `max_attempts=5`, `retry_drivers=False`, `retry_seconds=1`,
+`order_patience_seconds=60`, `offer_seconds=10`, and `quote_seconds=30` by default.
+No-candidate decisions wait within the order deadline; they do not consume an
+offer attempt. Offers are clipped to the order's remaining dispatch patience.
+There is one unresolved offer per local order and per local driver. All retry
+scheduling carries order identities and generations.
+
+Quotes and offers store their policy version, selected rule, campaign ID and
+prediction time. Orders keep `eta_predictions` with target `pickup_arrival` and
+source quote, offer or revision. Assignment and completion of preceding own
+service trigger local revisions. A revision excludes the target ride's boarding
+and transport. It cannot trigger arrival or change committed payments. Physical
+leg origins are chosen by the engine when service actually starts. Exports keep
+estimated trip distance and actual completed transport distance separately.
+
+`rider_cancellation_fee_minor` and
+`driver_cancellation_compensation_minor` configure separate cancellation
+settlements for rider requests before boarding; defaults are zero. Driver and
+platform cancellation requests have zero fees. The current cancellation policy
+is consulted at request time; accepted completion payouts are never changed.
+Canceled attempts do not advance completed-ride eligibility.
+
+The initial controller is fixed: `controller` produces no tariff change. Use
+`sim.policies.schedule_controller(start, platform_id, interval_seconds=...,
+until_seconds=...)` for a bounded cadence with explicit serializable memory. Timed
+interventions explicitly select new compiled versions through
+`sim.policies.schedule_intervention`. Automatic surge, broadcast dispatch,
+road-network routing, campaign budgets, stacking variants and quests remain
+extensions rather than advertised implementations. Built-in declarations expose
+parameter types, permitted observations, typed outputs, lifecycle hooks and
+versioned JSON memory fields. Snapshots preserve the selected built-in versions
+and platform-local completion memory.
 
 ## Policy responsibilities
 
@@ -36,9 +127,9 @@ engine; no direct queue, mutable world object, wall-clock dependency, or ambient
 global RNG is part of the supported interface.
 
 Each implementation declares its version, parameter schema, permitted inputs,
-output types, memory schema, and supported lifecycle hooks. The
-[scenario compiler](scenario-definition.md) validates those declarations and
-binds selected implementations. Runtime checks still validate outputs.
+output types, memory schema, and supported lifecycle hooks. The strict Python configuration binding validates parameter schemas and binds
+the built-in implementations. The broader [scenario compiler](scenario-definition.md)
+remains a separate layer. Runtime checks still validate outputs.
 
 Resolve shared platform defaults, then platform-specific overrides, then the
 highest-priority matching conditional rule. Require explicit unique priorities
@@ -80,7 +171,6 @@ service. That does not grant knowledge of service elsewhere.
 Rejection, expiry, or an unsuccessful acceptance can trigger the next bounded
 attempt. Define retry delay, whether a driver can be retried, and overall order
 patience explicitly. Defaults use distinct drivers and positive retry delays.
-Legacy compatibility retains its existing immediate bounded redispatch behavior.
 When no attempt remains, end the platform order and notify the rider policy;
 do not automatically end the underlying trip intent inside dispatch logic.
 
@@ -137,8 +227,7 @@ and commission fractions in `[0, 1]`. Negative contribution is allowed.
 Each platform can set its own tariffs, commissions, and campaigns. Discounting
 the rider does not reduce base driver payout; the platform funds the discount.
 A driver bonus does not increase rider payment. Currency changes within a run
-are not supported initially. Legacy quotes retain existing arithmetic through
-their explicit compatibility policy, without silently imposing modern rounding.
+are not supported. All quotes use the modern commitment and rounding rules.
 
 Supported initial campaign settings include start/end, fixed or capped percentage
 rider discount, fixed completion bonus, visible segment/new-user eligibility,

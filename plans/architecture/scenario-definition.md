@@ -50,8 +50,7 @@ version. Do not publish a preset that relies on incidental constructor defaults.
 
 ## Defaults, overrides, and provenance
 
-Use complete versioned presets, including an explicit legacy single-platform
-preset and a modern three-platform preset. Label synthetic defaults; calibration
+Use complete versioned modern presets, including a three-platform preset. Label synthetic defaults; calibration
 is a separate artifact with its source and applicable model version. A future
 default change creates a new preset version, not a changed meaning of `@1`.
 
@@ -184,11 +183,10 @@ Errors name the exact field, policy/rule, expected contract, and conflicting
 value/reference. Report independent configuration errors together where possible.
 Warnings explain unresolved runtime risks without silently rewriting a scenario.
 
-Legacy `Simulation(...)` calls map to a named Rebu-only compatibility definition:
-existing fare arithmetic, decision draw sequence, idle-only local dispatch,
-timeout semantics, and default timings. It does not exercise two commitments.
-Do not mix legacy fare arguments with modern platform tariff definitions or
-inject new rounding and random draws into this path.
+The shipped Python API uses explicit world, platform policy, and population
+profile values. Old scalar `Simulation(...)` pricing and probability arguments
+are removed. The future compiler should bind this modern contract directly;
+legacy scenario compatibility is not a requirement.
 
 Test minimal preset resolution; immutable version pinning; unknown-key errors;
 policy replacement; segment-rule precedence; invalid app/car access; conflicting

@@ -3,12 +3,15 @@
 import csv
 import hashlib
 import json
+import math
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
 from plotly import __version__ as plotly_version
 from plotly.offline import get_plotlyjs
+
+from policy_contracts import plain
 
 from metrics import INTERVAL_MINUTES, OFFER_OUTCOME_KEYS, aggregate_intervals, summarize_intervals
 
@@ -20,7 +23,7 @@ def write_json(path, value):
 def run_configuration(sim, start, end, time_scale, initial_time, interval_minutes):
     source_dir = Path(__file__).resolve().parent
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run": {
             "id": sim.run_directory.name,
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -33,19 +36,10 @@ def run_configuration(sim, start, end, time_scale, initial_time, interval_minute
         },
         "simulation": {
             "seed": sim.seed,
-            "platform_id": sim.platform_id,
-            "driver_count": len(sim.drivers),
-            "rider_count": len(sim.riders),
-            "minor_units_per_major": sim.world.minor_units_per_major,
-            **{key: getattr(sim, key) for key in (
-                "speed_kmh", "base_fare", "price_per_km", "commission_fraction",
-                "boarding_delay_seconds", "order_delay_seconds", "accept_delay_seconds",
-                "offer_timeout_seconds", "max_offers_per_order",
-                "rider_order_probability", "driver_acceptance_probability",
-                "rider_price_sensitivity", "driver_price_sensitivity",
-                "rider_eta_sensitivity", "driver_eta_sensitivity",
-                "reference_price", "reference_eta_seconds",
-            )},
+            "driver_count": len(sim.drivers), "rider_count": len(sim.riders),
+            "world": plain(sim.world),
+            "platforms": {p: plain(policy.config) for p, policy in sim.policies.platforms.items()},
+            "profiles": {key: plain(profile) for key, profile in sim.policies.profiles.items()},
         },
         "scenario": sim.scenario_parameters,
         "scheduled_sessions": sim.session_schedule,
@@ -53,7 +47,7 @@ def run_configuration(sim, start, end, time_scale, initial_time, interval_minute
             "default_interval_minutes": interval_minutes,
             "available_interval_minutes": list(INTERVAL_MINUTES),
             "plotly_version": plotly_version,
-            "coverage_definition": "A quote finding at least one eligible driver with a free order slot anywhere on the map.",
+            "coverage_definition": "A quote finding a locally eligible driver; hidden competitor commitments may prevent acceptance.",
             "utilization_definition": "Physical service seconds (pickup travel, boarding, transport) divided by online driver seconds; pending offers and queued commitments are idle.",
             "interval_definition": "Intervals start at the run's initial time; only the final interval includes its right endpoint.",
             "session_to_order_definition": "Sessions that placed an order / sessions started in this run, grouped by session start; outcomes observed through run end, including undecided sessions in denominator.",
@@ -61,7 +55,8 @@ def run_configuration(sim, start, end, time_scale, initial_time, interval_minute
         },
         "source_sha256": {
             name: hashlib.sha256((source_dir / name).read_bytes()).hexdigest()
-            for name in ("main.py", "marketplace_engine.py", "event_engine.py", "behavior.py", "demand.py",
+            for name in ("main.py", "marketplace_engine.py", "event_engine.py", "behavior_policy.py", "marketplace_policy.py",
+                         "policy_runtime.py", "policy_contracts.py", "demand.py",
                          "metrics.py", "reporting.py", "report_template.html", "report_dashboard.js")
         },
     }
@@ -94,6 +89,8 @@ def collect_records(sim, cursor, initial_time):
             "location": intent.origin, "destination": intent.destination,
             "drivers_available": quote.drivers_available, "eta_seconds": quote.eta_seconds,
             "distance_km": quote.distance_km, "duration_seconds": quote.duration_seconds,
+            "expires_at": quote.expires_at, "policy_version": quote.policy_version,
+            "selected_rule": quote.selected_rule, "campaign_id": quote.campaign_id,
             "price": money(quote.fare.rider_payment_minor),
         })
     for intent in new(engine.intents, "intents"):
@@ -103,13 +100,36 @@ def collect_records(sim, cursor, initial_time):
             records.append({"type": "trip_ended", "at_seconds": intent.ended_at, "session_id": intent.id,
                             "rider_id": intent.rider_id, "outcome": intent.outcome, "reason": intent.reason,
                             "converted": intent.converted_at is not None})
+    for intent in new(engine.intents, 'intents'):
+        if intent.converted_at is None and intent.ended_at is None:
+            continue
+        observed = [engine.quotes[q] for q in intent.quote_ids]
+        records.append({'type': 'rider_decision',
+                        'at_seconds': intent.converted_at if intent.converted_at is not None else intent.ended_at,
+                        'session_id': intent.id, 'rider_id': intent.rider_id,
+                        'ordered': intent.converted_at is not None,
+                        'eta_seconds': min((q.eta_seconds for q in observed if q.eta_seconds is not None), default=None)})
+    # Censor unfinished personal observation windows at the report horizon,
+    # without mutating learning memory or affecting subsequent decisions.
+    for driver_id in engine.drivers:
+        state = sim.policies.state('driver', driver_id)
+        if state['phase'] in ('idle', 'busy') and state['at'] < now:
+            for platform_id in state['apps']:
+                records.append({'type': 'opportunity_exposure', 'driver_id': driver_id,
+                    'platform_id': platform_id, 'phase': state['phase'],
+                    'start_seconds': max(initial_time, state['at']), 'end_seconds': now, 'censored': True})
+        if state.get('post_dropoff_since') is not None:
+            records.append({'type': 'post_dropoff_offer_wait', 'driver_id': driver_id,
+                'start_seconds': state['post_dropoff_since'], 'end_seconds': now, 'censored': True})
+    records.extend(dict(obs) for obs in sim.policies.observations[cursor['observations']:])
     records.extend(dict(decision) for decision in sim.decisions[cursor["decisions"]:])
     for offer in new(engine.offers, "offers"):
         records.append({
             "type": "offer_created", "at_seconds": offer.created_at, "offer_id": offer.id,
             "order_id": offer.order_id, "platform_id": offer.platform_id, "driver_id": offer.driver_id,
             "price": money(offer.payout.driver_payout_minor), "eta_seconds": offer.eta_seconds,
-            "expires_at": offer.expires_at,
+            "expires_at": offer.expires_at, "policy_version": offer.policy_version,
+            "selected_rule": offer.selected_rule, "campaign_id": offer.campaign_id,
         })
         if offer.state != "pending":
             records.append({"type": "offer_resolved", "at_seconds": offer.resolved_at, "offer_id": offer.id,
@@ -132,12 +152,17 @@ def collect_records(sim, cursor, initial_time):
                 "end_reason": service.end_reason,
             })
     for order in new(engine.orders, "orders"):
+        for prediction in order.eta_predictions:
+            records.append({'type': 'pickup_eta_prediction', 'at_seconds': prediction['at'],
+                            'order_id': order.id, 'platform_id': order.platform_id, **prediction})
         if order.state == "completed":
             records.append({
                 "type": "order_completed", "at_seconds": order.timeline["completed"],
                 "order_id": order.id, "platform_id": order.platform_id,
                 "driver_id": order.assignment.driver_id, "rider_id": order.rider_id,
-                "distance_km": engine.quotes[order.quote_id].distance_km,
+                "distance_km": sum(math.dist(leg.origin, leg.destination)
+                                   for leg in engine.services[order.service_id].legs if leg.kind == 'transport'),
+                "estimated_distance_km": engine.quotes[order.quote_id].distance_km,
                 "fare": money(order.fare.rider_payment_minor),
             })
         elif order.state == "canceled":

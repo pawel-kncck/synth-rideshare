@@ -14,13 +14,7 @@ from main import Simulation
 def build_scenario(seed=0, rider_count=3500):
     rng = random.Random(seed)
     demand = WeeklyDemandProfile()
-    sim = Simulation(
-        driver_count=30, rider_count=rider_count, seed=seed,
-        rider_order_probability=0.55, driver_acceptance_probability=0.70,
-        rider_price_sensitivity=1.0, driver_price_sensitivity=1.0,
-        rider_eta_sensitivity=0.5, driver_eta_sensitivity=0.5,
-        reference_price=10.0, reference_eta_seconds=300,
-    )
+    sim = Simulation(driver_count=30, rider_count=rider_count, seed=seed)
     sim.scenario_parameters = {
         "name": "Realistic week", "start_weekday": "Monday", "start_hour": 0,
         "demand_duration_hours": 168, "drain_hours": 1,

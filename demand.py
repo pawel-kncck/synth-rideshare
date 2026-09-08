@@ -4,7 +4,7 @@ import math
 import random
 from dataclasses import dataclass
 
-from behavior import finite_number
+from policy_contracts import finite_number
 
 
 @dataclass(frozen=True)
