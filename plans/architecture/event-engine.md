@@ -112,8 +112,9 @@ raises stops the scheduler: the exception is wrapped in `HandlerFailure`, which
 carries the record, the simulated time, the recently processed records, and
 the original exception as its cause. The scheduler refuses further steps after
 a failure so that a partly executed transition is never retried automatically.
-`Simulation.run()` writes the failed event and the events before it into
-`config.json` with a failed status. Domain handlers must validate before
+`Simulation.run()` writes the failed event, recent events, traceback, and raw
+final state into `simulation.log` with a failed status. Offline analysis in
+`metrics.py` uses the actual stopping time. Domain handlers must validate before
 mutating and publish outputs after a coherent transition.
 
 ## Continuation and observation

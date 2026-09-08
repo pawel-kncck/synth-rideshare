@@ -183,8 +183,8 @@ sets, and comparison windows belong to [phase 4](phase-4-experiment-runner.md).
 
 ## Metrics and reports
 
-The following contracts guide scenario validation using current reports and
-exported records. New platform/time comparison panels, replicate uncertainty,
+The following contracts guide scenario validation using raw logs and
+offline calculations in `metrics.py`. New platform/time comparison panels, replicate uncertainty,
 and performance benchmarks belong to phase 4; they are not additional phase 3
 implementation steps.
 
@@ -206,14 +206,15 @@ can overlap, including service elsewhere, and cannot be summed as physical hours
 
 Use consistent platform/time filters, cohort definitions, and weighted ratios.
 Reconstruct ownership at arbitrary window starts from snapshots and changes.
-Keep Python and dashboard metrics in parity. Reports do not consume behavioral
-randomness or supply hidden feedback to policies.
+Keep all metric calculations in `metrics.py`, after execution, using the raw
+log. Analysis does not consume behavioral randomness or supply hidden feedback
+to policies.
 
 ## Implementation sequence
 
 | Milestone | Deliverable and acceptance gate |
 | --- | --- |
-| 0. Refactor and characterize | Done: scheduling (`event_engine.py`) and domain transitions (`marketplace_engine.py`) are separate; `main.py` now holds population and run/report orchestration; the policy modules own platform and participant decisions. Legacy single-platform results were a sanity check, not a compatibility requirement. |
+| 0. Refactor and characterize | Done: scheduling (`event_engine.py`) and domain transitions (`marketplace_engine.py`) are separate; `main.py` now holds population and execution and raw logging; the policy modules own platform and participant decisions. Legacy single-platform results were a sanity check, not a compatibility requirement. |
 | 1. Shared market and platform views | Done in the engine: cars, trajectories, access, and scoped views/notifications. Same location at the same time; no competitor order visibility. |
 | 2. Offers and queued commitments | Done in the engine: competing offers, atomic two-order capacity, same/cross-platform queues, cancellation, and deferred offline; the ETA fixture and third-order races are checked. Independent local estimators and pickup ETA histories are implemented. |
 | 3. Economics and rider funnel | Done: committed minor-unit fares/payouts, independent tariffs and incentives, conserving settlements, bounded app search, cancellation and rider retries. |
@@ -228,7 +229,8 @@ to that phase.
 
 Scheduling lives in `event_engine.py` and domain transitions in
 `marketplace_engine.py`; `Simulation.run()` in `main.py` remains the
-orchestration entry point until the experiment runner exists. Commercial logic
+execution/logging entry point until the experiment runner exists. Offline
+metrics are calculated separately by `metrics.py`. Commercial logic
 lives in `marketplace_policy.py`, participant logic in `behavior_policy.py`, and
 `policy_runtime.py` supplies immutable scoped contexts and applies typed proposals.
 The detailed implementation contracts are owned by the two policy documents.

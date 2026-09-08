@@ -61,4 +61,4 @@ def build_scenario(seed=0, rider_count=30_000, drivers_per_shift=185):
 
 if __name__ == "__main__":
     # Stop at Sunday midnight: next-week completions do not count toward the target.
-    build_scenario().run(start=0, end=WEEK_HOURS, time_scale=False, interval_minutes=60)
+    build_scenario().run(start=0, end=WEEK_HOURS, time_scale=False)

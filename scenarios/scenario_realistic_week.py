@@ -38,4 +38,4 @@ def build_scenario(seed=0, rider_count=3500):
 
 
 if __name__ == "__main__":
-    build_scenario().run(start=0, end=169, time_scale=False, interval_minutes=60)
+    build_scenario().run(start=0, end=169, time_scale=False)

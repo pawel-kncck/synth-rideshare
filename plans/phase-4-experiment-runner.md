@@ -6,7 +6,9 @@ period of extensive scenario testing.
 
 The detailed design lives in [Experiment runner](architecture/experiment-runner.md).
 This phase builds on compiled scenario definitions and the existing marketplace,
-policy, checkpoint, and report contracts.
+policy, checkpoint, raw-log, and offline metric contracts. All metric
+calculations remain in `metrics.py` and run only after simulation execution;
+future comparison outputs consume those results.
 
 ## Scope and implementation sequence
 
@@ -15,7 +17,7 @@ policy, checkpoint, and report contracts.
 | 1. Experiment definition and execution | Baseline and named variants, replication seeds, semantic diffs, saved manifests, and fresh state per variant and replication. Reproduce a saved small experiment with all defaults explicit. |
 | 2. Controlled inputs and reproducibility | Shared populations and exogenous schedules where compatible, stable random identities, implementation provenance, and explicit failure records. Validate repeatability and independence from logging/report detail. |
 | 3. Windows and continuation | Declared warm-up, treatment, measurement, cutoff/drain behavior, and checkpoint integration. Continuous and resumed runs agree without duplicated boundary records or invented terminal outcomes. |
-| 4. Comparison and reporting | Platform/time reports, paired differences, replicate uncertainty, raw numerators/denominators, and Python/dashboard metric parity. Keep unfinished outcomes and undefined shares visible. |
+| 4. Comparison and reporting | Platform/time reports, paired differences, replicate uncertainty, raw numerators/denominators, and shared metric definitions in `metrics.py`. Keep unfinished outcomes and undefined shares visible. |
 | 5. Scale and performance | Small, weekly, and multiweek measurements; metrics-only batch output; resource limits; serial/parallel equality where parallel execution is supported. Profile runtime, peak memory, candidate scans, event counts, logs, and reports before optimizing. |
 
 ## Validation and handoff

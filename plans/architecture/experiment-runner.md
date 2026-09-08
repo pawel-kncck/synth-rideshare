@@ -5,6 +5,11 @@ and execution layer of the [phase 4 roadmap](../phase-4-experiment-runner.md).
 Implementation follows phase 3 scenario definitions and extensive scenario testing.
 
 The runner evaluates a baseline and scenario variants under declared controls.
+The current execution path writes a structured `simulation.log`; `metrics.py`
+reconstructs summaries and optional intervals separately after execution. Any
+future runner must preserve that separation and keep metric calculations in
+`metrics.py`. Rendering and comparison outputs described below are future work.
+
 Its output is reproducible evidence about model behavior, including uncertainty
 and failures. It does not decide which app someone uses or how a platform prices.
 
@@ -140,8 +145,9 @@ platform service, commitment, and exposure measures.
 
 Aggregate ratios from counts/time, not averages of interval percentages. Preserve
 exact clipped spans, start-cohort definitions, and snapshots needed to reconstruct
-ownership at arbitrary window starts. Ensure Python, JSON/CSV exports, and the
-dashboard's platform/time filters agree.
+ownership at arbitrary window starts. Keep calculations in `metrics.py`; future
+exports or visualizations must consume its results instead of reimplementing
+metric formulas.
 
 ## Comparison and interpretation
 
@@ -206,6 +212,6 @@ instead of a hidden global-idle filter. Metrics-only mode must preserve outcomes
 
 Validate serial/parallel equality, trace/report independence, repeatable saved
 definitions, continuous/resumed equality, exact boundary accounting, money and
-entity conservation, Python/JavaScript metric parity, undefined shares, and
-failure visibility. Use the old weekly calibration only for legacy regression;
+entity conservation, consistent metrics across analysis outputs, undefined
+shares, and failure visibility. Use the old weekly calibration only for legacy regression;
 do not force new-model outcomes to match its ride count or utilization.

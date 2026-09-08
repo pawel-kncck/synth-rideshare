@@ -1,10 +1,12 @@
-"""Scenario scheduling and run/report orchestration over explicit policy layers."""
+"""Scenario scheduling and raw run logging over explicit policy layers."""
 
-import logging
+import hashlib
+import json
 import math
 import random
 import time
-from datetime import datetime
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import mkdtemp
 
@@ -14,7 +16,6 @@ from policy_contracts import RandomValues, finite_number, plain
 from policy_runtime import PolicyRuntime
 from event_engine import HandlerFailure, HandlerRegistry, Scheduler
 from marketplace_engine import MarketplaceEngine, World
-from metrics import INTERVAL_MINUTES
 
 
 def generate_ids(prefix, count, upper, seed):
@@ -84,10 +85,9 @@ class Simulation:
         self.decisions = self.policies.decisions
         self.scenario_parameters = {}
         self.session_schedule = []
-        self.log_path = self.run_directory = self.report_path = None
-        self._logger = logging.Logger(__name__, level=logging.INFO)
-        self._logger.propagate = False
-        self.engine.add_listener(lambda n: self._log(f'{n.audience}:{n.audience_id} {n.kind} {dict(n.data)}'))
+        self.log_path = self.run_directory = None
+        self._log_stream = None
+        self.engine.add_listener(self._log_notification)
 
     def _register_sessions(self, registry):
         for kind, handler in (('driver_session.start', self._on_driver_session_start),
@@ -179,12 +179,24 @@ class Simulation:
         """Process every event due up to the target time, then set the clock there."""
         self.scheduler.advance_to(target_time)
 
-    def run(self, start=6, end=23, time_scale=3600, log_dir="logs", interval_minutes=15):
-        """Play the clock, save a run report and log, and print a run summary.
+    def _write_log(self, kind, **data):
+        """Write raw observations only; metric calculations live in metrics.py."""
+        if self._log_stream is not None:
+            record = {"type": kind, "at_seconds": self.current_time, **data}
+            self._log_stream.write(json.dumps(record, allow_nan=False, separators=(",", ":")) + "\n")
 
-        time_scale is simulated seconds per runtime second: 1 is real time,
-        0.5 is half speed, and 60 plays a simulated minute in one second.
-        False skips sleeping entirely. Numeric zero is invalid.
+    def _log_notification(self, notification):
+        if self._log_stream is not None:
+            self._write_log("notification", notification=plain(notification))
+
+    def run(self, start=6, end=23, time_scale=3600, log_dir="logs"):
+        """Advance the simulation and save one JSON Lines simulation.log.
+
+        No summary, interval aggregation, or analysis runs here. After this
+        returns, use ``python metrics.py PATH/TO/simulation.log`` separately.
+        time_scale is simulated seconds per real second; False skips sleeping.
+        Initial/final checkpoints preserve raw histories, pending work, policy
+        diagnostics and exact continuation boundaries for offline analysis.
         """
         if time_scale is not False and (
             isinstance(time_scale, bool)
@@ -193,173 +205,66 @@ class Simulation:
             or time_scale <= 0
         ):
             raise ValueError("time_scale must be a finite positive number or False")
+        if not all(isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t)
+                   for t in (start, end)):
+            raise ValueError("Run hours must be finite numbers")
         end_time = (end - start) * 3600
         if not math.isfinite(end_time):
             raise ValueError("Run duration must be finite")
         if end_time < self.current_time:
             raise ValueError("Run end time is before the current simulation time")
-        if isinstance(interval_minutes, bool) or interval_minutes not in INTERVAL_MINUTES:
-            raise ValueError("interval_minutes must be 5, 15, 30, or 60")
 
-        # Load the reporting dependency before processing any simulation events.
-        from reporting import collect_records, run_configuration, write_json, write_report
-
-        initial_time = self.current_time
-        cursor = self._cursor()
         directory = Path(log_dir)
         directory.mkdir(parents=True, exist_ok=True)
         self.run_directory = Path(mkdtemp(
             dir=directory, prefix=f"simulation-{datetime.now():%Y%m%d-%H%M%S}-"
         )).resolve()
         self.log_path = self.run_directory / "simulation.log"
-        self.report_path = None
-        configuration = run_configuration(self, start, end, time_scale, initial_time, int(interval_minutes))
-        write_json(self.run_directory / "config.json", configuration)
-        with self.log_path.open("w", encoding="utf-8") as log_file:
-            handler = logging.StreamHandler(log_file)
-            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-            self._logger.addHandler(handler)
-            started_at = time.perf_counter()
+        source_dir = Path(__file__).resolve().parent
+        sources = ("main.py", "marketplace_engine.py", "event_engine.py", "behavior_policy.py",
+                   "marketplace_policy.py", "policy_runtime.py", "policy_contracts.py", "demand.py")
+        with self.log_path.open("w", encoding="utf-8") as stream:
+            self._log_stream = stream
             try:
-                self._log(
-                    f"Run started: hours {start:g} to {end:g}, end at {end_time:g}s, "
-                    f"time_scale={time_scale}, seed={self.seed}, "
-                    f"drivers={len(self.drivers)}, riders={len(self.riders)}"
-                )
-                if time_scale is False:
-                    self.advance_to(end_time)
+                self._write_log("run_started", schema_version=1, run_id=self.run_directory.name,
+                    created_at=datetime.now(timezone.utc).isoformat(), start_hour=start,
+                    target_end_seconds=end_time, time_scale=time_scale,
+                    source_sha256={name: hashlib.sha256((source_dir / name).read_bytes()).hexdigest()
+                                   for name in sources})
+                self._write_log("state", boundary="initial", snapshot=self.snapshot())
+                stream.flush()
+                started_at = time.perf_counter()
+                try:
+                    if time_scale is False:
+                        self.advance_to(end_time)
+                    else:
+                        self.advance_to(self.current_time)
+                        while self.current_time < end_time:
+                            next_time = self.scheduler.next_time()
+                            next_time = end_time if next_time is None else min(next_time, end_time)
+                            time.sleep((next_time - self.current_time) / time_scale)
+                            self.advance_to(next_time)
+                except BaseException as error:
+                    failure = {"error_type": type(error).__name__, "error": str(error),
+                               "traceback": traceback.format_exc()}
+                    if isinstance(error, HandlerFailure):
+                        failure["failed_event"] = error.record.to_dict()
+                        failure["events_before_failure"] = [record.to_dict() for record in error.recent]
+                    runtime = time.perf_counter() - started_at
+                    self._write_log("state", boundary="final", snapshot=self.snapshot())
+                    self._write_log("run_finished", status="failed", runtime_seconds=runtime, **failure)
+                    raise
                 else:
-                    self.advance_to(self.current_time)
-                    while self.current_time < end_time:
-                        next_time = self.scheduler.next_time()
-                        next_time = end_time if next_time is None else min(next_time, end_time)
-                        time.sleep((next_time - self.current_time) / time_scale)
-                        self.advance_to(next_time)
-
-                runtime = time.perf_counter() - started_at
-                configuration["run"].update(status="completed", runtime_seconds=runtime)
-                records = collect_records(self, cursor, initial_time)
-                self.report_path = write_report(self.run_directory, configuration, records)
-                summary = self._run_summary(cursor, initial_time, runtime, time_scale)
-                self._logger.info("%s", summary)
-            except BaseException as error:
-                self._logger.exception("Run stopped at simulated time %gs", self.current_time)
-                configuration["run"].update(status="failed", stopped_at_seconds=self.current_time)
-                if isinstance(error, HandlerFailure):
-                    # Enough to find the event again in a rerun of the same scenario.
-                    configuration["run"]["failed_event"] = error.record.to_dict()
-                    configuration["run"]["events_before_failure"] = [
-                        record.to_dict() for record in error.recent
-                    ]
-                write_json(self.run_directory / "config.json", configuration)
-                raise
+                    runtime = time.perf_counter() - started_at
+                    self._write_log("state", boundary="final", snapshot=self.snapshot())
+                    self._write_log("run_finished", status="completed", runtime_seconds=runtime)
             finally:
-                self._logger.removeHandler(handler)
-                handler.close()
+                self._log_stream = None
 
-        print(summary)
-
-    # ----------------------------------------------------------------------
-    # Run accounting. Engine records have sequential ids, so a cursor of
-    # the counts at run start selects what this run created.
-    # ----------------------------------------------------------------------
-
-    def _cursor(self):
-        engine = self.engine
-        return {
-            "shifts": len(engine.shifts), "intents": len(engine.intents), "quotes": len(engine.quotes),
-            "orders": len(engine.orders), "offers": len(engine.offers),
-            "settlements": len(engine.settlements), "decisions": len(self.decisions),
-            "events": self.scheduler.processed_count, "observations": len(self.policies.observations),
-        }
-
-    def _new_records(self, table, cursor_count):
-        return [record for record in table.values() if record.id > cursor_count]
-
-    def _driver_hours(self, initial_time):
-        """Physical online and service time within this run's interval."""
-        now = self.current_time
-
-        def duration(started_at, ended_at):
-            end = now if ended_at is None else min(ended_at, now)
-            return max(0, end - max(started_at, initial_time))
-
-        online = math.fsum(duration(shift.started_at, shift.ended_at)
-                           for shift in self.engine.shifts.values()) / 3600
-        # Service is pickup travel, boarding, and transport actually performed;
-        # a queued commitment adds nothing until its own pickup travel starts.
-        in_service = math.fsum(duration(service.started_at, service.ended_at)
-                               for service in self.engine.services.values()) / 3600
-        return online, in_service, online - in_service
-
-    def _run_summary(self, cursor, initial_time, runtime, time_scale):
-        engine = self.engine
-        intents = self._new_records(engine.intents, cursor["intents"])
-        quotes = self._new_records(engine.quotes, cursor["quotes"])
-        orders = self._new_records(engine.orders, cursor["orders"])
-        offers = self._new_records(engine.offers, cursor["offers"])
-        settlements = [s for s in self._new_records(engine.settlements, cursor["settlements"])
-                       if s.reason == "completed_ride"]
-        completed = [order for order in orders if order.state == "completed"]
-        canceled = sum(order.state == "canceled" for order in orders)
-        unserved = sum(intent.outcome == "abandoned" for intent in intents)
-        undecided = sum(intent.live and intent.converted_at is None for intent in intents)
-        converted = sum(intent.converted_at is not None for intent in intents)
-        offer_states = {state: sum(offer.state == state for offer in offers)
-                        for state in ("accepted", "rejected", "expired", "canceled", "acceptance_failed", "pending")}
-        distance = sum(math.dist(leg.origin, leg.destination) for order in completed
-                       for leg in engine.services[order.service_id].legs if leg.kind == 'transport')
-        payments = sum(s.rider_payment_minor for s in settlements) / self.world.minor_units_per_major
-        payouts = sum(s.driver_payout_minor for s in settlements) / self.world.minor_units_per_major
-        contribution = sum(s.platform_contribution_minor for s in settlements) / self.world.minor_units_per_major
-        pickup_waits = [order.timeline["arrived"] - order.timeline["created"] for order in completed]
-        pickup_wait = f"{sum(pickup_waits) / len(pickup_waits):.2f}s" if pickup_waits else "n/a"
-        simulated = self.current_time - initial_time
-        playback = "as fast as possible (no sleep)" if time_scale is False else f"{time_scale:g}x"
-        online_hours, service_hours, idle_hours = self._driver_hours(initial_time)
-        utilization = f"{service_hours / online_hours:.2%}" if online_hours else "n/a"
-        covered = sum(quote.drivers_available for quote in quotes)
-        coverage = f"{covered / len(quotes):.2%}" if quotes else "n/a"
-        conversion = f"{converted / len(intents):.2%}" if intents else "n/a"
-        acceptance = f"{offer_states['accepted'] / len(offers):.2%}" if offers else "n/a"
-        on_shift = sum(driver.shift_id is not None for driver in engine.drivers.values())
-        live_intents = sum(intent.live for intent in engine.intents.values())
-        active_orders = sum(not order.terminal for order in engine.orders.values())
-        queued = sum(max(0, len(driver.commitments) - 1) for driver in engine.drivers.values())
-        return "\n".join([
-            "Simulation run summary",
-            f"  Simulated: {simulated:.2f}s ({simulated / 3600:.2f}h); "
-            f"runtime: {runtime:.3f}s; speed: {playback}",
-            f"  Driver shifts: {len(engine.shifts) - cursor['shifts']} started; {on_shift} on shift at end",
-            f"  Driver hours: {online_hours:.2f} online; {service_hours:.2f} in service; "
-            f"{idle_hours:.2f} idle; utilization: {utilization}",
-            f"  Rider trips: {len(intents)} started; {live_intents} live at end",
-            f"  Search coverage: {coverage} ({covered} of {len(quotes)} quotes)",
-            f"  Trip conversion: {conversion} ({converted} of {len(intents)} trips; {undecided} undecided)",
-            f"  Offer acceptance: {acceptance} ({offer_states['accepted']} of {len(offers)} offers; "
-            f"{offer_states['rejected']} rejected; {offer_states['expired']} expired; "
-            f"{offer_states['canceled']} canceled; {offer_states['acceptance_failed']} failed; "
-            f"{offer_states['pending']} pending)",
-            f"  Orders: {len(orders)} created; {len(completed)} completed; {canceled} canceled; "
-            f"{active_orders} active at end ({queued} queued behind another ride)",
-            f"  Riders leaving without a ride: {unserved}",
-            f"  Completed trips: {distance:.2f} km; rider payments: {payments:.2f}; "
-            f"driver payouts: {payouts:.2f}; platform contribution: {contribution:.2f}",
-            f"  Average order-to-pickup wait (completed trips): {pickup_wait}",
-            f"  Events: {self.scheduler.processed_count - cursor['events']} processed; "
-            f"{self.scheduler.pending_count} pending at end",
-            f"  Log: {self.log_path}",
-            f"  Report: {self.report_path}",
-        ])
+        print(f"Simulation finished. Log: {self.log_path}")
 
     def _schedule(self, delay_seconds, kind, **payload):
         return self.scheduler.schedule_after(delay_seconds, kind, payload)
-
-    def _log(self, message):
-        self._logger.info("[%6.0fs] %s", self.current_time, message)
-
-    def _money(self, minor):
-        return minor / self.world.minor_units_per_major
 
     def _on_driver_session_start(self, event):
         driver_id = event.payload['driver_id']
