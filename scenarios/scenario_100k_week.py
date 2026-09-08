@@ -1,4 +1,4 @@
-"""A seeded week targeting 90–110k completed rides and 70–75% utilization."""
+"""A seeded week with 30,000 riders and 555 drivers on one 10-by-10 km map."""
 
 import random
 import sys
@@ -16,10 +16,12 @@ SESSIONS_PER_RIDER = 7
 
 
 def build_scenario(seed=0, rider_count=30_000, drivers_per_shift=185):
-    """Defaults yield 94,766 completions and 72.11% utilization over 168 hours.
+    """Defaults yield 103,719 completions and 71.94% utilization over 168 hours.
 
-    Calibrated at seed 0 with the current simulator. Custom parameters or seeds
-    may change the results; all decisions and ride outcomes remain autonomous.
+    The population was calibrated at seed 0, before the marketplace engine
+    existed, to 90-110k rides and 70-75% utilization; back-to-back dispatch
+    now completes more rides per online hour. Custom parameters or seeds
+    change the results; all decisions and ride outcomes remain autonomous.
     """
     for name, value in (("rider_count", rider_count), ("drivers_per_shift", drivers_per_shift)):
         if type(value) is not int or value <= 0:
