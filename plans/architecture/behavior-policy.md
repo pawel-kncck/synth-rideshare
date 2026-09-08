@@ -16,39 +16,45 @@ choices, configuration, memory, and limitations. Executable models live in
 `behavior_policy.py`: `RiderPolicy`, `DriverPolicy`, and `EvolutionPolicy`.
 `behavior.py` is removed. `policy_runtime.py` translates their proposals into
 engine commands and owns notification delivery, explicit state and guarded
-scheduling. `main.py` only assembles the population and schedules exogenous
-sessions. There is no legacy probability model or scenario compatibility mode.
+scheduling. `scenario.py` realizes the population and exogenous sessions from
+a compiled definition, and `main.py` only executes one prepared run. There is
+no legacy probability model or scenario compatibility mode.
 
-`Simulation(rider_profiles=..., driver_profiles=...)` accepts a `PersonProfile`,
-a list with one profile per person, or a factory `(person_id, random_values)`.
-Factories run once during population construction, so a seeded factory can
-sample correlated segment traits without resampling them on each trip. Profiles
-are immutable. Learned scores and preferences live in per-person runtime state;
-trip memories and shift/search memories are separate.
+Populations are declared in the scenario: behavior defaults for each trait
+family, correlated segments with weights and trait overrides, and explicit
+people for deterministic fixtures. Personal values resolve as behavior defaults,
+then the segment, then the explicit person. Segment traits may be distributions
+sampled once per person with a seed derived from the person's stable identity,
+so a trait is never resampled on a later trip. Realized `PersonProfile` values
+are saved as input artifacts and are immutable. Learned scores and preferences
+live in per-person runtime state; trip memories and shift/search memories are
+separate. Segment `initial_scores` seed the learned scores.
 
 ```python
-from behavior_policy import PersonProfile, RiderTraits, DriverTraits, EvolutionTraits
-from main import Simulation
+from scenario import Scenario, person, segment
 
-person = PersonProfile(
-    apps=("rebu", "blot"), preferred_app="rebu",
-    accounts=("rebu", "blot"), registrations=("rebu", "blot"),
-    awareness=("rebu", "blot", "flyt"),
-    segment="commuter", disclosed_to=("rebu",),
-    rider=RiderTraits(eta_tolerance_seconds=300, patience_seconds=240),
-    driver=DriverTraits(no_offer_seconds=60, second_order_probability=.8),
-    evolution=EvolutionTraits(adoption_rate_per_day=.02, learning_rate=.1,
-                              onboard_car=True),
-)
-sim = Simulation(rider_profiles=person, driver_profiles=person)
-sim.policies.schedule_checkpoint(86400)
+scenario = (Scenario(preset="three-platform-week@1")
+    .with_changes({
+        "behavior.rider.parameters.eta_tolerance_seconds": 300,
+        "behavior.evolution.parameters.learning_rate": .1,
+        "population.riders.segments.rebu-first.rider.patience_seconds": {"uniform": [180, 360]},
+        "evolution.checkpoint_hours": 24,
+    })
+    .add("population.drivers.people", person(
+        "d-commuter", apps=("rebu", "blot"), preferred_app="rebu", registrations=("rebu", "blot"),
+        awareness=("rebu", "blot", "flyt"), disclosed_to=("rebu",),
+        driver={"no_offer_seconds": 60, "second_order_probability": .8},
+        evolution={"adoption_rate_per_day": .02, "onboard_car": True})))
 ```
 
+The compiler rejects an unusable preferred app, a driver whose car is not
+registered for it, membership of an unlaunched platform, unknown platform
+references, weights that do not sum to one and out-of-range trait values.
 Access supports every nonempty subset of the configured apps independently by
 role. `preferred_app` must be in installed apps and usable accounts; drivers also
 require its vehicle registration. `accounts` defaults to installed apps and
-`registrations` defaults to accounts. The default population has all configured
-apps and initially prefers the first configured app (Rebu in the modern preset).
+`registrations` defaults to accounts. The published presets mix segments that
+install all three apps with different first choices and a Rebu-only segment.
 Only launched usable apps participate. `awareness` explicitly identifies apps a
 person can discover before installation. A profile's latent `segment` is exposed
 only to platforms in `disclosed_to`.
@@ -153,9 +159,10 @@ observations remain exported so this estimator can be replaced. Learning rate
 zero leaves score values and preferences unchanged, even with new observations.
 
 Preference changes require `preference_margin` and
-`preference_cooldown_seconds`. Use
-`sim.policies.schedule_intervention(at_seconds, role="rider", person_id=...,
-preferred_app="blot")` for explicit preference changes independently of learning.
+`preference_cooldown_seconds`. A scenario `preference_change` intervention
+targeting a segment or an explicit people list sets preferences independently
+of learning; the compiler checks static access and that the app is launched
+by then. Checkpoints come from the scenario's `evolution.checkpoint_hours`.
 At a checkpoint, all due interventions are applied first, all decisions use the
 same population snapshot, and only then are adoption and learning results
 applied. Exogenous trip/shift schedules and population counts never change.

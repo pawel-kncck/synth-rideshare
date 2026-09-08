@@ -26,7 +26,7 @@ use exact equality on `role`, `segment`, `new_user` or `completed_rides`. Segmen
 is present only for platforms named in the person's `disclosed_to`; completion
 history is maintained separately by platform and role. The explicit fallback is
 the fully resolved default parameter set. This binder is not the full scenario
-compiler described in the roadmap.
+compiler; scenarios bind the same values through `platforms.<id>.policy`.
 
 ```python
 from marketplace_policy import PlatformPolicy
@@ -89,11 +89,12 @@ platform cancellation requests have zero fees. The current cancellation policy
 is consulted at request time; accepted completion payouts are never changed.
 Canceled attempts do not advance completed-ride eligibility.
 
-The initial controller is fixed: `controller` produces no tariff change. Use
-`sim.policies.schedule_controller(start, platform_id, interval_seconds=...,
-until_seconds=...)` for a bounded cadence with explicit serializable memory. Timed
-interventions explicitly select new compiled versions through
-`sim.policies.schedule_intervention`. Automatic surge, broadcast dispatch,
+The initial controller is fixed: `controller` produces no tariff change. A
+platform's scenario `controller` setting (`interval_hours`, `until_hours`)
+schedules a bounded cadence with explicit serializable memory. Timed
+`policy_change` interventions in the scenario select new compiled versions;
+scenario campaigns declare `start_hours`/`end_hours`, which the compiler
+converts to simulated seconds. Automatic surge, broadcast dispatch,
 road-network routing, campaign budgets, stacking variants and quests remain
 extensions rather than advertised implementations. Built-in declarations expose
 parameter types, permitted observations, typed outputs, lifecycle hooks and

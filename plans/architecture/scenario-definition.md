@@ -1,10 +1,60 @@
 # Scenario definition
 
-Status: proposed design, not implemented. Preset names and API examples below
-illustrate authoring contracts for the
-[phase 3 roadmap](../phase-3-multi-platform-marketplace.md). This is phase 3's
-final implementation step, followed by extensive scenario testing before the
-[phase 4 experiment runner](../phase-4-experiment-runner.md).
+Status: implemented in `scenario.py`, executed by `main.py`. This was phase 3's
+final implementation step in the
+[phase 3 roadmap](../phase-3-multi-platform-marketplace.md); extensive scenario
+testing follows before the [phase 4 experiment runner](../phase-4-experiment-runner.md).
+
+## Shipped implementation
+
+`Scenario(preset="three-platform-week@1")` selects a published preset;
+`Scenario.from_definition(dict)` and `Scenario.load(path)` accept a complete
+definition or a saved plan manifest. `with_changes({path: value})` sets values
+by dotted path (maps merge by schema, lists are replaced), `add(path, item)`
+and `remove(path, id)` edit keyed collections and ID tables, and `renamed`
+labels the variant. Typed builders (`campaign`, `rule`, `peak`, `segment`,
+`person`, `shift`, `trip`, `launch`, `policy_change`, `preference_change`,
+`platform_policy`) return complete items. Times are authored in hours after
+the calendar origin and normalized to seconds; money stays in declared minor units.
+
+`compile_scenario(scenario)` returns an immutable `Plan`: the canonical resolved
+definition, per-value provenance (`preset:<id>`, `definition`, or
+`change[i]:<op> <path>`), warnings, compiled `PlatformPolicy` values, selected
+implementations, behavior defaults, segment plans, explicit people, intervention
+entries ordered by time then launch/policy/preference, checkpoint times and
+fingerprints for the definition, controls, implementations and plan.
+`diff_plans(baseline, variant)` lists leaf-level semantic differences including
+inherited values and implementation replacements. `Plan.save(path)` writes the
+manifest; loading it reproduces the same definition fingerprint.
+
+`Plan.prepare(seed)` realizes `Inputs`: population records (stable `rider-n`,
+`driver-n`, `car-driver-n` identities, segment assignment by largest-remainder
+counts and seeded order, traits sampled once per person from declared
+distributions) and sessions (`trip-n` in arrival order, rotation or explicit
+shifts). `Inputs.reuse_for(variant_plan)` shares identities and schedules with
+a variant whose world, population and activity sections are unchanged.
+`main.Simulation(inputs)` builds fresh state and `run()` executes to the horizon.
+
+Implementations are selected by `name@version` from `policy_runtime.py`'s
+registry (`register_policy(family, cls)`), one for riders, drivers, evolution
+and each platform's marketplace. A replacement must accept the family's
+parameter schema and hooks; the replaced implementation's parameters are not
+carried over. The compiler cannot prove custom Python correct.
+
+Published presets: `three-platform-day@1` (one Monday, 10 drivers, 100 riders,
+one trip each) and `three-platform-week@1` (Monday through Sunday plus a drain
+hour, 30 drivers in three crews, 3,500 riders, weekday and weekend peaks, daily
+checkpoints). Both are labeled `calibration: synthetic` and write every default
+out under their version. A `scenario.ScenarioError` reports every independent
+configuration error together, each naming its path.
+
+Supported activity generators are `rotation`/`explicit`/`none` shifts and
+`weekly`/`explicit`/`none` trips; the only conflict policy is `fail`. Static
+checks reject crews whose shifts overlap, overlapping explicit shift windows and
+same-second trips for one rider, and warn about trips within a rider's search
+patience. Endogenous demand, queue/defer policies, unit conversion of money,
+JSON/YAML front ends beyond `Scenario.load`, and restricted formula languages
+are not implemented.
 
 Phase 3 must support compiling a definition and executing a single seeded scenario
 through the existing `Simulation` orchestration. It must not depend on the phase 4

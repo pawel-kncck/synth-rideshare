@@ -196,17 +196,17 @@ def load_run(path):
             if kind == "run_started":
                 if header is not None or line_number != 1:
                     raise ValueError("Expected exactly one run_started record at the beginning")
-                if record.get("schema_version") != 1:
+                if record.get("schema_version") != 2:
                     raise ValueError("Unsupported run log schema")
                 header = record
             elif header is None:
                 raise ValueError("Missing run_started record; legacy text logs are not supported")
             elif kind == "state":
                 snapshot = record["snapshot"]
-                if (snapshot.get("schema_version") != 1
+                if (snapshot.get("schema_version") != 2
                         or snapshot["engine"].get("schema_version") != 2
                         or snapshot["scheduler"].get("schema_version") != 1
-                        or snapshot["policies"].get("schema_version") != 1):
+                        or snapshot["policies"].get("schema_version") != 2):
                     raise ValueError("Unsupported state schema in run log")
                 if record["boundary"] == "initial" and initial is None and final is None:
                     initial = snapshot

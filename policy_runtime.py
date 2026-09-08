@@ -14,12 +14,76 @@ from marketplace_engine import CommandRejected
 from policy_contracts import Cancel, Decision, RandomValues, Stop, Wait, finite_number, freeze, plain
 
 
-class PolicyRuntime:
-    schema_version = 1
+# Policy implementations are selected by identity and version, never by an
+# anonymous callback embedded in scenario data. A replacement must consume the
+# family's parameter schema (or a subclass) because profiles and platform
+# configurations are typed values, and must support the family's hooks.
+POLICY_FAMILIES = {
+    'rider': (RiderPolicy, ('decide', 'progress')),
+    'driver': (DriverPolicy, ('expand', 'respond', 'progress')),
+    'evolution': (EvolutionPolicy, ('checkpoint',)),
+    'marketplace': (MarketplacePolicy, ('quote', 'dispatch', 'revise', 'cancel', 'controller')),
+}
+POLICY_REGISTRY = {family: {} for family in POLICY_FAMILIES}
 
-    def __init__(self, engine, registry, seed, platforms, profiles):
+
+def policy_id(implementation):
+    declaration = implementation.declaration
+    return f'{declaration.name}@{declaration.version}'
+
+
+def register_policy(family, implementation):
+    """Register a trusted implementation under its declared name and version."""
+    if family not in POLICY_FAMILIES:
+        raise ValueError(f'Unknown policy family {family!r}')
+    builtin, hooks = POLICY_FAMILIES[family]
+    declaration = getattr(implementation, 'declaration', None)
+    if declaration is None or not isinstance(declaration.name, str) or not isinstance(declaration.version, str):
+        raise ValueError(f'{family} policy needs a Declaration with a name and version')
+    if not issubclass(declaration.parameter_schema, builtin.declaration.parameter_schema):
+        raise ValueError(f'{family} policy must accept {builtin.declaration.parameter_schema.__name__} parameters')
+    missing = [hook for hook in hooks if not callable(getattr(implementation, hook, None))]
+    if missing or set(hooks) - set(declaration.hooks):
+        raise ValueError(f'{family} policy must implement hooks {hooks}')
+    identifier = policy_id(implementation)
+    existing = POLICY_REGISTRY[family].get(identifier)
+    if existing is not None and existing is not implementation:
+        raise ValueError(f'{family} policy {identifier} is already registered')
+    POLICY_REGISTRY[family][identifier] = implementation
+    return identifier
+
+
+def policy_class(family, identifier):
+    try:
+        return POLICY_REGISTRY[family][identifier]
+    except KeyError:
+        known = ', '.join(sorted(POLICY_REGISTRY.get(family, {}))) or 'none'
+        raise ValueError(f'Unknown {family} policy {identifier!r}; registered: {known}') from None
+
+
+for _family, (_implementation, _) in POLICY_FAMILIES.items():
+    register_policy(_family, _implementation)
+
+BUILTIN_IMPLEMENTATIONS = {family: policy_id(implementation) for family, (implementation, _) in POLICY_FAMILIES.items()}
+
+
+class PolicyRuntime:
+    schema_version = 2
+
+    def __init__(self, engine, registry, seed, platforms, profiles, implementations=None):
         self.engine, self.seed = engine, seed
-        self.platforms = {p: MarketplacePolicy(c) for p, c in platforms.items()}
+        selected = dict(implementations or {})
+        marketplace = selected.pop('marketplace', None)
+        marketplace = ({p: BUILTIN_IMPLEMENTATIONS['marketplace'] for p in platforms} if marketplace is None
+                       else dict(marketplace))
+        if set(marketplace) != set(platforms):
+            raise ValueError('Marketplace implementations must name exactly the configured platforms')
+        self.implementations = {family: selected.get(family, BUILTIN_IMPLEMENTATIONS[family])
+                                for family in ('rider', 'driver', 'evolution')}
+        self.implementations['marketplace'] = marketplace
+        self.bindings = {family: policy_class(family, identifier)
+                         for family, identifier in self.implementations.items() if family != 'marketplace'}
+        self.platforms = {p: policy_class('marketplace', marketplace[p])(c) for p, c in platforms.items()}
         self.profiles = profiles
         self.platform_memory = {p: {} for p in platforms}
         self.people = {key: {'preferred_app': profile.preferred_app, 'scores': {},
@@ -59,9 +123,11 @@ class PolicyRuntime:
     def schedule(self, delay, kind, **payload):
         return self.engine.scheduler.schedule_after(delay, kind, payload)
 
-    def record(self, role, identity, hook, decision, version='1'):
+    def record(self, role, identity, hook, decision, version=None):
         if not isinstance(decision, Decision):
             raise ValueError('Policies must return a typed Decision')
+        if version is None:
+            version = self.bindings[role].declaration.version
         self.decisions.append({'type': 'policy_decision', 'at_seconds': self.now, 'role': role,
                                'identity': identity, 'hook': hook, 'policy_version': version,
                                'action': type(decision.action).__name__, 'proposal': plain(decision.action),
@@ -98,6 +164,14 @@ class PolicyRuntime:
         if role == 'driver':
             usable &= self.engine.cars[person.car_id].registrations
         return sorted(p for p in usable if self.engine.platforms[p].launched)
+
+    def accessible_apps(self, role, person_id):
+        """Access independent of launch state; a launch intervention can precede a preference change."""
+        person = self.engine._person(role, person_id)
+        usable = person.apps & person.accounts
+        if role == 'driver':
+            usable &= self.engine.cars[person.car_id].registrations
+        return sorted(usable)
 
     def announced(self, role, person_id):
         """Only public campaigns on personally known apps; never query an unseen quote/supply."""
@@ -221,7 +295,7 @@ class PolicyRuntime:
         if intent is None:
             return
         t = self.profile('rider', intent.rider_id).rider
-        decision = RiderPolicy(t).decide(self.rider_context(intent), freeze(self.intents[str(intent.id)]),
+        decision = self.bindings['rider'](t).decide(self.rider_context(intent), freeze(self.intents[str(intent.id)]),
                                          RandomValues(self.seed, ('rider', intent.rider_id, intent.id)))
         self.record('rider', intent.rider_id, 'decide', decision)
         self.intents[str(intent.id)] = decision.memory
@@ -267,7 +341,7 @@ class PolicyRuntime:
         order = self.engine.orders[event.payload['order_id']]
         if order.terminal:
             return
-        policy = RiderPolicy(self.profile('rider', order.rider_id).rider)
+        policy = self.bindings['rider'](self.profile('rider', order.rider_id).rider)
         decision = policy.progress(freeze({'now': self.now, 'order': order}),
                                    freeze(self.intents[str(order.intent_id)]), RandomValues(self.seed, ('rider_progress', order.id)))
         self.record('rider', order.rider_id, 'progress', decision)
@@ -316,7 +390,7 @@ class PolicyRuntime:
         if event.payload['generation'] != s['generation']:
             return
         t = self.profile('driver', driver_id).driver
-        decision = DriverPolicy(t).expand(self.driver_context(driver_id), freeze(s.get('search', {})),
+        decision = self.bindings['driver'](t).expand(self.driver_context(driver_id), freeze(s.get('search', {})),
                                           RandomValues(self.seed, ('expansion', driver_id, s['generation'])))
         self.record('driver', driver_id, 'expand', decision)
         s['search'] = decision.memory
@@ -351,7 +425,7 @@ class PolicyRuntime:
         driver_id = offer.driver_id
         context = self.driver_context(driver_id, offer=offer, private_eta_seconds=self.private_eta(driver_id, order.pickup))
         s = self.state('driver', driver_id)
-        decision = DriverPolicy(self.profile('driver', driver_id).driver).respond(context,
+        decision = self.bindings['driver'](self.profile('driver', driver_id).driver).respond(context,
                     freeze(s.get('response', {})), RandomValues(self.seed, ('response', driver_id, offer.platform_id, offer.id)))
         self.record('driver', driver_id, 'respond', decision)
         if not isinstance(decision.action, Respond) or decision.action.offer_id != offer.id:
@@ -369,7 +443,7 @@ class PolicyRuntime:
             return
         driver_id = order.assignment.driver_id
         s = self.state('driver', driver_id)
-        decision = DriverPolicy(self.profile('driver', driver_id).driver).progress(
+        decision = self.bindings['driver'](self.profile('driver', driver_id).driver).progress(
             freeze({'now': self.now, 'order': order}), freeze(s.get('progress', {})),
             RandomValues(self.seed, ('driver_progress', driver_id, order.id)))
         self.record('driver', driver_id, 'progress', decision)
@@ -538,8 +612,8 @@ class PolicyRuntime:
             raise ValueError('Unknown platform')
         if config is not None and (not isinstance(config, PlatformPolicy) or platform_id is None):
             raise ValueError('A policy update requires a compiled PlatformPolicy and platform ID')
-        if preferred_app is not None and preferred_app not in self.usable_apps(role, person_id):
-            raise ValueError('Preferred intervention requires a usable app')
+        if preferred_app is not None and preferred_app not in self.accessible_apps(role, person_id):
+            raise ValueError('Preferred intervention requires installed, account-enabled and registered access')
         item = {'at': at_seconds, 'platform_id': platform_id, 'config': plain(config), 'role': role,
                 'person_id': person_id, 'preferred_app': preferred_app, 'launch': launch, 'applied': False}
         self.interventions.append(item)
@@ -553,7 +627,8 @@ class PolicyRuntime:
                 self.engine.launch_platform(item['launch'])
             if item['config'] is not None:
                 config = item['config']
-                self.platforms[item['platform_id']] = MarketplacePolicy(PlatformPolicy.compile(
+                implementation = policy_class('marketplace', self.implementations['marketplace'][item['platform_id']])
+                self.platforms[item['platform_id']] = implementation(PlatformPolicy.compile(
                     overrides=config['parameters'], rules=config['rules'], campaigns=config['campaigns'],
                     version=config['version'], fallback=config['fallback']))
             if item['preferred_app'] is not None:
@@ -578,11 +653,11 @@ class PolicyRuntime:
                     'apps': person.apps, 'usable_apps': self.usable_apps(role, person_id),
                     'preferred_app': s['preferred_app'], 'scores': s['scores'], 'observations': s['observations'],
                     'exposure': s['exposure'], 'offer_counts': s['offer_counts']})
-                decision = EvolutionPolicy(profile.evolution).checkpoint(context, freeze(s['evolution']),
+                decision = self.bindings['evolution'](profile.evolution).checkpoint(context, freeze(s['evolution']),
                         RandomValues(self.seed, ('checkpoint', role, person_id, self.now)))
                 proposals.append((role, person_id, decision))
         for role, person_id, decision in proposals:
-            self.record(role, person_id, 'checkpoint', decision)
+            self.record(role, person_id, 'checkpoint', decision, self.bindings['evolution'].declaration.version)
             s, a = self.state(role, person_id), decision.action
             s['evolution'] = decision.memory
             s['scores'] = decision.memory['scores']
@@ -608,6 +683,7 @@ class PolicyRuntime:
         return plain({'schema_version': self.schema_version, 'platform_memory': self.platform_memory,
             'people': self.people, 'intents': self.intents, 'dispatch_generation': self.dispatch_generation,
             'decisions': self.decisions, 'observations': self.observations, 'interventions': self.interventions,
+            'implementations': self.implementations,
             'platforms': {p: policy.config for p, policy in self.platforms.items()}})
 
     def restore_memory(self, snapshot):

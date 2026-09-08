@@ -44,18 +44,18 @@ requires them to be JSON-shaped (`None`, `bool`, `int`, finite `float`, `str`,
 lists, tuples, and string-keyed dicts) so records can be persisted and traced.
 Domain payloads reference stable entity ids and a generation identity (a
 shift id, an offer id, a service leg index) instead of closing over mutable
-Python objects. The marketplace engine registers two kinds; the Rebu
-simulation in `main.py` adds its scenario and decision timers:
+Python objects. The marketplace engine registers two kinds; `main.py` adds the
+exogenous session kinds scheduled from prepared scenario inputs, and
+`policy_runtime.py` registers its `policy.*` decision, checkpoint,
+intervention and controller timers:
 
 | Kind | Owner | Payload | Handler checks before acting |
 | --- | --- | --- | --- |
 | `offer.expire` | engine | `offer_id` | The offer is still pending and its deadline has passed. |
 | `service.advance` | engine | `service_id`, `leg` | The service has not ended and that leg is still its current one. |
-| `driver_session.start` | `main.py` | `driver_id`, `location`, `shift_seconds` | The engine rejects a second shift for a driver already on one. |
-| `driver_session.end_shift` | `main.py` | `driver_id`, `shift_id` | That shift is still the driver's current one. |
-| `rider_session.start` | `main.py` | `rider_id`, `location`, `destination` | The engine rejects a second live intent for the rider. |
-| `rider_session.decide` | `main.py` | `intent_id`, `quote_id` | The intent is live and has no order yet. |
-| `offer.respond` | `main.py` | `offer_id` | The offer is still pending. |
+| `shift.start` | `main.py` | `id`, `driver`, `location`, `shift_seconds` | The engine rejects a second shift for a driver already on one. |
+| `shift.end` | `main.py` | `driver`, `shift_id` | That shift is still the driver's current one. |
+| `trip.start` | `main.py` | `id`, `rider`, `origin`, `destination` | The engine rejects a second live intent for the rider. |
 
 The queue key is `(at_seconds, sequence)`: by time, then first-in first-out.
 There are no scheduler priorities. If future modeling needs them, version the

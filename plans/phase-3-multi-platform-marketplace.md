@@ -1,11 +1,12 @@
 # Phase 3: Rebu, Blot, and Flyt on one physical market
 
-Status: event engine, marketplace engine, marketplace policies and behavior
-policies are implemented. `main.py` assembles a multi-platform market through
-`policy_runtime.py`. [Scenario definition](architecture/scenario-definition.md)
-is the only remaining implementation step. After it, the focus is extensive
-scenario testing. The multi-replication experiment runner and comparison work
-are deferred to [phase 4](phase-4-experiment-runner.md).
+Status: all implementation steps are done. Event engine, marketplace engine,
+marketplace policies, behavior policies and
+[scenario definition](architecture/scenario-definition.md) are implemented;
+`scenario.py` compiles definitions into immutable plans and `main.py` executes
+one prepared run through `policy_runtime.py`. The remaining phase 3 work is
+extensive scenario testing. The multi-replication experiment runner and
+comparison work are deferred to [phase 4](phase-4-experiment-runner.md).
 
 The simulator's purpose is to compare experiments. Scenarios should require
 little configuration, inherit versioned defaults, and replace models without
@@ -219,7 +220,7 @@ to policies.
 | 2. Offers and queued commitments | Done in the engine: competing offers, atomic two-order capacity, same/cross-platform queues, cancellation, and deferred offline; the ETA fixture and third-order races are checked. Independent local estimators and pickup ETA histories are implemented. |
 | 3. Economics and rider funnel | Done: committed minor-unit fares/payouts, independent tariffs and incentives, conserving settlements, bounded app search, cancellation and rider retries. |
 | 4. Participation and evolution | Implemented initial policies: no-offer timers, app retention, second-order willingness, exposure-aware learning, adoption, and interventions. Preserve commitments during updates. |
-| 5. Scenario definition — remaining | Implement [scenario definition](architecture/scenario-definition.md): versioned presets, resolver/compiler, immutable plans, and fresh single-run state. Reproduce a saved small scenario with all defaults explicit through the existing orchestration. |
+| 5. Scenario definition | Done: [scenario definition](architecture/scenario-definition.md) ships versioned complete presets, typed overrides with provenance, a resolver/compiler producing immutable plans, per-seed input preparation, and fresh single-run state in `main.py`. A saved resolved manifest reproduces its plan and inputs without today's defaults. |
 
 After scenario definition, conduct extensive scenario testing against the
 cross-layer gates below. Use the findings to refine scenarios and fix behavior
@@ -228,16 +229,18 @@ multi-replication execution, comparison reports, and scale measurements move
 to that phase.
 
 Scheduling lives in `event_engine.py` and domain transitions in
-`marketplace_engine.py`; `Simulation.run()` in `main.py` remains the
-execution/logging entry point until the experiment runner exists. Offline
-metrics are calculated separately by `metrics.py`. Commercial logic
-lives in `marketplace_policy.py`, participant logic in `behavior_policy.py`, and
-`policy_runtime.py` supplies immutable scoped contexts and applies typed proposals.
+`marketplace_engine.py`; `scenario.py` compiles definitions and prepares
+inputs, and `Simulation.run()` in `main.py` remains the execution/logging
+entry point until the experiment runner exists. Exogenous shifts and trips are
+scheduled only from scenario inputs. Offline metrics are calculated separately
+by `metrics.py`. Commercial logic lives in `marketplace_policy.py`,
+participant logic in `behavior_policy.py`, and `policy_runtime.py` registers
+implementations, supplies immutable scoped contexts and applies typed proposals.
 The detailed implementation contracts are owned by the two policy documents.
 
-There is no legacy adapter. Bundled scenarios now use the modern three-platform
-preset and explicit policy configuration. Earlier calibration figures are
-historical observations, not compatibility targets.
+There is no legacy adapter. Bundled scenarios derive from the published
+`three-platform-day@1` and `three-platform-week@1` presets. Earlier
+calibration figures are historical observations, not compatibility targets.
 
 ## Cross-layer acceptance gates
 
