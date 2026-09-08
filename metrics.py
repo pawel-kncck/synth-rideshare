@@ -291,7 +291,37 @@ def collect_metric_records(initial, final):
     return records
 
 
-def calculate_metrics(path, interval_minutes=None):
+def aggregate_market_share(completed, platforms, start_seconds, end_seconds, period_days):
+    """Completion share in periods relative to run start, with a partial last row.
+
+    Use completion time, not quote/order time or installation counts. Periods
+    are half-open; only the last includes its right boundary. Empty markets
+    have undefined shares, and platforms with no rides remain in every row.
+    ``completed`` must contain only transitions observed during this run.
+    """
+    if isinstance(period_days, bool) or not isinstance(period_days, int) or period_days <= 0:
+        raise ValueError("market_share_days must be a positive integer")
+    if not all(math.isfinite(t) for t in (start_seconds, end_seconds)) or end_seconds < start_seconds:
+        raise ValueError("Invalid market-share time boundaries")
+    width = period_days * 86400
+    rows = [{"start_seconds": start_seconds + index * width,
+             "end_seconds": min(end_seconds, start_seconds + (index + 1) * width),
+             "platform_completions": {p: 0 for p in platforms}}
+            for index in range(max(1, math.ceil((end_seconds - start_seconds) / width)))]
+    for order in completed:
+        at = order["timeline"]["completed"]
+        if start_seconds <= at <= end_seconds:
+            index = min(len(rows) - 1, int((at - start_seconds) // width))
+            rows[index]["platform_completions"][order["platform_id"]] += 1
+    for row in rows:
+        total = sum(row["platform_completions"].values())
+        row["completed_orders"] = total
+        row["platform_completion_share_pct"] = {
+            p: 100 * count / total if total else None for p, count in row["platform_completions"].items()}
+    return rows
+
+
+def calculate_metrics(path, interval_minutes=None, *, market_share_days=None):
     """Calculate the full run summary and optional intervals from one saved log.
 
     Uses only the standard library and raw values in the log. No current model
@@ -363,17 +393,23 @@ def calculate_metrics(path, interval_minutes=None):
     if interval_minutes is not None:
         result["interval_minutes"] = interval_minutes
         result["intervals"] = aggregate_intervals(records, start, end, interval_minutes, header["start_hour"])
+    if market_share_days is not None:
+        result["market_share_days"] = market_share_days
+        result["market_share_periods"] = aggregate_market_share(
+            completed, platform_completions, start, end, market_share_days)
     return result
 
 
 def main():
     parser = argparse.ArgumentParser(description="Calculate metrics after a run from its structured simulation.log.")
-    parser.add_argument("log", type=Path, help="Path to simulation.log (JSON Lines schema 1)")
+    parser.add_argument("log", type=Path, help="Path to simulation.log (JSON Lines schema 2)")
     parser.add_argument("--interval-minutes", type=int, choices=INTERVAL_MINUTES,
                         help="Include interval metrics; omitted by default")
+    parser.add_argument("--market-share-days", type=int,
+                        help="Include platform completion shares in periods of this many days")
     args = parser.parse_args()
     try:
-        result = calculate_metrics(args.log, args.interval_minutes)
+        result = calculate_metrics(args.log, args.interval_minutes, market_share_days=args.market_share_days)
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.exit(2, f"Cannot analyze log: {error}\n")
     print(json.dumps(result, indent=2, allow_nan=False))

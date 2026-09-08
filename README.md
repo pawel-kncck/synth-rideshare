@@ -98,6 +98,7 @@ multi-replication experiment runner remains phase 4 work.
 | `scenarios/baseline_week.py` | The `three-platform-week@1` preset: three eight-hour crews, weekday commute and weekend night peaks, daily checkpoints. |
 | `scenarios/blot_discount_week.py` | A campaign plus a later tariff intervention on Blot, run against the baseline with shared population and schedules; prints the resolved diff. |
 | `scenarios/flyt_launch_week.py` | Flyt starts unlaunched and without members; awareness, adoption, learning and car onboarding grow it after a Wednesday launch. |
+| `scenarios/flyt_growth_month.py` | 1,000 riders, 50 drivers and 30 days: Flyt runs a tapered rider/driver campaign after a baseline week. Includes a `--control` variant; [assumptions and analysis](scenarios/flyt_growth_month.md). |
 | `scenarios/fixture_cross_platform_queue.py` | An explicit one-driver, two-rider market where Blot accepts an order during a Rebu ride and its ETA lacks the remaining Rebu service. |
 | `scenarios/scale_week.py` | 30,000 riders with seven trips each and 555 drivers: the profiling workload. Expect hours at full size; platform context construction dominates. |
 
@@ -183,12 +184,15 @@ Compute metrics explicitly after execution:
 ```sh
 python3 metrics.py logs/simulation-<run-id>/simulation.log
 python3 metrics.py logs/simulation-<run-id>/simulation.log --interval-minutes 15
+python3 metrics.py logs/simulation-<run-id>/simulation.log --market-share-days 7
 ```
 
-Both commands print JSON to stdout and leave the log unchanged. No HTML, CSV,
+These commands print JSON to stdout and leave the log unchanged. No HTML, CSV,
 configuration, event-export, or summary files are created automatically. The
 first command calculates a whole-run summary; the second adds interval rows
-(5, 15, 30 or 60 minutes). The Python API is:
+(5, 15, 30 or 60 minutes). The third adds per-platform completed-ride counts and
+shares in seven-day periods; use `--market-share-days 1` for daily shares. Periods
+are relative to run start, and the last can be shorter. The Python API is:
 
 ```python
 from metrics import calculate_metrics
