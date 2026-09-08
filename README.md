@@ -11,55 +11,64 @@ Python 3.9 or later:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python scenarios/scenario_500_riders.py
+.venv/bin/python scenarios/baseline_day.py
+.venv/bin/python main.py three-platform-week@1 --seed 3
 ```
 
 The simulator and offline metrics use only the Python standard library. Each
-scenario writes one structured `simulation.log` under a unique directory in
-`logs/`. Use `time_scale=False` to run without sleeping.
+run writes one structured `simulation.log` under a unique directory in `logs/`.
 Validation uses scenario runs and throwaway scripts; there is no unit test suite.
 
-```python
-from main import Simulation
-from marketplace_engine import World
-from marketplace_policy import PlatformPolicy
+A scenario is a published versioned preset plus typed changes. Presets are
+complete: every world, platform, behavior, population, activity and evolution
+setting is written out under its version, labeled synthetic. A scenario changes
+only what an experiment needs, by dotted path or with keyed `add`/`remove`
+operations on campaigns, rules, people and interventions:
 
-sim = Simulation(
-    driver_count=10,
-    rider_count=100,
-    seed=7,
-    world=World(speed_kmh=30, boarding_seconds=30),
-    platforms={
-        "rebu": PlatformPolicy.compile(overrides={"base_fare_minor": 200}),
-        "blot": PlatformPolicy.compile(overrides={"base_fare_minor": 180}),
-        "flyt": PlatformPolicy.compile(overrides={"commission_fraction": .15}),
-    },
-)
-sim.schedule_driver_session(0, sim.drivers[0], (2, 2), shift_seconds=8 * 3600)
-sim.schedule_rider_session(100, sim.riders[0], (2, 2), (5, 8))
-sim.run(start=0, end=9, time_scale=False)
+```python
+from main import Simulation, run_scenario
+from scenario import Scenario, campaign, compile_scenario, diff_plans, policy_change
+
+baseline = Scenario(preset="three-platform-week@1")
+variant = (baseline.renamed("blot-discount")
+    .with_changes({"platforms.blot.policy.parameters.per_km_minor": 120,
+                   "behavior.driver.parameters.no_offer_seconds": 90})
+    .add("platforms.blot.policy.campaigns",
+         campaign("midweek", start_hours=24, end_hours=96, discount_fraction=.2, bonus_minor=100))
+    .add("interventions", policy_change("tariff", at_hours=96, platform="blot",
+                                        version="tariff-v2", parameters={"per_km_minor": 165})))
+
+plan = compile_scenario(variant)          # immutable: resolved values, provenance, fingerprints
+print(diff_plans(compile_scenario(baseline), plan))
+inputs = plan.prepare(seed=0)             # realized people, cars, shifts and trips for one replication
+Simulation(inputs).run()                  # fresh engine, scheduler, memory and randomness
+run_scenario(baseline, seed=0)            # the same three steps in one call
 ```
 
-`Simulation` accepts explicit `world`, `platforms`, `rider_profiles`, and
-`driver_profiles`. With no platform mapping, it creates all three platforms.
-The old scalar pricing and decision-probability constructor arguments have been
-removed. Profile configuration, model equations, clocks, adoption and learning
-are documented in [Behavior policy](plans/architecture/behavior-policy.md).
-Commercial configuration is documented in
-[Marketplace policy](plans/architecture/marketplace-policy.md).
+`compile_scenario` rejects unknown keys, unused generator parameters, invalid
+ranges and probabilities, unknown platform/segment/person references, app or car
+access that cannot participate, conflicting interventions, and a request for
+more than two accepted commitments. Independent errors are reported together,
+each naming its field. `Plan.manifest()` and `Plan.save(path)` export the
+canonical resolved definition with per-value provenance; `Scenario.load(path)`
+rebuilds the scenario from that artifact alone. The authoring contract is
+documented in [Scenario definition](plans/architecture/scenario-definition.md);
+profiles, model equations, adoption and learning in
+[Behavior policy](plans/architecture/behavior-policy.md); commercial
+configuration in [Marketplace policy](plans/architecture/marketplace-policy.md).
 
 ## Architecture
 
 | File | Responsibility |
 | --- | --- |
-| `main.py` | Population assembly, exogenous session scheduling, checkpoints, execution and raw logging. |
+| `scenario.py` | Definition schema, versioned presets, typed overrides with provenance, semantic diffs, the compiler producing immutable plans, and per-seed population/activity generation. |
+| `main.py` | Single-run execution over prepared inputs: fresh state, exogenous session handlers, checkpoints and raw logging. `run_scenario` is the convenience entry point. |
 | `event_engine.py` | Generic deterministic scheduler, serializable events, cancellation and event budgets. |
 | `marketplace_engine.py` | Physical truth, access, quotes, orders, offers, commitments, service, legal transitions and exact settlement. |
 | `policy_contracts.py` | Immutable detached observations, typed decisions, validation and identity-keyed randomness. |
 | `marketplace_policy.py` | Versioned platform policy implementations and strict configuration binding. |
 | `behavior_policy.py` | Participant policy implementations; the behavior specification lives in the linked architecture document. |
-| `policy_runtime.py` | Scoped context construction, notification routing, guarded delayed decisions, command application and explicit memory persistence. |
-| `demand.py` | Exogenous weekly demand sampling, independent of policies. |
+| `policy_runtime.py` | Policy registry by identity and version, scoped context construction, notification routing, guarded delayed decisions, command application and explicit memory persistence. |
 | `metrics.py` | All post-run calculations: reconstruct metrics from a saved log, summarize outcomes, and optionally aggregate intervals. |
 
 The engine checks legality again when proposals execute. Each driver can hold at
@@ -74,24 +83,47 @@ The runtime is the only adapter between policy decisions and engine commands.
 Scoped engine views also return detached, immutable records. Direct engine records
 remain authoritative and are intended for orchestration and analysis.
 
-These are trusted Python contracts, not a sandbox for hostile plugins. The
-shipped checkpoint loader binds the built-in policy implementations and rejects
-unsupported snapshot versions. A general scenario compiler, arbitrary plugin
-registry and multi-replication experiment runner remain separate roadmap work.
+These are trusted Python contracts, not a sandbox for hostile plugins. A custom
+policy is registered with `policy_runtime.register_policy(family, cls)` under
+its declared `name@version`, must accept the family's parameter schema and
+implement its hooks, and is then selectable by scenarios. The compiler cannot
+prove such code correct; runtime checks and scenario runs validate it. The
+multi-replication experiment runner remains phase 4 work.
+
+## Scenarios
+
+| Scenario | What it exercises |
+| --- | --- |
+| `scenarios/baseline_day.py` | The `three-platform-day@1` preset: one Monday, ten all-day drivers, one trip per rider. |
+| `scenarios/baseline_week.py` | The `three-platform-week@1` preset: three eight-hour crews, weekday commute and weekend night peaks, daily checkpoints. |
+| `scenarios/blot_discount_week.py` | A campaign plus a later tariff intervention on Blot, run against the baseline with shared population and schedules; prints the resolved diff. |
+| `scenarios/flyt_launch_week.py` | Flyt starts unlaunched and without members; awareness, adoption, learning and car onboarding grow it after a Wednesday launch. |
+| `scenarios/fixture_cross_platform_queue.py` | An explicit one-driver, two-rider market where Blot accepts an order during a Rebu ride and its ETA lacks the remaining Rebu service. |
+| `scenarios/scale_week.py` | 30,000 riders with seven trips each and 555 drivers: the profiling workload. Expect hours at full size; platform context construction dominates. |
+
+Generated person IDs are `rider-n`/`driver-n` with cars `car-driver-n`; trip
+IDs are `trip-n` in arrival order. They depend only on the population and
+activity sections and the seed, so paired variants keep identities. Segment
+counts use largest-remainder rounding and a seeded assignment; traits can be
+scalars or `{"uniform": [low, high]}`, `{"normal": [mean, sd, low, high]}` and
+`{"choice": [[value, weight], ...]}` distributions sampled once per person.
 
 ## Sessions, time and checkpoints
 
-`schedule_driver_session(at_seconds, driver_id, location, shift_seconds=None)`
-schedules a shift. `schedule_rider_session(at_seconds, rider_id, origin,
-destination)` schedules a trip intent. Coordinates are Cartesian kilometres;
-all engine and policy durations use simulated seconds. The scenario controls
-exogenous schedules; policy events handle the subsequent lifecycle.
+Scenario times are hours after the calendar origin; the plan and log use
+simulated seconds. Coordinates are Cartesian kilometres on the world's map.
+The scenario controls exogenous shifts and trip intents; policy events handle
+the subsequent lifecycle. A rotation generator with `crews * shift_hours > 24`,
+overlapping explicit shifts, or two trips of one rider at the same second are
+rejected before execution. Other overlaps depend on realized rides and fail
+the run when the engine rejects the second session; nothing is dropped silently.
 
-`advance_to(t)` processes events through `t` without playback delay. `run(start=6,
-end=23, time_scale=3600)` advances to simulated time `(end - start) * 3600`
-seconds, writes the log, and prints its path. `time_scale` is simulated seconds
-per real second; `False` disables sleeping. `run()` performs no metric calculations
-and does not import `metrics.py`. Analyze the log separately after it returns.
+`Simulation.run(until_seconds=None, time_scale=False, log_dir="logs")` advances
+to the scenario horizon (or an earlier time), writes the log, and prints its
+path. `time_scale` is simulated seconds per real second; `False` disables
+sleeping. `run()` performs no metric calculations and does not import
+`metrics.py`. Analyze the log separately after it returns. `advance_to(t)`
+processes events through `t` without playback delay.
 
 ```python
 import json
@@ -104,17 +136,19 @@ continued.advance_to(3600)
 ```
 
 Capture snapshots at event boundaries, after an `advance_to` call. They include
-engine records, scheduler identities and queue ordering, policy versions, pending
-interventions, profiles, private memories, diagnostic records and randomness
-identities. Restoring and continuing produces the same records as an uninterrupted
-run. Logs and wall-clock run directories are runner outputs and are not part
-of deterministic state.
+engine records, scheduler identities and queue ordering, selected policy
+implementations and versions, pending interventions, profiles, private
+memories, diagnostic records, randomness identities, the plan manifest and the
+realized inputs. Restoring and continuing produces the same records as an
+uninterrupted run without reading today's defaults. Logs and wall-clock run
+directories are runner outputs and are not part of deterministic state.
 
-Use `sim.policies.schedule_intervention(at_seconds, platform_id="rebu",
-config=PlatformPolicy(version="tariff-v2", ...))` to select a new commercial
-policy at a simulated decision boundary. Existing quote and accepted offer terms
-remain committed. Population checkpoints and preference interventions are
-specified in [Behavior policy](plans/architecture/behavior-policy.md).
+Interventions are scenario data: `launch`, `policy_change` and
+`preference_change` items with an ID and a time. Launches apply before policy
+versions, which apply before cohort preference changes at the same time; at a
+learning checkpoint all due interventions apply first, then adoption and
+learning decisions use one population snapshot. Existing quote and accepted
+offer terms remain committed.
 
 ## Raw log and offline metrics
 
@@ -122,10 +156,11 @@ specified in [Behavior policy](plans/architecture/behavior-policy.md).
 Lines (one JSON object per line), with this ordered schema:
 
 1. `run_started`: log schema version, run identity, wall-clock creation time,
-   simulated origin/target, playback settings, and simulation source hashes.
+   calendar origin, simulated target, playback settings, scenario identity with
+   definition/implementation/input fingerprints, and simulation source hashes.
 2. `state` with `boundary="initial"`: the raw simulation checkpoint before events
    are processed, including seed, world, population profiles, configured policies,
-   scenario parameters, scheduled sessions, existing records, and pending events.
+   the plan manifest, realized inputs, existing records, and pending events.
 3. `notification`: timestamped, scoped engine lifecycle notifications during
    execution. These contain observations, not interval aggregates.
 4. `state` with `boundary="final"`: the raw checkpoint at the actual stopping
@@ -187,7 +222,7 @@ opportunity observations and preference decisions. Behavioral exposure and
 learning updates remain in the policy runtime because subsequent decisions use
 them; report aggregation is entirely offline.
 
-The final implementation step in [phase 3](plans/phase-3-multi-platform-marketplace.md)
-is [scenario definition](plans/architecture/scenario-definition.md), followed by
-extensive scenario testing. The experiment runner and comparison work belong to
-[phase 4](plans/phase-4-experiment-runner.md).
+[Phase 3](plans/phase-3-multi-platform-marketplace.md) implementation is
+complete with [scenario definition](plans/architecture/scenario-definition.md);
+what remains is extensive scenario testing. The experiment runner and comparison
+work belong to [phase 4](plans/phase-4-experiment-runner.md).

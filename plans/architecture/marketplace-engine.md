@@ -1,7 +1,7 @@
 # Marketplace engine
 
 Status: implemented in `marketplace_engine.py`. `main.py` composes a multi-platform
-simulation through `policy_runtime.py`. This document defines the physical and contractual
+simulation from compiled scenario inputs through `policy_runtime.py`. This document defines the physical and contractual
 mechanics used by the [phase 3 roadmap](../phase-3-multi-platform-marketplace.md).
 
 There is one physical market and one marketplace engine. Rebu, Blot, and Flyt
@@ -15,8 +15,8 @@ transitions, scoped observation delivery, and monetary settlement records. It
 registers two domain handlers, `offer.expire` and `service.advance`, on the
 generic [event engine](event-engine.md). Platform decisions belong to
 [marketplace policies](marketplace-policy.md), and personal decisions belong to
-[behavior policies](behavior-policy.md); today `main.py` plays both roles for
-one platform.
+[behavior policies](behavior-policy.md); `policy_runtime.py` adapts both to
+engine commands.
 
 Fixed constraints, enforced by the engine regardless of policy:
 
