@@ -1,7 +1,8 @@
 # Event engine
 
-Status: implemented in `event_engine.py`. `main.py` runs on it. See the
-[phase 3 roadmap](../phase-3-multi-platform-marketplace.md) for what comes next.
+Status: implemented in `event_engine.py`. The marketplace engine and
+`main.py` run on it. See the [phase 3 roadmap](../phase-3-multi-platform-marketplace.md)
+for what comes next.
 
 The event engine advances a simulated clock and executes scheduled work. It is
 usable by another simulation domain without importing ride-hailing entities,
@@ -42,17 +43,19 @@ Handlers are called as `handler(record)` with an `EventRecord` containing
 requires them to be JSON-shaped (`None`, `bool`, `int`, finite `float`, `str`,
 lists, tuples, and string-keyed dicts) so records can be persisted and traced.
 Domain payloads reference stable entity ids and a generation identity (a
-session id, an offer id) instead of closing over mutable Python objects. The
-ride-hailing domain uses these kinds:
+shift id, an offer id, a service leg index) instead of closing over mutable
+Python objects. The marketplace engine registers two kinds; the Rebu
+simulation in `main.py` adds its scenario and decision timers:
 
-| Kind | Payload | Handler checks before acting |
-| --- | --- | --- |
-| `driver_session.start` | `driver_id`, `location`, `shift_seconds` | The driver has no active session. |
-| `driver_session.end_shift` | `driver_id`, `session_id` | That session is still the driver's active one. |
-| `rider_session.start` | `rider_id`, `location`, `destination` | The rider has no active session. |
-| `rider_session.decide` | `rider_id`, `session_id` | That session is active and has not ordered. |
-| `offer.expire`, `offer.decide` | `order_id`, `offer_id` | The order is active and that offer is still its pending one. |
-| `ride.advance` | `order_id`, `expected_state` | The order is active, assigned, and in the expected state. |
+| Kind | Owner | Payload | Handler checks before acting |
+| --- | --- | --- | --- |
+| `offer.expire` | engine | `offer_id` | The offer is still pending and its deadline has passed. |
+| `service.advance` | engine | `service_id`, `leg` | The service has not ended and that leg is still its current one. |
+| `driver_session.start` | `main.py` | `driver_id`, `location`, `shift_seconds` | The engine rejects a second shift for a driver already on one. |
+| `driver_session.end_shift` | `main.py` | `driver_id`, `shift_id` | That shift is still the driver's current one. |
+| `rider_session.start` | `main.py` | `rider_id`, `location`, `destination` | The engine rejects a second live intent for the rider. |
+| `rider_session.decide` | `main.py` | `intent_id`, `quote_id` | The intent is live and has no order yet. |
+| `offer.respond` | `main.py` | `offer_id` | The offer is still pending. |
 
 The queue key is `(at_seconds, sequence)`: by time, then first-in first-out.
 There are no scheduler priorities. If future modeling needs them, version the
@@ -97,10 +100,12 @@ head, where it is skipped and reported to the trace sink. `pending_count` and
 entries materially increase memory.
 
 Cancellation never substitutes for domain checks. Every ride-hailing handler
-first resolves the ids in its payload against the active sessions, orders, and
-pending offers and returns quietly when they no longer match. Resolving an
-offer also cancels its remaining timers, but a timer that fires anyway (for
-example one already at the head of the queue) is neutralized by the check.
+first resolves the ids in its payload against the current records and returns
+quietly when they no longer match. The marketplace engine keeps no
+cancellation handles at all: a resolved offer's expiry event and a stopped
+service's arrival event simply find nothing to do. That keeps the market
+restorable from records plus the scheduler snapshot, with no handle table
+to rebuild; the stale events are few and short-lived.
 
 Unknown kinds and invalid payloads fail at scheduling time. A handler that
 raises stops the scheduler: the exception is wrapped in `HandlerFailure`, which
@@ -150,7 +155,5 @@ runs whenever the engine changes:
 - Tracing, playback speed, and output configuration do not affect simulated work.
 - A handler failure stops the run and preserves enough context for reproduction.
 
-The extraction kept the heap-based discrete-event loop and the random draw
-order, so the bundled scenarios produce the same summaries as before it.
-That is a sanity check, not a compatibility promise. Measure event throughput,
-queue size, invalid-event share, and memory before changing the data structure.
+Measure event throughput, queue size, invalid-event share, and memory before
+changing the data structure.

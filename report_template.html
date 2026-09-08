@@ -110,8 +110,8 @@
     <nav class="files" aria-label="Full run files"><a href="simulation.log">Full run log</a><a href="config.json">Configuration</a><a href="events.jsonl">Full run events</a><a href="summary.json">Full run summary</a></nav>
   </div>
   <details><summary>Metric definitions and run parameters</summary>
-    <p class="muted">Week and day use the simulated calendar; range includes both selected days. Partial periods are clipped to the available run time. Search coverage counts searches finding at least one eligible idle driver. Driver utilization divides active time by online time inside the selection, splitting driver spans exactly. Completions use drop-off time. Chart intervals start at the selection's beginning. Only the run's final interval includes its right endpoint.</p>
-    <p class="muted">Session-to-order is converted sessions / all sessions started in this run, including sessions without supply and those still undecided. Offer acceptance is accepted offers / all offers created in this run, including rejected, expired, canceled, and pending offers. Later decisions for sessions or offers from earlier runs remain in the event export but are excluded from these new-cohort ratios. Baseline probabilities describe the reference price and ETA; observed ratios vary with market conditions.</p>
+    <p class="muted">Week and day use the simulated calendar; range includes both selected days. Partial periods are clipped to the available run time. Search coverage counts quotes finding at least one eligible driver with a free order slot. Driver utilization divides physical service time (pickup travel, boarding, transport) by online time inside the selection, splitting driver spans exactly; a queued order adds no service time until its own pickup starts. Completions use drop-off time. Chart intervals start at the selection's beginning. Only the run's final interval includes its right endpoint.</p>
+    <p class="muted">Session-to-order is converted sessions / all sessions started in this run, including sessions without supply and those still undecided. Offer acceptance is accepted offers / all offers created in this run, including rejected, expired, canceled, failed-acceptance, and pending offers. Later decisions for sessions or offers from earlier runs remain in the event export but are excluded from these new-cohort ratios. Baseline probabilities describe the reference price and ETA; observed ratios vary with market conditions.</p>
     <pre id="parameters"></pre>
   </details>
   <noscript>This interactive report requires JavaScript. The interval data is also available in metrics.csv.</noscript>
@@ -219,8 +219,8 @@
         rows.map((row, i) => [windows[i], row.converted_sessions, row.rider_sessions, row.undecided_sessions]),
         '<b>%{customdata[0]}</b><br>Session-to-order: %{y:.2f}%<br>%{customdata[1]} of %{customdata[2]} sessions<br>Undecided: %{customdata[3]}'),
       trace('Offer acceptance', '#9155d7', rows.map(row => row.offer_acceptance_pct), {xaxis: 'x5', yaxis: 'y5'},
-        rows.map((row, i) => [windows[i], row.accepted_offers, row.offers, row.rejected_offers, row.expired_offers, row.canceled_offers, row.pending_offers]),
-        '<b>%{customdata[0]}</b><br>Offer acceptance: %{y:.2f}%<br>%{customdata[1]} of %{customdata[2]} offers<br>Rejected: %{customdata[3]} · Expired: %{customdata[4]}<br>Canceled: %{customdata[5]} · Pending: %{customdata[6]}'),
+        rows.map((row, i) => [windows[i], row.accepted_offers, row.offers, row.rejected_offers, row.expired_offers, row.canceled_offers, row.failed_offers, row.pending_offers]),
+        '<b>%{customdata[0]}</b><br>Offer acceptance: %{y:.2f}%<br>%{customdata[1]} of %{customdata[2]} offers<br>Rejected: %{customdata[3]} · Expired: %{customdata[4]}<br>Canceled: %{customdata[5]} · Failed: %{customdata[6]} · Pending: %{customdata[7]}'),
       trace('Search coverage', '#2563eb', rows.map(row => row.coverage_pct), {xaxis: 'x', yaxis: 'y'},
         rows.map((row, i) => [windows[i], row.covered_searches, row.searches]),
         '<b>%{customdata[0]}</b><br>Coverage: %{y:.2f}%<br>%{customdata[1]} of %{customdata[2]} searches covered'),

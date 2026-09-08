@@ -5,6 +5,12 @@ import math
 
 INTERVAL_MINUTES = (5, 15, 30, 60)
 
+# Every created offer is pending or has exactly one of these dispositions.
+OFFER_OUTCOME_KEYS = {
+    "accepted": "accepted_offers", "rejected": "rejected_offers", "expired": "expired_offers",
+    "canceled": "canceled_offers", "acceptance_failed": "failed_offers", "pending": "pending_offers",
+}
+
 
 def clock_label(seconds):
     """Format simulated clock seconds, including day offsets after midnight."""
@@ -20,7 +26,9 @@ def aggregate_intervals(records, start_seconds, end_seconds, interval_minutes=15
     Intervals start at this run's initial simulated time. They are half-open,
     except the last interval includes events at the run end, matching run().
     The caller supplies only searches/completions observed during this run;
-    this prevents counting boundary events again in a continuation.
+    this prevents counting boundary events again in a continuation. Active
+    driver time is physical service (pickup travel, boarding, transport), so
+    an accepted order queued behind another ride adds nothing until it starts.
     """
     if (
         isinstance(interval_minutes, bool)
@@ -60,6 +68,7 @@ def aggregate_intervals(records, start_seconds, end_seconds, interval_minutes=15
             "rejected_offers": 0,
             "expired_offers": 0,
             "canceled_offers": 0,
+            "failed_offers": 0,
             "pending_offers": 0,
         })
 
@@ -98,7 +107,7 @@ def aggregate_intervals(records, start_seconds, end_seconds, interval_minutes=15
                 row = offer_rows.get(record["offer_id"])
                 if row is not None:
                     row["pending_offers"] -= 1
-                    row[record["state"] + "_offers"] += 1
+                    row[OFFER_OUTCOME_KEYS[record["state"]]] += 1
         elif kind in ("search", "order_completed"):
             at = record["at_seconds"]
             if not start_seconds <= at <= end_seconds:
@@ -144,7 +153,7 @@ def summarize_intervals(rows):
     market = {key: sum(row[key] for row in rows) for key in (
         "rider_sessions", "converted_sessions", "undecided_sessions", "declined_sessions",
         "unavailable_sessions", "offers", "accepted_offers", "rejected_offers", "expired_offers",
-        "canceled_offers", "pending_offers",
+        "canceled_offers", "failed_offers", "pending_offers",
     )}
     return {
         **market,

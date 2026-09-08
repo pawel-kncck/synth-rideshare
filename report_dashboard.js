@@ -4,7 +4,7 @@ const Dashboard = (() => {
   const countKeys = [
     'searches', 'covered_searches', 'completed_orders', 'rider_sessions',
     'converted_sessions', 'undecided_sessions', 'declined_sessions', 'unavailable_sessions',
-    'offers', 'accepted_offers', 'rejected_offers', 'expired_offers', 'canceled_offers', 'pending_offers',
+    'offers', 'accepted_offers', 'rejected_offers', 'expired_offers', 'canceled_offers', 'failed_offers', 'pending_offers',
     'online_driver_seconds', 'active_driver_seconds'
   ];
   const weekdays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];

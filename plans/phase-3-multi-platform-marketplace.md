@@ -1,7 +1,9 @@
 # Phase 3: Rebu, Blot, and Flyt on one physical market
 
-Status: design and implementation plan only. Proposed APIs, modules, presets,
-and capabilities are not implemented by this documentation change.
+Status: the event engine and the marketplace engine are implemented
+(`event_engine.py`, `marketplace_engine.py`); `main.py` composes a Rebu-only
+simulation on them. Policies, scenario definitions, and the experiment runner
+remain design documents.
 
 The simulator's purpose is to compare experiments. Scenarios should require
 little configuration, inherit versioned defaults, and replace models without
@@ -206,27 +208,28 @@ randomness or supply hidden feedback to policies.
 
 | Milestone | Deliverable and acceptance gate |
 | --- | --- |
-| 0. Refactor and characterize | Separate scheduling (done: `event_engine.py`), domain transitions, policies, configuration, and run/report orchestration. Legacy single-platform results are a reference for sanity checks, not a compatibility requirement. |
+| 0. Refactor and characterize | Done: scheduling (`event_engine.py`) and domain transitions (`marketplace_engine.py`) are separate; `main.py` holds Rebu's policy, participant behavior, and run/report orchestration. Legacy single-platform results were a sanity check, not a compatibility requirement. |
 | 1. Definition and experiment foundation | Versioned presets, resolver/compiler, immutable plans, fresh run state, and paired variants. Reproduce a saved small experiment with all defaults explicit. |
-| 2. Shared market and platform views | Cars, trajectories, access, and scoped observations. Same location at the same time; no competitor order visibility. |
-| 3. Offers and queued commitments | Competing offers, atomic two-order capacity, same/cross-platform queues, independent estimates, cancellation, and deferred offline. Pass the ETA fixture and third-order race tests. |
-| 4. Economics and rider funnel | Independent tariffs, incentives, committed terms, settlements, bounded app search, and exactly-once conversion. Reconcile money and trip outcomes. |
+| 2. Shared market and platform views | Done in the engine: cars, trajectories, access, and scoped views/notifications. Same location at the same time; no competitor order visibility. |
+| 3. Offers and queued commitments | Done in the engine: competing offers, atomic two-order capacity, same/cross-platform queues, cancellation, and deferred offline; the ETA fixture and third-order races are checked. Independent estimators beyond Rebu's own remain policy work. |
+| 4. Economics and rider funnel | Engine side done: frozen fare/payout terms in minor units and conserving settlements. Independent tariffs, incentives, bounded app search, and rider retries remain policy work. |
 | 5. Participation and evolution | No-offer timers, app retention, second-order willingness, exposure-aware learning, adoption, and interventions. Preserve commitments during updates. |
 | 6. Comparison and scale | Platform/time reports, replicate uncertainty, continuation, and small/weekly/multiweek measurements. Pass all cross-layer gates below. |
 
-Scheduling is extracted into `event_engine.py`; `run()` remains the
-orchestration entry point until the experiment runner exists. Split `_dispatch_order` into
-local policy decisions and engine commands. Replace driver `pending_order` and
-`current_order` with separate offer references, commitments, and physical state.
-Move choice/pricing behind their contracts; do not retain all domain transitions
-in `main.py`. Module names are implementation choices, not a required package API.
+Scheduling lives in `event_engine.py` and domain transitions in
+`marketplace_engine.py`; `Simulation.run()` in `main.py` remains the
+orchestration entry point until the experiment runner exists. Rebu's quote,
+estimate, and dispatch policy and the participants' order/accept decisions
+are methods on `Simulation` that issue engine commands and react to engine
+notifications; the marketplace-policy and behavior-policy contracts will move
+them behind declared interfaces. Module names are implementation choices, not
+a required package API.
 
-The legacy adapter uses Rebu, one car per driver, existing price arithmetic and
-random draw order, and local rules that offer only to idle drivers. It does not
-exercise second commitments. Preserve timeout-at-deadline behavior and current
-numeric results; do not add rounding or extra draws to that path. Reject mixed
-legacy arguments and modern policy overrides. New experiments select the modern
-model explicitly.
+There is no separate legacy adapter. The bundled scenarios run on the modern
+engine with Rebu as the only platform, one car per driver, fares rounded to
+minor units, and back-to-back dispatch to drivers with a free own slot. Their
+figures therefore differ from the single-platform calibration recorded before
+the engine existed; that calibration is a reference, not a target.
 
 ## Cross-layer acceptance gates
 
@@ -258,8 +261,8 @@ model explicitly.
 
 There is no unit test suite: every milestone may refactor the previous one,
 and tests would turn ad-hoc decisions into permanent requirements. Validate
-with scenario runs and throwaway scripts. The 94,766-ride/72.11%-utilization
-legacy calibration is a reference, not a target imposed on three competing
+with scenario runs and throwaway scripts. The earlier 94,766-ride/72.11%-utilization
+calibration is a reference, not a target imposed on three competing
 platforms. Profile candidate
 scans, event counts, logs, reports, runtime, and peak memory before optimizing;
 indexes must preserve platform knowledge boundaries.
