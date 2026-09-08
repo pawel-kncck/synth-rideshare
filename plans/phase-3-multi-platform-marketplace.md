@@ -1,493 +1,268 @@
-# Phase 3: Rebu, Blot, and Flyt marketplace
-
-Planning document only. No simulator implementation is included in this change.
-
-Build one shared physical marketplace containing three competing platforms:
-**Rebu, Blot, and Flyt**. Keep one identity, location, and physical activity state
-per person. Platforms determine which people can interact, what a trip costs,
-what a driver earns, and which app each person chooses to use. Market share is
-an outcome of these interactions, rather than a percentage assigned to orders.
-
-The recommended starting assumptions are that Rebu represents the current
-unnamed platform; riders check apps sequentially; and drivers can leave several
-apps open while idle. Drivers have one pending offer or accepted ride globally.
-That last rule is an explicit simplification: simultaneous app availability is
-supported, but simultaneous competing offers to one driver are deferred. An
-exclusive-switch driver policy should also be configurable for experiments.
-
-1. **Use the existing event engine and correct its single-platform assumptions.**
-
-   The current code already has persistent person IDs, transient sessions,
-   immutable quotes, deterministic offer reservations, and an event scheduler.
-   It does not yet have persistent person objects holding behavioral attributes.
-   The main integration points are:
-
-   | Existing location | Required change |
-   | --- | --- |
-   | `main.py`: `Simulation.__init__` | Register platforms and persistent rider/driver profiles, with separate random streams for new behavior. |
-   | `calculate_price`, `SearchResult`, `SearchRecord` | Add platform, tariff version, quote identity, validity, and separate rider/driver economics. |
-   | `_driver_is_eligible`, `_search`, `_dispatch_order` | Filter by installed and open apps, while preserving global driver reservations. |
-   | `_start_rider_session`, `_decide_on_quote`, `_abandon_order` | Keep a trip request alive across bounded app searches and failed platform orders. |
-   | Driver session lifecycle and `_advance_ride` | Start and invalidate idle-triggered app-opening events. |
-   | `behavior.py` | Retain reusable probability helpers; add policies using person-specific attributes. |
-   | `metrics.py`, `reporting.py`, `report_dashboard.js` | Replace the assumption of one rider decision per session; add platform attribution without duplicating people or time. |
-   | `scenarios/` and `demand.py` | Reuse weekly demand generation; add explicit populations, platform policies, interventions, and repeated activity over multiple weeks. |
-
-   Keep the event scheduler and physical ride lifecycle centralized. Do not run
-   three independent `Simulation` instances: that would require synchronizing
-   the same drivers, riders, trips, and clock across separate markets.
-
-2. **Represent app ownership, preference, and current app use separately.**
-
-   Introduce the following data, retaining the public lists of IDs used by the
-   existing scenarios and adding profile dictionaries keyed by those IDs.
-
-   | Object | Persistent or transient state |
-   | --- | --- |
-   | Platform configuration | Stable ID (`rebu`, `blot`, `flyt`), display name, launch time, versioned pricing, commission, and incentive schedules. |
-   | Rider profile | Installed apps, preferred app and scores for other apps, price/ETA tolerances, sensitivities, search friction, patience, learning rate, and adoption propensity. |
-   | Driver profile | Enabled apps, preferred app and scores, tolerance for time without an offer, payout/pickup sensitivities, learning rate, and adoption propensity. In the initial model, downloading a driver app enables it immediately; onboarding delays can be added later. |
-   | Rider session | One trip intent: apps considered, quote snapshots, current platform attempt, elapsed search time, retry budget, and at most one active order. |
-   | Driver session | One physical shift: open apps, location, offer/ride reservation, idle timestamps, and a generation number for pending choice callbacks. |
-   | Order and offer | Owning platform, stable trip/session identity, immutable price or payout commitments, and the existing lifecycle state. |
-   | Per-person platform experience | Observed prices, pickup times, failures, offer waits, payouts, exposure duration, and observation counts. |
-
-   Installed apps constrain access; preferred app determines the normal first
-   choice; open apps determine current participation. A download must not
-   automatically make the new app preferred. A different platform winning one
-   ride must not automatically become the person's preferred app either.
-
-   Scenario population settings should support all seven nonempty subsets,
-   independently for riders and drivers: Rebu, Blot, Flyt, Rebu+Blot, Rebu+Flyt,
-   Blot+Flyt, and all three. Configure a preferred-app distribution conditional
-   on each subset, so nobody prefers an app they do not have.
-
-   Support both explicit profiles for small deterministic scenarios and seeded
-   population segments for larger ones. Segments can correlate ownership,
-   loyalty, sensitivity, and adoption propensity; do not require all attributes
-   to be sampled independently. Draw stable personal traits once, rather than
-   rerolling them on every trip or shift. Distribution weights must sum to one;
-   use deterministic rounding and seeded assignment when exact segment counts
-   are requested. Initial app ownership and preferences are inputs; initial
-   completed-ride share is not implied by either distribution.
-
-3. **Give each platform its own pricing and incentive accounting.**
-
-   A first implementation needs independent base fare, distance rate, optional
-   time rate, minimum fare, and scheduled multiplier for each platform. Preserve
-   the current base-plus-distance calculation as the compatibility setting.
-   Fare changes and campaigns are scheduled in simulated time. Automatic surge
-   can later implement the same pricing interface, but is not needed initially.
-
-   Keep one currency and define the calculation explicitly:
-
-   ```text
-   gross fare G = max(minimum fare,
-                      multiplier * (base + per_km * km + per_minute * minutes))
-   rider discount D = eligible fixed amount OR percentage of G, capped at G
-   rider payment = G - D
-   base driver payout = (1 - commission_rate) * G
-   driver payout = base driver payout + eligible driver bonus B
-   platform contribution = rider payment - driver payout
-                         = commission_rate * G - D - B
-   ```
-
-   Discounts and bonuses are platform-funded in this model. A rider discount
-   lowers the rider's decision price without lowering driver pay. A driver
-   bonus increases the driver's decision payout without raising the rider's
-   price. Contribution excludes operating costs and taxes; it is not profit.
-   Use a consistent monetary rounding rule and store settled amounts in integer
-   minor units. Default commission is zero in single-platform compatibility
-   mode, preserving the existing driver response to full fares.
-
-   The initial campaign scope should include start/end times, fixed or capped
-   percentage rider discounts, fixed bonuses per completed ride, and eligibility
-   by segment or newly adopted app. Campaign visibility is also explicit:
-   people may discover an incentive in a quote/offer, or receive scenario-defined
-   awareness before using the app. An unknown campaign cannot change choice.
-   Treat overlapping campaigns as non-stacking by default: apply the greatest
-   eligible rider discount and greatest eligible driver bonus, with stable ID
-   ordering for ties. Export which campaigns actually applied.
-
-   Freeze gross fare and rider discount in a quote until its stated expiry.
-   Creating an order binds those terms to that order. Freeze the driver's base
-   payout and applicable bonus in each offer; acceptance binds those terms to
-   the ride. An accepted bonus remains payable if the campaign ends during the
-   trip. Only completed rides settle money, exactly once; canceled orders do
-   not consume a completed-ride entitlement. Quote expiry requires a new search
-   and a fresh rider decision, never a silent price substitution.
-
-   Use half-open campaign windows `[start, end)` and policy lookup by simulation
-   time, so boundaries do not depend on callback insertion order. Quotes and
-   offers issued before a boundary retain their commitments for their validity
-   period. Record policy versions and campaign IDs on those snapshots.
-
-   Aggregate campaign budgets, first-N redemption limits, and target-based
-   bonuses such as “complete 20 rides” are extensions, not requirements for the
-   first version. They need explicit reservation/release rules to honor quoted
-   incentives under concurrent demand; never implement a cap by silently
-   reducing an already committed discount or bonus at settlement.
-
-4. **Make rider choice a bounded search across apps for one trip.**
-
-   The default flow is:
-
-   ```text
-   Trip intent -> open preferred installed app -> receive its quote
-      -> acceptable: choose whether to order or leave
-      -> price/ETA dissatisfaction or no supply: consider another installed app
-      -> compare observed, valid quotes -> order one platform or leave
-      -> dispatch failure: finish that order, then try another within the budget
-      -> accepted ride: stop all app searches -> complete the trip
-   ```
-
-   Price sensitivity and ETA sensitivity should be separate personal traits.
-   Express “too expensive” relative to a trip reference fare based on distance
-   and duration, with a personal acceptable-price ratio. Keep that reference
-   independent of the platform's current tariff or discount. Express the ETA
-   tolerance in seconds. A configurable smooth response can turn excess above
-   either tolerance into the probability of opening another app. For example,
-   a bounded response of `1 - exp(-sensitivity * normalized_excess)` is zero at
-   or below tolerance and increases with dissatisfaction. No supply and failed
-   dispatch trigger trying an unvisited installed app when patience permits.
-
-   Choose the next unvisited app using stored preference and known incentives,
-   without inspecting quotes from apps the person has not opened. Each new app
-   takes a configurable positive opening/decision delay. People can return to
-   the best previously observed quote if it is still valid. Search never
-   reserves a vehicle; supply must be checked again when dispatching an order.
-
-   Keep the search trigger distinct from the final purchase decision. Among
-   considered quotes, use a common utility scale combining platform preference,
-   net rider price, pickup ETA, and search friction, with an outside option of
-   leaving without a ride. Draw the outside option once per trip and reuse
-   platform taste draws across retries. Repeatedly checking the same offer
-   must not grant independent extra conversion chances. Additional apps can
-   improve conversion by providing better options, not merely more coin flips.
-   Preserve the existing decision function in single-platform compatibility
-   mode and test its probability endpoints explicitly.
-
-   Bound distinct app openings, quote refreshes, order attempts, and total trip
-   search time separately. A useful first policy permits at most one order
-   attempt per installed app, up to three platforms. A retry uses a positive
-   delay. Enforce an explicit terminal exit when patience or all options are
-   exhausted. Once a driver accepts, do not allow platform switching mid-ride.
-
-   `_abandon_order` currently ends the rider session immediately. It must instead
-   release the failed order and return to the rider's choice policy when another
-   attempt is allowed. Use session/attempt identities on callbacks, so an old
-   decision cannot order a newer quote or revive a finished trip.
-
-5. **Let drivers expand app use when time without an offer becomes excessive.**
-
-   At shift start, a driver normally opens their preferred enabled app. At ride
-   completion, the default policy starts a new waiting episode with the preferred
-   app; alternative apps are opened again if the driver waits too long. Allow
-   scenarios to retain all previously opened apps between rides as an alternative
-   policy. Keeping these choices explicit makes their supply effects measurable.
-
-   Track two different clocks. `idle_started_at` measures time from shift start
-   or ride completion until the next accepted ride. The no-offer clock measures
-   time since becoming available or since the most recent offer arrived. The
-   user's requested switching trigger is the second clock: receipt of an offer
-   resets it even if the driver rejects the offer. Record time to first offer
-   after drop-off separately from time to next acceptance. Opening another app
-   resets neither clock.
-
-   Sample a personal no-offer tolerance and schedule an event when it expires.
-   A more impatient driver opens alternatives sooner; announced bonuses and
-   learned platform experience affect which alternative they choose. If an
-   offer is pending when a choice event fires, defer the choice until the offer
-   resolves; accepted rides suppress it. After rejection or expiry, resume
-   waiting against the latest offer timestamp. If further apps remain, schedule
-   the next expansion after a positive additional delay. With all enabled apps
-   open, do not schedule a repeated app-opening loop.
-
-   The default multi-app policy adds the next app to `open_platform_ids`.
-   Exclusive-switch mode replaces the previous open app. Neither action changes
-   the driver's physical location, creates another shift, or transfers a ride.
-   Receiving and accepting offers still uses payout and pickup sensitivity; idle
-   time controls app participation rather than replacing the acceptance policy.
-
-   An eligible driver must have the order's platform enabled and open, be within
-   an active shift, and have neither a global pending offer nor a current ride.
-   Reserve them atomically when dispatch creates an offer, making them unavailable
-   to every platform until it is rejected, expired, canceled, or the accepted
-   ride completes. Keep the existing nearest-driver and stable-ID tie rules;
-   offer reservation conflicts resolve through deterministic event ordering.
-   Preserve the five-distinct-driver limit per platform order initially.
-
-   Increment a session/idle generation on every relevant transition. Each
-   scheduled choice checks that generation and the session's current state.
-   Shift end prevents new app openings, cancels pending offers, and still lets
-   an accepted ride finish. This extends the current guarded-callback scheduler
-   without requiring polling every driver on every simulated second.
-
-6. **Model downloads and preference changes on a slower timescale.**
-
-   Run repeated trips and shifts for the same people over a configurable number
-   of weeks. Do not regenerate their ownership or preferences each day. Hold the
-   total person population and exogenous trip-intent/shift schedules fixed in
-   the initial model; incentives affect conversion, app participation, and
-   allocation within those schedules. Generating additional trip intents or
-   longer shifts in response to incentives is a separate extension.
-
-   Provide two complementary evolution mechanisms:
-
-   | Mechanism | Intended use |
-   | --- | --- |
-   | Scheduled interventions | Platform launch, pricing changes, campaign changes, marketing exposure, or explicit app/preference changes for a named cohort. Useful for controlled experiments. |
-   | Behavioral evolution | People download additional apps or revise preference because of exposure and their observed experience. Produces endogenous changes in market share. |
-
-   Use a configurable daily checkpoint for adoption and preference updates,
-   while continuing to record experiences when they happen. For adoption, give
-   each missing platform a nonnegative rate based on the person's segment,
-   exposure to the platform, download friction, and accumulated dissatisfaction.
-   A rate has units of events per simulated day; convert it using
-   `p = 1 - exp(-rate * elapsed_days)` so changing the update interval does not
-   accidentally multiply adoption intensity. With several missing apps, use
-   the combined rate to decide whether a download occurs and rate weights to
-   choose its target; initially permit at most one download per checkpoint.
-   Document that this cap introduces a coarse-time approximation at high rates.
-   Unlaunched platforms are ineligible. Rates of zero freeze adoption.
-
-   Dissatisfaction can accelerate adoption, but exposure must allow adoption
-   even among people with only one app. If social diffusion is later enabled,
-   use an explicit exposure model, not unrestricted knowledge of every driver's
-   availability or every rider's outcome. The initial model supports downloads
-   without uninstalling; membership is therefore nondecreasing. Optional app
-   removal/account inactivity can be added separately if ownership churn is
-   needed, preserving at least one usable app and existing ride commitments.
-
-   Learn platform experience from a person's own observations. Rider signals
-   include normalized net price, observed pickup ETA/actual wait, and fulfillment
-   failures. Driver signals include no-offer waits, pickup/service duration,
-   and payout. Normalize for trip length and observation time so a platform
-   serving longer trips is not automatically considered better or worse.
-   Maintain bounded, smoothed scores and observation counts. Preserve priors
-   for unused apps; unknown experience is not equivalent to a perfect or failed
-   service. Default learning should use observed rewards without an additional
-   direct “promotion preference boost,” which would count the same benefit twice.
-
-   For drivers, use actual offer opportunities to estimate wait and expected
-   payout per cycle, including pickup, boarding, and ride duration. Waiting that
-   ends because the driver accepts another platform's offer is censored, not a
-   completed wait or a failure. Time busy on another platform is not eligible
-   exposure time. A concrete first estimator is an offer-arrival rate from
-   observed offers divided by eligible waiting exposure, stabilized by a
-   configurable prior rate and prior exposure. Its inverse estimates waiting
-   time; combine it with smoothed observed payout and service duration to estimate
-   earnings per cycle-hour. This deliberately simple arrival-rate approximation
-   incorporates exposure with no offer, instead of learning only from successful
-   waits. Keep raw wait/censoring records to validate or replace it later.
-
-   Update preferred app only when another enabled app's score exceeds the
-   current one by a configurable margin, with a preference-change cooldown.
-   Combine learned experience with stable loyalty and explicit campaign awareness
-   on documented scales. Some people therefore remain loyal after a small
-   improvement elsewhere, while more flexible people move sooner. A zero
-   learning rate freezes experience-driven preference changes. Downloads and
-   explicit scenario changes remain separately controllable.
-
-   Compute checkpoint decisions against the same pre-update population snapshot
-   and apply them together, avoiding person-iteration bias. New ownership and
-   preference affect the next safe decision: a new rider search or an idle
-   driver app choice. They never interrupt a pending offer or accepted ride.
-   Log every download and preference transition with its cause. Scheduled
-   interventions at a checkpoint take precedence before behavioral updates,
-   and conflicting explicit updates to the same property must be rejected.
-
-   The feedback chain to expose in results is:
-
-   ```text
-   price / discount / bonus changes
-     -> different rider choices and driver app participation
-     -> different eligible supply, pickup ETAs, and offer waits
-     -> different completions and earnings
-     -> updated experience, downloads, and preferences
-     -> different platform choices on subsequent trips and shifts
-   ```
-
-7. **Make scenarios declarative enough to compare experiments.**
-
-   Keep Python scenario entry points. Add validated configuration objects rather
-   than another collection of positional constructor parameters.
-
-   | Configuration group | Contents |
-   | --- | --- |
-   | Market | Seed, horizon, physical population, geometry, speed, weekly trip-intent profile, and shifts. |
-   | Platforms | Rebu/Blot/Flyt IDs, launch times, separate tariffs and commission rates. |
-   | Rider population | Seven ownership-subset weights, conditional preferences, segment-specific tolerances and choice traits. |
-   | Driver population | Separate ownership/preference weights, no-offer tolerances, app retention/switch policy, and acceptance traits. |
-   | Campaigns | Platform, effective window, discount or bonus, eligibility, and awareness rules. |
-   | Evolution | Update cadence, adoption rates/exposure, memory and learning settings, preference margin and cooldown. |
-   | Interventions | Time-indexed platform-policy or cohort changes, with explicit precedence. |
-
-   Save realized profiles and scheduled intents/shifts as well as the settings
-   that generated them. Generate repeated rider activity with enough spacing to
-   avoid overlapping sessions; retain the current public API's explicit error
-   for overlapping sessions. Do not silently drop a trip intent when testing
-   an intervention that causes longer searches or rides.
-
-   Add a small deterministic scenario for inspection and a multiweek experiment
-   with a baseline period, a Blot discount period, a Flyt driver-bonus period,
-   and a post-campaign period. Clearly label chosen segment shares, prices,
-   tolerances, and campaign sizes as synthetic example inputs. Include a frozen
-   ownership/preference control and an otherwise identical evolving-population
-   run. An optional entrant variant launches Flyt partway through the run with
-   no initial Flyt users and a scenario-defined awareness campaign.
-
-   Compare configurations using the same generated people, intended trips,
-   shifts, and seed set. Report absolute rides and unserved demand alongside
-   share, and measure retention after incentives end. Directional effects are
-   expected only with other conditions held fixed: a discount can attract more
-   demand than available drivers can serve. Do not force a campaign to increase
-   completed-ride share in every congested scenario.
-
-8. **Separate market metrics from platform metrics and ownership metrics.**
-
-   Completed-ride share is the primary market-share measure:
-   `platform completions / completions across all three platforms` within the
-   selected time interval. It sums to 100% when at least one ride completes,
-   and is undefined when none complete. Also expose first-app share, order share,
-   and gross-fare share as distinct quantities, each with its denominator.
-
-   | Measure | Required interpretation |
-   | --- | --- |
-   | Trip demand and conversion | One rider session per physical trip intent; conversion means at least one order, counted once even if several platform orders fail. Fulfillment means a completed ride. |
-   | Platform funnel | App visits/searches, quotes, order attempts, accepted orders, and completions. State whether denominators count visits or unique trip intents. |
-   | Rider switching | Original preferred/first app, apps opened, reasons, final platform or unserved exit, total search time, and pickup wait. |
-   | Driver supply | Unique physical drivers plus eligible/pending/serving drivers by platform; app-open counts alone do not represent available supply. |
-   | Driver time | Global online/idle/active time counted once per physical shift. Active time and payouts belong to the serving platform. |
-   | App exposure | Idle time during which each app was open and eligible; these platform intervals can overlap and must not be summed into global driver hours. |
-   | Driver opportunity | Time to first offer after a trip, subsequent offer gaps, time to next accepted ride, and censored waits. |
-   | Ownership and preference | Installed-app penetration per platform, the seven ownership combinations, preferred-app shares, downloads, and preference transitions over time. |
-   | Economics | Gross fares, net rider payments, discounts, base payouts, bonuses, platform contribution, and driver earnings per physical online hour. |
-
-   Preferred-app shares sum to 100% for each role. Installed-app penetrations
-   can sum above 100%, as can platform app-open driver counts. Report unique
-   active riders/drivers separately; they can use multiple platforms within one
-   selected period. Avoid a platform utilization ratio using another platform's
-   service time or an undefined allocation of shared idle time. Initially show
-   global utilization and per-platform service hours and exposure separately.
-
-   Add versioned events for app openings/closures, quote decisions, order
-   attempts, first conversion, terminal trip outcomes, ownership/preference
-   changes, and financial settlement. Distinguish a quote rejection from an
-   unserved trip. Every platform interaction carries a platform ID and the
-   stable trip/shift/person IDs needed for attribution.
-
-   The existing Python aggregator decrements `undecided_sessions` on every
-   `rider_decision`; the dashboard keeps only the last decision for a session.
-   Both assumptions break with repeated app searches. Introduce exactly-once
-   trip conversion and terminal outcome records, keeping individual quote
-   decisions as diagnostic events. Resolve this before enabling rider retries.
-   Preserve offer-created/resolved cohort accounting for platform acceptance.
-
-   Extend the existing dashboard with a Market/Rebu/Blot/Flyt selector and
-   comparison series using fixed platform colors. Combine that selector with
-   the existing Week/Day/Range controls for every card, chart, and CSV export.
-   Include incentive/policy change markers, share trends, ownership/preferences,
-   switch reasons, offer waits, and economics. Recompute weighted ratios from
-   counts and time; never average percentages or add overlapping platform counts.
-
-   Record initial profile state plus timestamped changes so an arbitrary report
-   range reconstructs ownership and preferences at its start; counting only
-   downloads inside the selected range is insufficient. Version the export
-   schema, save policy/seed derivation details and added source hashes, and keep
-   profile snapshots separate from compact dashboard aggregates for large runs.
-   Continuations retain current membership, experience, monetary commitments,
-   RNG state, and future events. Each saved report includes its own starting
-   state and only newly observed events/settlements; earlier reports stay fixed.
-
-9. **Implement in increments with explicit acceptance gates.**
-
-   | Milestone | Deliverable and gate |
-   | --- | --- |
-   | 1. Platform and population foundation | Add profiles and platform-tagged records, platform-aware search/dispatch, independent tariffs, and compatibility mode. One driver cannot be duplicated across markets; a Rebu-only run preserves existing behavior. |
-   | 2. Incentive economics | Add campaigns, awareness inputs, immutable terms, and settlement. Demonstrate a discount changing rider price only, a bonus changing driver payout only, and exact financial reconciliation. |
-   | 3. Rider search and funnel | Implement sequential app choice, bounded cross-platform attempts, and exactly-once trip accounting in Python and dashboard observations. Demonstrate preferred-first search and fallback after price, ETA, and dispatch failures. |
-   | 4. Driver app participation | Implement idle clocks, app-opening timers, global reservations, and app retention policies. Demonstrate the same driver reachable through several apps but serving only one ride. |
-   | 5. Evolution | Add exposure/adoption, observed-experience learning, preference hysteresis, and scheduled interventions. Demonstrate persistent people changing ownership and preference over several weeks with market share calculated from completions. |
-   | 6. Comparative reporting and scale | Finish platform/time filtering and experiment scenarios. Verify accounting, deterministic continuation, Python/JavaScript metric parity, and measured performance at small, weekly, and multiweek scales. |
-
-   Suggested new modules are `platforms.py` for platform configuration, pricing,
-   campaigns, and money; `population.py` for profiles and seeded segments;
-   `choice.py` for pure rider/driver choice calculations; and `evolution.py` for
-   adoption and preference transitions. Keep lifecycle mutations in `main.py`
-   and retain reusable probability primitives in `behavior.py`. Do not name a
-   module `platform.py`, which would shadow Python's standard-library module.
-
-   Keep old `Simulation(...)` calls working through an explicit internal
-   Rebu-only compatibility configuration when no platform/population config is
-   supplied. Existing fare arguments map to Rebu in that mode. New marketplace
-   scenarios explicitly configure all three platforms and heterogeneous access;
-   reject ambiguous combinations of legacy fare arguments and platform tariffs.
-   Document the three-platform scenario as the entry point for this feature.
-
-   Use separate stable random streams for profile generation, rider choice,
-   driver choice, and evolution. Derive their seeds reproducibly, without
-   Python's process-randomized `hash()`. The compatibility path must not consume
-   extra decision draws. For comparative experiments, key choice randomness by
-   stable intent/person/decision identity where practical, so unrelated new
-   events do not shift every later person's random draw. Reporting and playback
-   never consume behavioral randomness.
-
-10. **Validate causal rules, concurrency, accounting, and evolution.**
-
-    Add focused tests with explicit people and forced choices before larger
-    statistical experiments. Required cases include:
-
-    | Case | Acceptance criterion |
-    | --- | --- |
-    | Single-, two-, and three-app people | Only installed/enabled apps can be used; preferred app belongs to that set. |
-    | Preferred rider app acceptable | Default opens it first; no automatic query of unseen competitors. |
-    | High price, high ETA, unavailable supply | Each cause can independently trigger another app, subject to personal sensitivity and patience. |
-    | All platforms unattractive | Trip exits within finite time; repeated quotes do not create extra independent conversion draws. |
-    | Failed first platform order, successful second | Two orders, one rider session, one converted trip, one completion. |
-    | One driver, two platform orders at the same instant | At most one global pending offer and one accepted ride; deterministic loser behavior. |
-    | Driver idle threshold | Alternative opens at the defined no-offer threshold; offer receipt resets the offer clock, app opening does not. |
-    | Stale rider/driver timer, shift end, ride acceptance | Old callbacks cannot reopen apps, duplicate orders, or revive finished sessions. |
-    | Discounts and bonuses | Correct decision input changes; committed terms survive campaign end; canceled orders do not settle. |
-    | Quote expiry and tariff boundary | An expired quote is refreshed and reconsidered; new quotes use new policy, committed orders retain old terms. |
-    | Adoption and preference | Download does not force preference; repeated good/bad experiences can change it; zero rates freeze the corresponding process. |
-    | All apps installed or platform not launched | No duplicate/impossible download; no unbounded no-op update events. |
-    | Driver observed through multiple apps | Busy time is not counted as idle opportunity on another app; interrupted waits are marked censored. |
-    | Same seed/configuration and split versus continuous run | Same behavioral outcomes and settlements, excluding report metadata and wall-clock runtime. |
-    | Arbitrary report range and platform filter | Correct starting ownership, unique trip accounting, exact clipped physical time, weighted ratios, and matching Python/JavaScript results. |
-
-    Check conservation independently of which random choices occurred:
-    orders created = completed + canceled + active; rider sessions started =
-    ended + active; global completions = sum of platform completions; total
-    physical online time = idle + active time; and rider payments = driver
-    payouts + platform contribution. Every trip can complete at most once.
-    Zero denominators produce gaps, not invented zeros or shares.
-
-    Validate configuration before scheduling: platform IDs and references,
-    nonempty app sets, subset weights, bounded probabilities, finite monetary
-    amounts and tolerances, commission in `[0, 1]`, strictly positive retry and
-    evolution intervals, and coherent time windows. Retain current offer-timeout
-    ordering and horizon behavior, including unfinished rides and campaign
-    commitments carried into a later run.
-
-    Run the existing Python and dashboard test suites, plus the new targeted
-    cases, during implementation. Use several seeds for aggregate directional
-    experiments, with frozen controls to separate immediate price/supply effects
-    from subsequent learning and adoption. Do not preserve the current
-    94,773-ride/72.12%-utilization calibration as a target for three competing
-    platforms; it describes the current single-platform model.
-
-    Start with scans of active eligible drivers and profile only after correctness.
-    A per-platform eligible-driver index is the first optimization if warranted;
-    every global reservation must update all relevant indexes. Daily evolution
-    may scan the population once, but ordinary event processing must not scan
-    all inactive people. Measure event counts, runtime, history/report size, and
-    peak memory on the existing 100k-week scale before extending the horizon.
-
-The first complete release covers all requested behavior: heterogeneous app
-ownership, preferred-first usage, rider price/ETA switching, driver no-offer
-switching, independent platform pricing, rider discounts, driver bonuses, new
-downloads, learned preference changes, and market-share evolution. Real routing,
-automatic competitive pricing, simultaneous offers to one driver, campaign
-budget optimization, app uninstalling, and endogenous total demand/shift length
-remain separate extensions.
+# Phase 3: Rebu, Blot, and Flyt on one physical market
+
+Status: design and implementation plan only. Proposed APIs, modules, presets,
+and capabilities are not implemented by this documentation change.
+
+The simulator's purpose is to compare experiments. Scenarios should require
+little configuration, inherit versioned defaults, and replace models without
+rewriting lifecycle mechanics. Establish those boundaries before introducing
+three competing marketplaces: **Rebu**, **Blot**, and **Flyt**.
+
+One market owns riders, drivers, cars, and physical locations. Each platform is
+a marketplace with independent policies and knowledge. Market share emerges
+from participants' decisions and completed rides.
+
+This revision replaces the earlier global one-pending-offer-or-ride reservation.
+Competing offers can coexist. A driver can hold two accepted, unfinished orders
+market-wide while physically serving only one. Same-platform back-to-back orders
+and cross-platform queued orders are requirements of this phase.
+
+## Architecture and document map
+
+| Document | Responsibility |
+| --- | --- |
+| [Event engine](architecture/event-engine.md) | Generic clock, deterministic scheduling, event records, cancellation, and continuation; no ride-hailing dependencies. |
+| [Marketplace engine](architecture/marketplace-engine.md) | Shared entities, physical movement, commitments, legal transitions, scoped observations, and accounting. |
+| [Marketplace policy](architecture/marketplace-policy.md) | Per-platform matching, dispatch, pricing, distance/ETA estimates, incentives, expiry, and cancellation, including segment conditions. |
+| [Behavior policy](architecture/behavior-policy.md) | Participant decisions, private memory, app use, acceptance, patience, adoption, and learning. |
+| [Scenario definition](architecture/scenario-definition.md) | Minimal authoring, versioned presets, typed overrides, interventions, validation, and compilation to an execution plan. |
+| [Experiment runner](architecture/experiment-runner.md) | Variants, replications, controlled inputs, reproducibility, measurements, comparison, and performance. |
+
+These are responsibility boundaries, not independent simulation clocks. The
+marketplace engine supplies domain handlers to the event engine and validates
+policy commands. Platform policies receive local views; participant policies
+receive personal views. Compilation prepares an immutable plan, and the runner
+creates fresh mutable state per replication. Reporting cannot affect decisions.
+
+The layer documents own detailed contracts; this roadmap owns implementation
+order and release scope. Change both when a shared contract changes.
+
+## Engine invariants and configurable assumptions
+
+Every modern scenario must obey these marketplace-engine constraints:
+
+- Every physical ride binds one rider, one driver, and one car. Each entity can
+  participate in only one physical ride at a time.
+- A driver/car has one actual trajectory, shared by an onboard rider, regardless
+  of what individual platforms report about their orders.
+- A driver holds at most two accepted, nonterminal orders across all platforms.
+  Offers alone do not consume slots; acceptance acquires a slot atomically.
+- A queued order cannot physically arrive at pickup until the preceding ride
+  ends and its own pickup travel finishes. An expired ETA cannot cause arrival.
+- Going offline cannot erase a ride or silently discard accepted commitments.
+  Cancellation and shutdown must reach valid physical and contractual endings.
+- People own at least one installed app; cars have at least one platform
+  registration. Service requires compatible participant and vehicle access.
+
+The two-order ceiling is a fixed model constraint, even though it is not a
+physical law. Platforms can impose stricter rules but cannot raise it. World
+parameters such as speed are configurable; a single actual trajectory is not.
+
+Nearest-driver matching, five distinct dispatch attempts, ten-second offer
+expiry, rider search strategy, second-order willingness, cancellation rules,
+app retention, tariffs, and learning models are replaceable policy defaults.
+Do not encode these as engine laws.
+
+## Entities, platform knowledge, and commitments
+
+Introduce persistent rider, driver, and car records. Keep installed/enabled
+apps, preferred app, open apps, accepted orders, and physical activity separate.
+A car's membership means registration; it has no human app preference. Initially
+assign one explicit car per driver. Shared-fleet reassignment is a later model.
+
+Support all seven nonempty app subsets independently for riders and drivers,
+plus explicit car registrations. Validate preferred-app usability and compatible
+driver/car pairs. Support explicit small populations and seeded correlated
+segments. Downloads and preference changes are different transitions. If driver
+adoption triggers car registration, declare that policy and log both changes.
+
+Each platform knows its own offers, orders, app sessions, visible segments, and
+shared location observations. It cannot access competitor destinations, orders,
+or the global commitment queue. Match using platform-local eligibility; a
+secret global-idle filter would leak competitor activity. Participants can know
+their own commitments across apps. The experiment observer may see the whole
+market, but that privilege never becomes a policy input.
+
+An accepted Blot order can be labeled "driving to pickup" by Blot while its
+driver still carries Rebu's rider. Store Blot's order state, the market's physical
+activity, and the driver's service sequence separately. Multiple offers do not
+reserve a driver globally. Competing acceptances for one order choose one driver;
+competing acceptances for the driver's last slot admit one winner atomically.
+
+## Movement, estimates, and back-to-back service
+
+Platforms calculate distance, propose routes, and estimate ETA independently.
+The market executes one actual route and supplies position at simulated time
+`t`. Start with straight-line movement at world speed, interpolated between
+movement boundaries without per-second population polling.
+
+ETA never schedules physical arrival. On completion of a preceding ride, begin
+queued pickup travel from its actual drop-off position. Validate route origins
+and world constraints. Initial service order follows acceptance order; a queued
+cancellation can remove a commitment without interrupting the occupied ride.
+
+Use this deterministic fixture with otherwise exact travel estimates:
+
+| Quantity | Minutes |
+| --- | --- |
+| Remaining Rebu ride | 6 |
+| Current position to Blot pickup | 3 |
+| Rebu destination to Blot pickup | 4 |
+| Blot's initial ETA without Rebu knowledge | 3 |
+| Actual pickup wait after Blot acceptance | 10 |
+| Informed same-platform back-to-back estimate for identical geometry | 10 |
+
+The seven-minute error must emerge from missing information, without an
+artificial cross-platform penalty. Same-platform knowledge permits a correct
+estimate under an exact estimator; other estimation models can still err.
+Reject a third commitment, including another Rebu order while Rebu and Blot
+already occupy the two slots.
+
+## Behavior, economics, and evolution
+
+Riders normally open their preferred usable app. Personal price/ETA tolerances,
+sensitivity, search friction, and patience govern further app searches. Bound
+app openings, quote refreshes, and orders separately. Keep one trip intent across
+failed attempts and count conversion once. Reuse trip taste/outside-option draws
+so repeated searches do not manufacture conversion. A permitted pre-boarding
+cancellation can allow a retry after the prior order closes; an onboard rider
+cannot switch into another simultaneous ride.
+
+Drivers choose apps and offers using private workload, preference, payout, and
+waiting experience. Track physical idle time, no-offer time, and commitment wait
+separately. A queued order may eliminate post-drop-off idle waiting. Busy time
+can provide another app's offers, so the previous blanket exclusion of busy
+time from offer opportunity is removed. Separate idle and busy-with-a-free-slot
+exposure and retain censored waiting observations.
+
+Platforms own independent versioned tariffs, commissions, discounts, and driver
+bonuses. Freeze quoted rider terms and accepted driver terms. The default
+completed-ride accounting is:
+
+```text
+gross fare G; rider discount D; commission fraction c; driver bonus B
+rider payment = G - D
+driver payout = (1 - c) * G + B
+platform contribution = c * G - D - B
+```
+
+Contribution excludes operating costs and taxes. Default cancellation charges
+no fee and earns no completion bonus. Other supported cancellation policies
+must produce separate explicit settlements, not invented completed rides.
+Campaign windows are half-open, and committed terms survive policy changes.
+The policy and engine documents define rounding and settlement contracts.
+
+Initially hold total people, exogenous trip intents, and shifts fixed. Preserve
+ownership and personal memory across weeks. Support scheduled launch, marketing,
+policy/cohort changes, and endogenous adoption and learning. Zero rates freeze
+those mechanisms independently. Use observed experience, priors for unused apps,
+bounded learning, and preference hysteresis. Updates never interrupt occupied
+rides, erase queued commitments, or rewrite monetary terms.
+
+## Scenario compiler and experiment controls
+
+New Python scenario builders produce typed definitions rather than mutating a
+live simulation. A named, versioned preset supplies complete synthetic defaults.
+Scenarios specify differences. Export resolved values and override provenance.
+Unknown keys, unused parameters, and incompatible policies fail before execution.
+
+Compile definitions into prepared plans: resolve policy versions and references,
+check interfaces and observation permissions, normalize units, bind functions,
+and prepare lookups. Instantiate reproducible populations and external inputs
+per replication. Dynamic legality still needs runtime checks. Do not precompute
+market-dependent futures or promise native speedups for arbitrary Python hooks.
+
+Compare a baseline and explicit variants using a seed set and shared initial
+people/schedules where those inputs are controlled. Use stable intent/person
+and decision-purpose random identities, not global order counters or Python's
+process-randomized hash. Record model, preset, policy, compiler, metric, and
+environment versions. Define warm-up, measurement, drain, and unfinished-outcome
+treatment before comparing results.
+
+## Metrics and reports
+
+Replace single-decision-per-session assumptions before rider retries. Emit
+exactly-once trip conversion and terminal outcomes alongside repeated quotes.
+Preserve offer-created/resolved cohorts and distinguish failed acceptance from
+rejection, expiry, and cancellation.
+
+Primary market share is platform completions divided by all completions in the
+selected window. Also report absolute completions, unserved demand, first-app
+and order shares, downloads, preferences, and ownership. Undefined denominators
+produce gaps. Installed-app penetrations can sum above 100%.
+
+Count physical driver/car service only for the order actually receiving pickup
+travel, boarding, or passenger transport. A Blot queue overlapping Rebu service
+is not Blot active time. Report commitment wait, platform-reported en-route time,
+and original/revised/actual ETA separately. Platform offer opportunity intervals
+can overlap, including service elsewhere, and cannot be summed as physical hours.
+
+Use consistent platform/time filters, cohort definitions, and weighted ratios.
+Reconstruct ownership at arbitrary window starts from snapshots and changes.
+Keep Python and dashboard metrics in parity. Reports do not consume behavioral
+randomness or supply hidden feedback to policies.
+
+## Implementation sequence
+
+| Milestone | Deliverable and acceptance gate |
+| --- | --- |
+| 0. Refactor and characterize | Separate scheduling, domain transitions, policies, configuration, and run/report orchestration. Preserve legacy single-platform decisions, timings, and metrics. |
+| 1. Definition and experiment foundation | Versioned presets, resolver/compiler, immutable plans, fresh run state, and paired variants. Reproduce a saved small experiment with all defaults explicit. |
+| 2. Shared market and platform views | Cars, trajectories, access, and scoped observations. Same location at the same time; no competitor order visibility. |
+| 3. Offers and queued commitments | Competing offers, atomic two-order capacity, same/cross-platform queues, independent estimates, cancellation, and deferred offline. Pass the ETA fixture and third-order race tests. |
+| 4. Economics and rider funnel | Independent tariffs, incentives, committed terms, settlements, bounded app search, and exactly-once conversion. Reconcile money and trip outcomes. |
+| 5. Participation and evolution | No-offer timers, app retention, second-order willingness, exposure-aware learning, adoption, and interventions. Preserve commitments during updates. |
+| 6. Comparison and scale | Platform/time reports, replicate uncertainty, continuation, and small/weekly/multiweek measurements. Pass all cross-layer gates below. |
+
+Extract `_schedule`/`advance_to` into generic scheduling and retain `run()` as a
+compatibility facade over runner orchestration. Split `_dispatch_order` into
+local policy decisions and engine commands. Replace driver `pending_order` and
+`current_order` with separate offer references, commitments, and physical state.
+Move choice/pricing behind their contracts; do not retain all domain transitions
+in `main.py`. Module names are implementation choices, not a required package API.
+
+The legacy adapter uses Rebu, one car per driver, existing price arithmetic and
+random draw order, and local rules that offer only to idle drivers. It does not
+exercise second commitments. Preserve timeout-at-deadline behavior and current
+numeric results; do not add rounding or extra draws to that path. Reject mixed
+legacy arguments and modern policy overrides. New experiments select the modern
+model explicitly.
+
+## Cross-layer acceptance gates
+
+- No rider, driver, or car is physically occupied twice, and one car cannot have
+  two active controlling drivers.
+- All app subsets, car registration, preference validity, launches, and downloads
+  obey access rules without inventing platform users.
+- Competitor state cannot leak through candidate filtering, ETA inputs, capacity
+  counters, or rejection reasons.
+- Offers coexist; an order assigns one driver; a driver holds at most two
+  accepted orders; same-time races and all third-order combinations are tested.
+- Queued pickup cannot occur early, even if the preceding route passes that
+  pickup. Queue cancellation leaves current service unchanged; promotion and
+  capacity release happen exactly once.
+- Offline requests, stale events, expiry, and policy changes cannot revive orders
+  or remove occupied entities.
+- Rider retries preserve intent identity and conversion; repeated searches do
+  not grant independent extra conversion chances.
+- Discounts/bonuses affect the correct party; terms survive campaign end;
+  cancellation settlements remain distinct from completion rewards.
+- Learning distinguishes idle/busy opportunity, handles censored waits, respects
+  actor knowledge, and freezes with zero rates.
+- Continuous and resumed runs agree, including positions, queues, memory,
+  randomness, future events, and monetary commitments.
+- Orders created = completed + canceled + active; each intent completes at most
+  once; physical online time = idle + service; platform completions sum to market
+  completions; rider payments = driver payouts + platform contribution for every
+  completed-ride or explicit cancellation settlement.
+
+Run existing Python/JavaScript suites and focused new contract tests during
+implementation. The 94,773-ride/72.12%-utilization legacy calibration is a
+reference, not a target imposed on three competing platforms. Profile candidate
+scans, event counts, logs, reports, runtime, and peak memory before optimizing;
+indexes must preserve platform knowledge boundaries.
+
+The first complete release includes the behavior above. Road-network routing,
+automatic pricing optimization, campaign budgets/quests, app removal, shared
+fleets, pooling, and endogenous total demand/shift generation remain extensions.
+Define interfaces for such models without claiming their implementations exist.
