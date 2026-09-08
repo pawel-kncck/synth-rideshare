@@ -206,7 +206,7 @@ randomness or supply hidden feedback to policies.
 
 | Milestone | Deliverable and acceptance gate |
 | --- | --- |
-| 0. Refactor and characterize | Separate scheduling, domain transitions, policies, configuration, and run/report orchestration. Preserve legacy single-platform decisions, timings, and metrics. |
+| 0. Refactor and characterize | Separate scheduling (done: `event_engine.py`), domain transitions, policies, configuration, and run/report orchestration. Legacy single-platform results are a reference for sanity checks, not a compatibility requirement. |
 | 1. Definition and experiment foundation | Versioned presets, resolver/compiler, immutable plans, fresh run state, and paired variants. Reproduce a saved small experiment with all defaults explicit. |
 | 2. Shared market and platform views | Cars, trajectories, access, and scoped observations. Same location at the same time; no competitor order visibility. |
 | 3. Offers and queued commitments | Competing offers, atomic two-order capacity, same/cross-platform queues, independent estimates, cancellation, and deferred offline. Pass the ETA fixture and third-order race tests. |
@@ -214,8 +214,8 @@ randomness or supply hidden feedback to policies.
 | 5. Participation and evolution | No-offer timers, app retention, second-order willingness, exposure-aware learning, adoption, and interventions. Preserve commitments during updates. |
 | 6. Comparison and scale | Platform/time reports, replicate uncertainty, continuation, and small/weekly/multiweek measurements. Pass all cross-layer gates below. |
 
-Extract `_schedule`/`advance_to` into generic scheduling and retain `run()` as a
-compatibility facade over runner orchestration. Split `_dispatch_order` into
+Scheduling is extracted into `event_engine.py`; `run()` remains the
+orchestration entry point until the experiment runner exists. Split `_dispatch_order` into
 local policy decisions and engine commands. Replace driver `pending_order` and
 `current_order` with separate offer references, commitments, and physical state.
 Move choice/pricing behind their contracts; do not retain all domain transitions
@@ -256,9 +256,11 @@ model explicitly.
   completions; rider payments = driver payouts + platform contribution for every
   completed-ride or explicit cancellation settlement.
 
-Run existing Python/JavaScript suites and focused new contract tests during
-implementation. The 94,773-ride/72.12%-utilization legacy calibration is a
-reference, not a target imposed on three competing platforms. Profile candidate
+There is no unit test suite: every milestone may refactor the previous one,
+and tests would turn ad-hoc decisions into permanent requirements. Validate
+with scenario runs and throwaway scripts. The 94,766-ride/72.11%-utilization
+legacy calibration is a reference, not a target imposed on three competing
+platforms. Profile candidate
 scans, event counts, logs, reports, runtime, and peak memory before optimizing;
 indexes must preserve platform knowledge boundaries.
 

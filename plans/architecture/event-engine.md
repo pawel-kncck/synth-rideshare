@@ -1,123 +1,143 @@
 # Event engine
 
-Status: proposed design, not an implemented API. See the
-[phase 3 roadmap](../phase-3-multi-platform-marketplace.md) for delivery order.
+Status: implemented in `event_engine.py`. `main.py` runs on it. See the
+[phase 3 roadmap](../phase-3-multi-platform-marketplace.md) for what comes next.
 
-The event engine advances a simulated clock and executes scheduled work. It
-must be usable by another simulation domain without importing ride-hailing
-entities, platform rules, behavioral models, or reporting packages.
+The event engine advances a simulated clock and executes scheduled work. It is
+usable by another simulation domain without importing ride-hailing entities,
+platform rules, behavioral models, or reporting packages: `event_engine.py`
+imports only the standard library.
 
 ## Responsibilities and boundary
 
-Own the clock, event ordering, scheduling, event identities, cancellation,
-execution status, and serialization of scheduling state. The
-[marketplace engine](marketplace-engine.md) registers domain handlers; it owns
-what a handler means and whether a resulting domain transition is legal.
+The engine owns the clock, event ordering, scheduling, event identities,
+cancellation, execution status, execution budgets, and serialization of
+scheduling state. The [marketplace engine](marketplace-engine.md) registers
+domain handlers; it owns what a handler means and whether a resulting domain
+transition is legal.
 
-The scheduler must not know about drivers, cars, orders, pricing, offer expiry,
+The scheduler does not know about drivers, cars, orders, pricing, offer expiry,
 physical occupancy, or the two-order limit. It does not generate demand or make
 random decisions. Wall-clock playback, output directories, replication, and
-reports belong to the [experiment runner](experiment-runner.md).
+reports belong to the [experiment runner](experiment-runner.md); today
+`Simulation.run()` in `main.py` plays that role.
 
-## Proposed interface and event representation
+## Interface
 
-Conceptual operations, with final Python names to be chosen during extraction:
+| Operation | Python | Contract |
+| --- | --- | --- |
+| Register handler | `HandlerRegistry.register(kind, handler, version=1)` | Associate a versioned event kind with a callable. A registry is configuration: build it once, construct any number of schedulers from it. Re-registering a kind fails. |
+| Schedule at time | `Scheduler.schedule_at(at_seconds, kind, payload=None)` | Validate time and payload, assign an event id and a sequence number, return a `ScheduledEvent` handle. |
+| Schedule after delay | `Scheduler.schedule_after(delay_seconds, kind, payload=None)` | Resolve relative to the current simulated time with the same validation. |
+| Cancel | `handle.cancel()` or `Scheduler.cancel(handle)` | Idempotent. Returns `True` only when the event was pending. Canceling a running or processed event does not undo its effects and returns `False`. |
+| Step | `Scheduler.step()` | Process the next valid event and return its record, or return `None` when the queue is empty. |
+| Advance to time | `Scheduler.advance_to(target_seconds)` | Process events through the inclusive boundary, then move the clock there. Returns the number of events processed. |
+| Snapshot/restore | `Scheduler.snapshot()`, `Scheduler.restore(snapshot, registry, **options)` | Preserve clock, valid pending records, counters, and registered kind versions under `schema_version` 1. |
+| Inspect | `now`, `pending()`, `pending_count`, `processed_count`, `next_time()`, `recent`, `failure` | Read-only views for runners, tracing, and diagnostics. |
+| Compact | `Scheduler.compact()` | Rebuild the heap without canceled entries. Ordering keys are unchanged; nothing is resampled. |
 
-| Operation | Contract |
-| --- | --- |
-| Register handler | Associate a versioned event kind with a callable during runtime construction. |
-| Schedule at time | Validate time and payload, assign event identity and stable sequence, return a cancellation handle. |
-| Schedule after delay | Resolve relative to the current simulated time using the same validation. |
-| Cancel handle | Idempotently mark an event invalid; cancellation of a processed event does not undo its effects. |
-| Step | Process the next valid event, or report that the queue is empty. |
-| Advance to time | Process events through an explicit inclusive boundary, then move the clock to that boundary. |
-| Snapshot/restore | Preserve clock, pending records, sequence counters, and cancellation state with schema versions. |
+Handlers are called as `handler(record)` with an `EventRecord` containing
+`event_id`, `at_seconds`, `sequence`, `kind`, `version`, and a read-only
+`payload` mapping. The scheduler treats payload fields as opaque values; it only
+requires them to be JSON-shaped (`None`, `bool`, `int`, finite `float`, `str`,
+lists, tuples, and string-keyed dicts) so records can be persisted and traced.
+Domain payloads reference stable entity ids and a generation identity (a
+session id, an offer id) instead of closing over mutable Python objects. The
+ride-hailing domain uses these kinds:
 
-Use structured records containing `event_id`, `at_seconds`, `sequence`,
-`kind`, and a serializable payload. Domain payloads normally reference stable
-entity IDs and a generation/attempt identity instead of closing over mutable
-Python objects. The scheduler treats those fields as opaque values.
+| Kind | Payload | Handler checks before acting |
+| --- | --- | --- |
+| `driver_session.start` | `driver_id`, `location`, `shift_seconds` | The driver has no active session. |
+| `driver_session.end_shift` | `driver_id`, `session_id` | That session is still the driver's active one. |
+| `rider_session.start` | `rider_id`, `location`, `destination` | The rider has no active session. |
+| `rider_session.decide` | `rider_id`, `session_id` | That session is active and has not ordered. |
+| `offer.expire`, `offer.decide` | `order_id`, `offer_id` | The order is active and that offer is still its pending one. |
+| `ride.advance` | `order_id`, `expected_state` | The order is active, assigned, and in the expected state. |
 
-The queue key is initially `(at_seconds, sequence)`. Keep FIFO ordering for
-equal times, matching the current heap mechanism. Do not add scheduler priorities
-as an incidental optimization. If future modeling needs explicit priorities,
-version and test the resulting semantics before exposing them.
+The queue key is `(at_seconds, sequence)`: by time, then first-in first-out.
+There are no scheduler priorities. If future modeling needs them, version the
+resulting semantics before exposing them.
 
 ## Time and ordering
 
-Use finite simulated seconds relative to one run origin. Keep the existing
-floating-point time representation for the initial extraction; calendar labels
-and time zones are runner/scenario concerns. Reject NaN, infinity, booleans as
-numeric times, negative delays, and attempts to move or schedule into the past.
+Time is finite simulated seconds relative to one run origin, kept as Python
+numbers. Calendar labels and time zones are runner/scenario concerns. The
+scheduler rejects NaN, infinity, booleans and other non-numbers, negative
+delays, and attempts to schedule or advance into the past, all before anything
+enters the queue.
 
 Zero-delay events are legal. A handler scheduling work for the current time
-places it after already queued events at that time. Run handlers to completion
-without interleaving another event. This allows the marketplace engine to make
-an atomic acceptance transition without a second acceptance executing midway.
-It does not make arbitrary handler code transactional or thread-safe.
+places it after already queued events at that time. Handlers run to completion
+without interleaving another event, which lets the marketplace engine make an
+atomic acceptance transition. It does not make arbitrary handler code
+transactional or thread-safe.
 
-Do not execute newly scheduled events recursively inside `schedule`. Return to
-the queue so event order remains inspectable. Provide a configurable execution
-budget for excessive events at one timestamp and overall event count. Exceeding
-a budget fails the run with a diagnostic trace; it must not silently discard
-work, shift timestamps, or alter outcomes to make progress.
+Newly scheduled events are never executed recursively inside `schedule_*`; they
+return to the queue so event order stays inspectable through `pending()`.
+Two execution budgets are configurable per scheduler: `max_events_per_time`
+(default 100,000 events at one timestamp) and `max_events` (default unlimited).
+Exceeding one raises `BudgetExceeded` naming the time, the event that was about
+to run, and the last processed events. The offending event is put back in the
+queue, the clock is not moved, and no work is discarded or reordered.
 
-Domain rules own boundary semantics. For example, the marketplace engine rejects
-acceptance when `now >= offer.expires_at`, regardless of callback insertion order.
-Tariff selection uses half-open effective windows. A domain checkpoint handler
-applies due explicit interventions before taking its learning snapshot. The
-scheduler itself does not assign special meanings to those events.
+Domain rules own boundary semantics. The ride-hailing domain queues an offer's
+expiry before the driver's decision and rejects acceptance when
+`now >= offer.expires_at`, regardless of insertion order. The scheduler assigns
+no special meaning to any kind.
 
-Preserve the current inclusive `advance_to(end)` behavior. A continuous run and
-a split run must execute a boundary event once, never twice. Running to a horizon
-leaves later events queued and does not imply an empty market or a completed ride.
+`advance_to(end)` is inclusive. A continuous run and a split run execute a
+boundary event once, never twice. Running to a horizon leaves later events
+queued; it does not imply an empty market or a completed ride.
 
 ## Cancellation, stale work, and failure
 
-Lazy cancellation is sufficient initially: retain invalid queue entries until
-they reach the head. Domain handlers must also check generation, session, and
-attempt identities. Canceling a timer cannot substitute for checking whether
-the quoted offer or trip still exists when related work executes.
+Cancellation is lazy: a canceled entry stays in the heap until it reaches the
+head, where it is skipped and reported to the trace sink. `pending_count` and
+`pending()` already exclude canceled entries. Call `compact()` if invalid
+entries materially increase memory.
 
-Use queue compaction only if invalid entries materially increase memory. Rebuild
-the heap without changing the ordering keys or resampling anything.
+Cancellation never substitutes for domain checks. Every ride-hailing handler
+first resolves the ids in its payload against the active sessions, orders, and
+pending offers and returns quietly when they no longer match. Resolving an
+offer also cancels its remaining timers, but a timer that fires anyway (for
+example one already at the head of the queue) is neutralized by the check.
 
-Unknown handler kinds, invalid payloads, or handler failures stop execution and
-identify time, event ID/kind, and the original exception. The runner records the
-failure and reproduction metadata. Do not automatically retry a partly executed
-domain handler. Domain command implementations must validate before mutation
-and publish their outputs after a coherent transition.
+Unknown kinds and invalid payloads fail at scheduling time. A handler that
+raises stops the scheduler: the exception is wrapped in `HandlerFailure`, which
+carries the record, the simulated time, the recently processed records, and
+the original exception as its cause. The scheduler refuses further steps after
+a failure so that a partly executed transition is never retried automatically.
+`Simulation.run()` writes the failed event and the events before it into
+`config.json` with a failed status. Domain handlers must validate before
+mutating and publish outputs after a coherent transition.
 
 ## Continuation and observation
 
-A scheduler snapshot alone is not a full simulation checkpoint. The runner
-coordinates snapshots with marketplace state, policy memory, randomness, and
-output cursors at an event boundary. Restore the handler registry from the
-recorded model/policy versions and reject incompatible versions.
+A scheduler snapshot alone is not a full simulation checkpoint. Marketplace
+state, policy memory, randomness, and output cursors must be captured together
+at an event boundary by the runner. `restore()` rejects unknown schema
+versions, pending kinds the registry lacks, kinds registered at a different
+version than the snapshot recorded, times before the restored clock, and
+counters that would reuse an existing event identity. A restored scheduler
+continues the event id and sequence counters, so same-time tie resolution is
+unchanged.
 
-Trace sinks may observe scheduled, canceled, skipped, and processed event
-records. They cannot mutate domain state or supply random draws. Detailed tracing
-may be disabled while retaining failure diagnostics and required domain metrics.
-Enabling tracing must not change event ordering or decisions.
+A trace sink is a callable `trace(action, record)` passed at construction. It
+observes `scheduled`, `canceled`, `skipped`, `processed`, and `failed` records.
+It receives frozen records with read-only payloads, cannot mutate domain state
+or supply random draws, and does not change ordering or decisions. Omitting the
+sink retains failure diagnostics through `recent` and the raised exception.
 
-Keep immutable configuration separate from runtime state. The same prepared plan
-can construct many independent schedulers, each with its own clock, queue, and
-sequence counters. A restored scheduler continues counters rather than resetting
-them and changing same-time tie resolution.
+Configuration is separate from runtime state: the registry and the budgets are
+fixed at construction, while the clock, queue, counters, and failure belong to
+each scheduler instance.
 
-## Initial implementation and validation
+## Validation
 
-Extract `Simulation._schedule`, `_schedule_at`, and `advance_to` first, with
-behavioral equivalence tests. A private callable adapter can preserve legacy
-execution during migration; arbitrary closures are not a supported portable
-checkpoint format. Move modern domain events to registered structured records
-before claiming persisted resume support.
-
-Keep heap-based discrete-event execution. Neither a tick loop nor a native-code
-compiler is required for this boundary. Measure event throughput, queue size,
-invalid-event share, and memory before changing the data structure.
-
-Required acceptance cases:
+There is no unit test suite, by project policy: at this stage every change may
+be a refactor, and tests would freeze ad-hoc decisions into requirements. The
+behaviors below are the contract, checked with throwaway scripts and scenario
+runs whenever the engine changes:
 
 - A toy non-market domain uses the scheduler without importing marketplace code.
 - Out-of-order insertion executes by time; equal times execute by sequence.
@@ -129,3 +149,8 @@ Required acceptance cases:
 - Continuous, split, and restored runs produce the same ordered domain results.
 - Tracing, playback speed, and output configuration do not affect simulated work.
 - A handler failure stops the run and preserves enough context for reproduction.
+
+The extraction kept the heap-based discrete-event loop and the random draw
+order, so the bundled scenarios produce the same summaries as before it.
+That is a sanity check, not a compatibility promise. Measure event throughput,
+queue size, invalid-event share, and memory before changing the data structure.

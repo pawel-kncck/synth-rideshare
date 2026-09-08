@@ -16,7 +16,7 @@ SESSIONS_PER_RIDER = 7
 
 
 def build_scenario(seed=0, rider_count=30_000, drivers_per_shift=185):
-    """Defaults yield 94,773 completions and 72.12% utilization over 168 hours.
+    """Defaults yield 94,766 completions and 72.11% utilization over 168 hours.
 
     Calibrated at seed 0 with the current simulator. Custom parameters or seeds
     may change the results; all decisions and ride outcomes remain autonomous.

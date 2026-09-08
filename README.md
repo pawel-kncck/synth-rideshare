@@ -42,7 +42,8 @@ are deliberately simple synthetic assumptions, not estimates of a real market.
 
 | Path | Contents |
 | --- | --- |
-| `main.py` | The whole simulator: actors, sessions, orders, offers, scheduler. |
+| `event_engine.py` | Generic discrete-event scheduler: clock, ordered queue, handler registry, cancellation, budgets, snapshots. No ride-hailing code. |
+| `main.py` | The ride-hailing domain: actors, sessions, orders, offers, and the event handlers that drive them. |
 | `behavior.py` | Price and pickup-ETA decision probabilities and parameter validation. |
 | `demand.py` | Configurable weekly peak windows and seeded arrival sampling. |
 | `metrics.py` | Exact time-interval aggregation of searches, driver time, and completions. |
@@ -98,7 +99,7 @@ uses `run(start=0, end=169)` (end hours may exceed 24 for multi-day runs).
 
 The **100k-rides week** scenario targets **90,000–110,000 completed rides** and
 **70–75% weekly driver utilization**. With its defaults and seed `0`, the current
-simulator produces **94,773 completed rides** and **72.12% utilization**:
+simulator produces **94,766 completed rides** and **72.11% utilization**:
 
 - 30,000 riders make seven sessions each: 210,000 sessions sampled across the
   week using the same commute and nightlife peaks. Sessions are assigned in
@@ -178,6 +179,26 @@ remains at its end time. Pending events and active sessions or orders are
 left in place, so a later run can continue them. `sim.advance_to(t)` jumps
 straight to a simulated time without delay; called outside `run()`, it does
 not create a log or print a summary.
+
+## Event engine
+
+The clock and the event queue live in `event_engine.Scheduler`, a generic
+discrete-event scheduler with no knowledge of riders or drivers. The
+simulation builds a `HandlerRegistry` with one handler per event kind
+(`driver_session.start`, `driver_session.end_shift`, `rider_session.start`,
+`rider_session.decide`, `offer.expire`, `offer.decide`, `ride.advance`) and
+schedules structured records whose payloads name entities by id plus a
+session or offer identity. Handlers look those up and return quietly when
+the thing an event was about has already ended, so a stale timer can never
+revive an order. Resolved offers also cancel their remaining timers.
+
+`sim.scheduler` exposes the engine: `now`, `pending()`, `pending_count`,
+`processed_count`, `next_time()`, `snapshot()`, and the execution budget
+(`max_events_per_time`, 100,000 by default). A handler that raises stops the
+run with `HandlerFailure`, which names the event and chains the original
+exception; `config.json` then records the failed event and the events
+processed just before it. See `plans/architecture/event-engine.md` for the
+contract and `event_engine.py` for the API.
 
 ## Rider and driver decisions
 
@@ -316,6 +337,6 @@ not change availability, scheduling, behavior, or random-number generation.
 Failed or interrupted runs retain their log and configuration with a failed
 status, without printing a success summary or producing a completion report.
 
-Run the tests with `.venv/bin/python -m unittest discover -s tests -v`.
-Run the dashboard selection, navigation, aggregation, and CSV checks with
-`node --test tests/test_dashboard.js` (Node.js 18 or newer).
+There is no unit test suite. At this stage every change may be a refactor,
+and tests would freeze ad-hoc decisions into requirements. Check a change by
+running the scenarios and reading the summaries and reports they produce.
