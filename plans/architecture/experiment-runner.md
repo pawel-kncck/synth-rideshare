@@ -1,7 +1,8 @@
 # Experiment runner
 
 Status: proposed design, not implemented. This document defines the comparison
-and execution layer of the [phase 3 roadmap](../phase-3-multi-platform-marketplace.md).
+and execution layer of the [phase 4 roadmap](../phase-4-experiment-runner.md).
+Implementation follows phase 3 scenario definitions and extensive scenario testing.
 
 The runner evaluates a baseline and scenario variants under declared controls.
 Its output is reproducible evidence about model behavior, including uncertainty

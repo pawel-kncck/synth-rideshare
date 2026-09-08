@@ -2,8 +2,10 @@
 
 Status: event engine, marketplace engine, marketplace policies and behavior
 policies are implemented. `main.py` assembles a multi-platform market through
-`policy_runtime.py`. General scenario definitions and the multi-replication
-experiment runner remain roadmap work.
+`policy_runtime.py`. [Scenario definition](architecture/scenario-definition.md)
+is the only remaining implementation step. After it, the focus is extensive
+scenario testing. The multi-replication experiment runner and comparison work
+are deferred to [phase 4](phase-4-experiment-runner.md).
 
 The simulator's purpose is to compare experiments. Scenarios should require
 little configuration, inherit versioned defaults, and replace models without
@@ -28,13 +30,13 @@ and cross-platform queued orders are requirements of this phase.
 | [Marketplace policy](architecture/marketplace-policy.md) | Per-platform matching, dispatch, pricing, distance/ETA estimates, incentives, expiry, and cancellation, including segment conditions. |
 | [Behavior policy](architecture/behavior-policy.md) | Participant decisions, private memory, app use, acceptance, patience, adoption, and learning. |
 | [Scenario definition](architecture/scenario-definition.md) | Minimal authoring, versioned presets, typed overrides, interventions, validation, and compilation to an execution plan. |
-| [Experiment runner](architecture/experiment-runner.md) | Variants, replications, controlled inputs, reproducibility, measurements, comparison, and performance. |
 
 These are responsibility boundaries, not independent simulation clocks. The
 marketplace engine supplies domain handlers to the event engine and validates
 policy commands. Platform policies receive local views; participant policies
-receive personal views. Compilation prepares an immutable plan, and the runner
-creates fresh mutable state per replication. Reporting cannot affect decisions.
+receive personal views. Compilation prepares an immutable plan, and single-scenario
+execution creates fresh mutable state. The [phase 4 experiment runner](architecture/experiment-runner.md)
+will reuse these contracts per replication. Reporting cannot affect decisions.
 
 The layer documents own detailed contracts; this roadmap owns implementation
 order and release scope. Change both when a shared contract changes.
@@ -161,7 +163,7 @@ those mechanisms independently. Use observed experience, priors for unused apps,
 bounded learning, and preference hysteresis. Updates never interrupt occupied
 rides, erase queued commitments, or rewrite monetary terms.
 
-## Scenario compiler and experiment controls
+## Scenario compiler
 
 New Python scenario builders produce typed definitions rather than mutating a
 live simulation. A named, versioned preset supplies complete synthetic defaults.
@@ -171,17 +173,20 @@ Unknown keys, unused parameters, and incompatible policies fail before execution
 Compile definitions into prepared plans: resolve policy versions and references,
 check interfaces and observation permissions, normalize units, bind functions,
 and prepare lookups. Instantiate reproducible populations and external inputs
-per replication. Dynamic legality still needs runtime checks. Do not precompute
+per scenario run. Dynamic legality still needs runtime checks. Do not precompute
 market-dependent futures or promise native speedups for arbitrary Python hooks.
 
-Compare a baseline and explicit variants using a seed set and shared initial
-people/schedules where those inputs are controlled. Use stable intent/person
-and decision-purpose random identities, not global order counters or Python's
-process-randomized hash. Record model, preset, policy, compiler, metric, and
-environment versions. Define warm-up, measurement, drain, and unfinished-outcome
-treatment before comparing results.
+Use stable intent/person and decision-purpose random identities, not global
+order counters or Python's process-randomized hash. Record model, preset, policy,
+compiler, metric, and environment versions. Paired variants, replication seed
+sets, and comparison windows belong to [phase 4](phase-4-experiment-runner.md).
 
 ## Metrics and reports
+
+The following contracts guide scenario validation using current reports and
+exported records. New platform/time comparison panels, replicate uncertainty,
+and performance benchmarks belong to phase 4; they are not additional phase 3
+implementation steps.
 
 Replace single-decision-per-session assumptions before rider retries. Emit
 exactly-once trip conversion and terminal outcomes alongside repeated quotes.
@@ -209,12 +214,17 @@ randomness or supply hidden feedback to policies.
 | Milestone | Deliverable and acceptance gate |
 | --- | --- |
 | 0. Refactor and characterize | Done: scheduling (`event_engine.py`) and domain transitions (`marketplace_engine.py`) are separate; `main.py` now holds population and run/report orchestration; the policy modules own platform and participant decisions. Legacy single-platform results were a sanity check, not a compatibility requirement. |
-| 1. Definition and experiment foundation | Versioned presets, resolver/compiler, immutable plans, fresh run state, and paired variants. Reproduce a saved small experiment with all defaults explicit. |
-| 2. Shared market and platform views | Done in the engine: cars, trajectories, access, and scoped views/notifications. Same location at the same time; no competitor order visibility. |
-| 3. Offers and queued commitments | Done in the engine: competing offers, atomic two-order capacity, same/cross-platform queues, cancellation, and deferred offline; the ETA fixture and third-order races are checked. Independent local estimators and pickup ETA histories are implemented. |
-| 4. Economics and rider funnel | Done: committed minor-unit fares/payouts, independent tariffs and incentives, conserving settlements, bounded app search, cancellation and rider retries. |
-| 5. Participation and evolution | Implemented initial policies: no-offer timers, app retention, second-order willingness, exposure-aware learning, adoption, and interventions. Preserve commitments during updates. |
-| 6. Comparison and scale | Platform/time reports, replicate uncertainty, continuation, and small/weekly/multiweek measurements. Pass all cross-layer gates below. |
+| 1. Shared market and platform views | Done in the engine: cars, trajectories, access, and scoped views/notifications. Same location at the same time; no competitor order visibility. |
+| 2. Offers and queued commitments | Done in the engine: competing offers, atomic two-order capacity, same/cross-platform queues, cancellation, and deferred offline; the ETA fixture and third-order races are checked. Independent local estimators and pickup ETA histories are implemented. |
+| 3. Economics and rider funnel | Done: committed minor-unit fares/payouts, independent tariffs and incentives, conserving settlements, bounded app search, cancellation and rider retries. |
+| 4. Participation and evolution | Implemented initial policies: no-offer timers, app retention, second-order willingness, exposure-aware learning, adoption, and interventions. Preserve commitments during updates. |
+| 5. Scenario definition — remaining | Implement [scenario definition](architecture/scenario-definition.md): versioned presets, resolver/compiler, immutable plans, and fresh single-run state. Reproduce a saved small scenario with all defaults explicit through the existing orchestration. |
+
+After scenario definition, conduct extensive scenario testing against the
+cross-layer gates below. Use the findings to refine scenarios and fix behavior
+before starting [phase 4](phase-4-experiment-runner.md). Paired variants,
+multi-replication execution, comparison reports, and scale measurements move
+to that phase.
 
 Scheduling lives in `event_engine.py` and domain transitions in
 `marketplace_engine.py`; `Simulation.run()` in `main.py` remains the

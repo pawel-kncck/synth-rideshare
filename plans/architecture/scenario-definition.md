@@ -2,7 +2,14 @@
 
 Status: proposed design, not implemented. Preset names and API examples below
 illustrate authoring contracts for the
-[phase 3 roadmap](../phase-3-multi-platform-marketplace.md).
+[phase 3 roadmap](../phase-3-multi-platform-marketplace.md). This is phase 3's
+final implementation step, followed by extensive scenario testing before the
+[phase 4 experiment runner](../phase-4-experiment-runner.md).
+
+Phase 3 must support compiling a definition and executing a single seeded scenario
+through the existing `Simulation` orchestration. It must not depend on the phase 4
+batch runner, paired variants, or comparison reports. Per-replication contracts
+below define the handoff to that future runner.
 
 A scenario describes a world and the models acting in it. It should be short
 when an experiment changes little, complete after resolution, and reproducible
@@ -163,11 +170,13 @@ simulation before/after every event. Observation hooks cannot mutate the world.
 Compilation rejects wrong types, unknown references, invalid probabilities,
 incompatible policies, unsupported observation access, and statically invalid
 limits. Runtime validates finite outputs, valid identities, command permissions,
-offer freshness, available capacity, and legal transitions. Contract tests and
-experiments assess behavioral logic, information leakage, calibration, and bias.
+offer freshness, available capacity, and legal transitions. Scenario runs and
+throwaway scripts assess behavioral logic, information leakage, calibration,
+and bias.
 
 Arbitrary Python cannot generally be proven pure, terminating, or correct by
-this compiler. It remains trusted extension code with runtime checks and tests.
+this compiler. It remains trusted extension code with runtime checks and
+scenario validation.
 A restricted formula language may later allow stronger inspection/optimization
 for selected policy families. Introduce it after concrete experimental needs,
 not as a requirement to compile every user-written Python function.

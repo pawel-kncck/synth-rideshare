@@ -13,11 +13,11 @@ Python 3.9 or later:
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python scenarios/scenario_500_riders.py
-.venv/bin/python -m unittest discover -s tests -v
 ```
 
 The scenario scripts write an offline HTML report and machine-readable records
 under a unique directory in `logs/`. Use `time_scale=False` to run without sleeping.
+Validation uses scenario runs and throwaway scripts; there is no unit test suite.
 
 ```python
 from main import Simulation
@@ -62,7 +62,6 @@ Commercial configuration is documented in
 | `demand.py` | Exogenous weekly demand sampling, independent of policies. |
 | `metrics.py`, `reporting.py` | Cohort metrics and report exports. |
 | `report_template.html`, `report_dashboard.js` | Offline dashboard and interactive time filtering. |
-| `tests/test_policies.py` | Policy contracts, lifecycle boundaries and deterministic continuation. |
 
 The engine checks legality again when proposals execute. Each driver can hold at
 most two unfinished accepted orders and physically serves only one at a time.
@@ -142,5 +141,7 @@ analysis, policy diagnostics, ETA histories and opportunity observations are
 available in the exported event records; new experiment-comparison panels are
 part of the experiment-runner roadmap.
 
-See [the phase 3 roadmap](plans/phase-3-multi-platform-marketplace.md) for the
-remaining scenario-definition and experiment-runner work.
+The final implementation step in [phase 3](plans/phase-3-multi-platform-marketplace.md)
+is [scenario definition](plans/architecture/scenario-definition.md), followed by
+extensive scenario testing. The experiment runner and comparison work belong to
+[phase 4](plans/phase-4-experiment-runner.md).

@@ -165,8 +165,8 @@ typed proposals, hooks and JSON memory fields/version. `Simulation.snapshot()`
 and `Simulation.restore()` preserve profiles, preferences, private memories,
 exposure, pending decisions, interventions and random identities. A general
 custom-policy registry and scenario compiler remain separate roadmap work;
-initial restore binds the shipped implementations. Run the acceptance suite with
-`python -m unittest discover -s tests -v`.
+initial restore binds the shipped implementations. Validate the behavior contracts
+with scenario runs and throwaway scripts; there is no unit test suite.
 
 ## Decision contract and information
 
