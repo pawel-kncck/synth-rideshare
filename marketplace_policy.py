@@ -8,7 +8,7 @@ import math
 from dataclasses import dataclass, field, fields
 from decimal import Decimal, ROUND_HALF_UP
 
-from policy_contracts import (Cancel, Declaration, Decision, Stop, Wait,
+from policy_contracts import (Cancel, Declaration, Decision, Stop, Transfer, Wait,
                               finite_number, positive_int, plain, freeze)
 
 
@@ -80,6 +80,7 @@ class MarketplaceParameters:
     quote_seconds: float = 30
     rider_cancellation_fee_minor: int = 0
     driver_cancellation_compensation_minor: int = 0
+    driver_cancellation_penalty_minor: int = 0
 
     def __post_init__(self):
         for f in fields(self):
@@ -201,7 +202,7 @@ class EtaProposal:
 class MarketplacePolicy:
     declaration = Declaration('marketplace', '1', PlatformPolicy,
         ('now', 'platform_id', 'request', 'order', 'drivers', 'own_orders', 'own_offers', 'visible'),
-        (QuoteProposal, OfferProposal, EtaProposal, Wait, Stop, Cancel), 1,
+        (QuoteProposal, OfferProposal, EtaProposal, Wait, Stop, Cancel, Transfer), 1,
         ('quote', 'dispatch', 'revise', 'cancel', 'controller'), (('completed', 'object'), ('last_controller_at', 'number')))
 
     def __init__(self, config):
@@ -296,7 +297,8 @@ class MarketplacePolicy:
         if context.order.state not in ('canceled', 'completed') and 'boarded' not in context.order.timeline:
             action = Cancel(context.order.id, context.party, context.reason,
                             params.rider_cancellation_fee_minor if context.party == 'rider' else 0,
-                            params.driver_cancellation_compensation_minor if context.party == 'rider' else 0)
+                            params.driver_cancellation_compensation_minor if context.party == 'rider' else 0,
+                            params.driver_cancellation_penalty_minor if context.party == 'driver' else 0)
         return Decision(action, plain(memory), 'Cancellation terms evaluated before boarding')
 
     def controller(self, context, memory, random):

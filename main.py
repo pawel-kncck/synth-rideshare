@@ -49,7 +49,8 @@ class Simulation:
         registry = HandlerRegistry()
         self.engine = MarketplaceEngine(self.world, registry)
         for platform_id, platform in plan.platforms.items():
-            self.engine.add_platform(platform_id, launched=platform.launched)
+            self.engine.add_platform(platform_id, launched=platform.launched,
+                                     starting_cash_minor=platform.starting_cash_minor)
         profiles = {}
         for person in inputs.people:
             profile = load_profile(person['profile'])

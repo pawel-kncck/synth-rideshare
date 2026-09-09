@@ -35,6 +35,9 @@ SNAPSHOT_SCHEMA_VERSION = 2
 ROLES = ("rider", "driver")
 CANCELLATION_PARTIES = ("rider", "driver", "platform")
 OFFER_DISPOSITIONS = ("accepted", "rejected", "expired", "canceled", "acceptance_failed")
+TRANSFER_REASONS = ("driver_penalty", "guarantee_topup", "lease", "dividend", "operating_cost", "grant")
+TRANSFER_COUNTERPARTIES = ("platform", "external")
+ACCOUNT_ROLES = ("platform", "driver", "rider")
 
 
 class CommandRejected(ValueError):
@@ -58,10 +61,14 @@ def point(value, name="point"):
 
 
 def minor_units(value, name, minimum=0):
-    """An integer amount of minor currency units (cents), never a float."""
+    """An integer amount of minor currency units (cents), never a float.
+
+    minimum=None accepts any sign (a Transfer's signed amount_minor); every
+    existing caller passes the default 0, so their behavior is unchanged.
+    """
     if isinstance(value, bool) or not isinstance(value, int):
         raise CommandRejected(f"{name} must be an integer number of minor currency units")
-    if value < minimum:
+    if minimum is not None and value < minimum:
         raise CommandRejected(f"{name} must be at least {minimum}")
     return value
 
@@ -180,6 +187,7 @@ class Platform:
     launched: bool = True
     open_driver_ids: set = field(default_factory=set)
     open_rider_ids: set = field(default_factory=set)
+    starting_cash_minor: Optional[int] = None  # seeds the platform's cash account; None = not tracked
 
 
 @dataclass
@@ -377,6 +385,54 @@ class Settlement:
     rider_payment_minor: int
     driver_payout_minor: int
     platform_contribution_minor: int  # the residual, so conservation is exact
+    bonus_minor: int = 0  # the accepted offer's bonus on completed_ride; 0 on cancellation_fee
+
+
+@dataclass(frozen=True)
+class Transfer:
+    """Money moved outside a ride. amount_minor is signed: positive credits the person.
+
+    A platform counterparty debits that platform's account by the same
+    amount (party deltas sum to zero); an external counterparty (lease,
+    operating cost) has no platform side, so the person's delta alone IS the
+    declared external amount. reason is one of TRANSFER_REASONS; role/person_id
+    name the credited or debited rider or driver.
+    """
+    id: int
+    at: float
+    reason: str
+    platform_id: Optional[str]     # None for an external counterparty
+    role: str                      # rider or driver
+    person_id: Any
+    amount_minor: int              # signed, never zero
+    order_id: Optional[int] = None
+    program_id: Optional[str] = None
+    counterparty: str = "platform"  # platform or external
+
+
+@dataclass
+class Account:
+    """A money balance the engine derives from settlements and transfers.
+
+    Keyed by (role, id) in MarketplaceEngine.accounts -- unrelated to a
+    person's platform *app* accounts (Driver.accounts/Rider.accounts,
+    activate_account), which are membership, not money. opening_minor is
+    None for a platform with no starting_cash_minor: settlement_minor and
+    transfer_minor still accumulate (so a ledger can report contribution and
+    transfers), but there is no absolute cash figure, so balance_minor is
+    None too. restore() always rebuilds this from the tables (_rebuild_accounts),
+    never from a snapshot's stored totals, so a restored run's own balances
+    are proof of conservation, not an assumption.
+    """
+    role: str            # platform, driver or rider
+    id: Any
+    opening_minor: Optional[int] = 0
+    settlement_minor: int = 0
+    transfer_minor: int = 0
+
+    @property
+    def balance_minor(self):
+        return None if self.opening_minor is None else self.opening_minor + self.settlement_minor + self.transfer_minor
 
 
 @dataclass(frozen=True)
@@ -615,10 +671,12 @@ class MarketplaceEngine:
         self.offers = {}
         self.services = {}
         self.settlements = {}
+        self.transfers = {}
         self._sequences = {
             name: itertools.count(1)
-            for name in ("shift", "intent", "quote", "order", "offer", "service", "settlement")
+            for name in ("shift", "intent", "quote", "order", "offer", "service", "settlement", "transfer")
         }
+        self.accounts = {}  # (role, id) -> Account; derived, never decoded from a snapshot (see restore())
         self._pending_by_order = {}  # order id -> set of pending offer ids
         self._pending_by_driver = {}  # driver id -> set of pending offer ids
         self._listeners = []
@@ -672,10 +730,14 @@ class MarketplaceEngine:
     # Population and access
     # ----------------------------------------------------------------------
 
-    def add_platform(self, platform_id, name=None, launched=True):
+    def add_platform(self, platform_id, name=None, launched=True, *, starting_cash_minor=None):
         if platform_id in self.platforms:
             raise CommandRejected(f"Platform {platform_id!r} already exists")
-        self.platforms[platform_id] = Platform(platform_id, name or platform_id, launched)
+        if starting_cash_minor is not None:
+            minor_units(starting_cash_minor, "starting_cash_minor")
+        self.platforms[platform_id] = Platform(platform_id, name or platform_id, launched,
+                                                starting_cash_minor=starting_cash_minor)
+        self._open_account("platform", platform_id, starting_cash_minor)
         return self.platforms[platform_id]
 
     def launch_platform(self, platform_id):
@@ -699,6 +761,7 @@ class MarketplaceEngine:
             raise CommandRejected('Accounts require installed apps')
         car.driver_id = driver_id
         self.drivers[driver_id] = driver
+        self._open_account("driver", driver_id, 0)
         return driver
 
     def add_rider(self, rider_id, apps, location=None, *, accounts=None):
@@ -710,6 +773,7 @@ class MarketplaceEngine:
         if not rider.accounts <= rider.apps:
             raise CommandRejected('Accounts require installed apps')
         self.riders[rider_id] = rider
+        self._open_account("rider", rider_id, 0)
         return rider
 
     def install_app(self, role, person_id, platform_id):
@@ -1170,7 +1234,8 @@ class MarketplaceEngine:
         intent = self.intents[order.intent_id]
         intent.live_order_id = None
         settlement = self._settle(order, "completed_ride", order.fare.rider_payment_minor,
-                                  order.assignment.payout.driver_payout_minor)
+                                  order.assignment.payout.driver_payout_minor,
+                                  order.assignment.payout.bonus_minor)
         self._notify("platform", order.platform_id, "order_completed", order_id=order.id,
                      settlement_id=settlement.id)
         self._notify("rider", order.rider_id, "order_completed", order_id=order.id,
@@ -1203,7 +1268,55 @@ class MarketplaceEngine:
     # Cancellation and money
     # ----------------------------------------------------------------------
 
-    def cancel_order(self, order_id, by, reason, *, rider_fee_minor=0, driver_compensation_minor=0):
+    def account(self, role, person_id):
+        """The money account for one platform, driver or rider. Read-only for callers."""
+        return self._lookup(self.accounts, (role, person_id), "Account")
+
+    def _open_account(self, role, person_id, opening_minor=0):
+        self.accounts[(role, person_id)] = Account(role, person_id, opening_minor)
+
+    def _post(self, role, person_id, field, amount_minor):
+        account = self.accounts[(role, person_id)]
+        setattr(account, field, getattr(account, field) + amount_minor)
+
+    def _post_settlement(self, settlement):
+        self._post("platform", settlement.platform_id, "settlement_minor", settlement.platform_contribution_minor)
+        self._post("rider", settlement.rider_id, "settlement_minor", -settlement.rider_payment_minor)
+        if settlement.driver_id is not None:
+            self._post("driver", settlement.driver_id, "settlement_minor", settlement.driver_payout_minor)
+        # else: an assignment-less driver payout has nowhere to post (see metrics.ledger's
+        # unattributed_driver_payout_minor) -- reachable today via a rider cancelling an
+        # unassigned order under driver_cancellation_compensation_minor > 0; rejecting it here
+        # would change legality for scenarios that already authored that parameter.
+
+    def _post_transfer_record(self, transfer):
+        self._post(transfer.role, transfer.person_id, "transfer_minor", transfer.amount_minor)
+        if transfer.counterparty == "platform":
+            self._post("platform", transfer.platform_id, "transfer_minor", -transfer.amount_minor)
+
+    def _rebuild_accounts(self):
+        """Derive every balance from settlements and transfers, never from stored totals.
+
+        Called only by restore(); a continuous run's accounts are already
+        correct from posting as commands executed. Comparing a restored
+        engine's snapshot() (which re-emits accounts from this) against the
+        continuous run's own is therefore a real conservation check, not a
+        tautology -- see plans/architecture/marketplace-engine.md.
+        """
+        self.accounts = {}
+        for platform in self.platforms.values():
+            self._open_account("platform", platform.id, platform.starting_cash_minor)
+        for driver_id in self.drivers:
+            self._open_account("driver", driver_id, 0)
+        for rider_id in self.riders:
+            self._open_account("rider", rider_id, 0)
+        for settlement in sorted(self.settlements.values(), key=lambda s: s.id):
+            self._post_settlement(settlement)
+        for transfer in sorted(self.transfers.values(), key=lambda t: t.id):
+            self._post_transfer_record(transfer)
+
+    def cancel_order(self, order_id, by, reason, *, rider_fee_minor=0, driver_compensation_minor=0,
+                     driver_penalty_minor=0):
         """End an order before boarding. The platform decides permission and fees;
         the engine performs the physical ending and frees only this commitment."""
         order = self._order(order_id)
@@ -1211,6 +1324,9 @@ class MarketplaceEngine:
             raise CommandRejected(f"Cancellation party must be one of {CANCELLATION_PARTIES}")
         minor_units(rider_fee_minor, "rider_fee_minor")
         minor_units(driver_compensation_minor, "driver_compensation_minor")
+        minor_units(driver_penalty_minor, "driver_penalty_minor")
+        if driver_penalty_minor and by != "driver":
+            raise CommandRejected("A cancellation penalty applies only to a driver cancellation")
         if order.terminal:
             raise CommandRejected(f"Order {order_id} is already {order.state}")
         service = self.services.get(order.service_id)
@@ -1242,18 +1358,70 @@ class MarketplaceEngine:
             if driver is not None:
                 self._notify("driver", driver.id, "order_canceled", order_id=order.id,
                              platform_id=order.platform_id, by=by, reason=reason)
+                if driver_penalty_minor:
+                    self.post_transfer("driver_penalty", "driver", driver.id, -driver_penalty_minor,
+                                       platform_id=order.platform_id, order_id=order.id)
                 self._release_commitment(driver, order, "canceled")
         return order
 
-    def _settle(self, order, reason, rider_payment_minor, driver_payout_minor):
+    def _settle(self, order, reason, rider_payment_minor, driver_payout_minor, bonus_minor=0):
+        minor_units(bonus_minor, "bonus_minor")
+        if bonus_minor > driver_payout_minor:
+            raise CommandRejected("bonus_minor cannot exceed the driver payout")
         settlement = Settlement(
             self._next_id("settlement"), self.now, order.id, order.platform_id, order.rider_id,
             order.assignment.driver_id if order.assignment else None, reason,
             rider_payment_minor, driver_payout_minor, rider_payment_minor - driver_payout_minor,
+            bonus_minor,
         )
         self.settlements[settlement.id] = settlement
         order.settlement_ids.append(settlement.id)
+        self._post_settlement(settlement)
         return settlement
+
+    def post_transfer(self, reason, role, person_id, amount_minor, *, platform_id=None,
+                      counterparty="platform", order_id=None, program_id=None):
+        """Move money outside a ride. amount_minor is signed: positive credits the person.
+
+        A platform counterparty debits that platform's account by the same amount, so the
+        party deltas sum to zero; an external counterparty has no platform side and the
+        person's delta IS the declared external amount. Emits no account-balance
+        notification -- only a transfer_posted to the credited person and, for a platform
+        counterparty, to the funding platform (see "Money and observation boundaries").
+        """
+        if reason not in TRANSFER_REASONS:
+            raise CommandRejected(f"Transfer reason must be one of {TRANSFER_REASONS}")
+        if role not in ROLES:
+            raise CommandRejected(f"Transfer role must be one of {ROLES}")
+        self._person(role, person_id)  # existence, CommandRejected on miss
+        minor_units(amount_minor, "amount_minor", minimum=None)
+        if amount_minor == 0:
+            raise CommandRejected("amount_minor must be a nonzero number of minor currency units")
+        if counterparty not in TRANSFER_COUNTERPARTIES:
+            raise CommandRejected(f"Transfer counterparty must be one of {TRANSFER_COUNTERPARTIES}")
+        if counterparty == "platform":
+            self._platform(platform_id)  # rejects None and unknown ids
+        elif platform_id is not None:
+            raise CommandRejected("An external transfer has no platform side")
+        if order_id is not None:
+            order = self._order(order_id)
+            if platform_id is not None and order.platform_id != platform_id:
+                raise CommandRejected(f"Order {order_id} does not belong to platform {platform_id!r}")
+        if program_id is not None and (not isinstance(program_id, str) or not program_id):
+            raise CommandRejected("program_id must be a nonempty string")
+        with self._transition():
+            transfer = Transfer(self._next_id("transfer"), self.now, reason, platform_id, role, person_id,
+                                amount_minor, order_id, program_id, counterparty)
+            self.transfers[transfer.id] = transfer
+            self._post_transfer_record(transfer)
+            self._notify(role, person_id, "transfer_posted", transfer_id=transfer.id, reason=reason,
+                         amount_minor=amount_minor, platform_id=platform_id, order_id=order_id,
+                         program_id=program_id, counterparty=counterparty)
+            if counterparty == "platform":
+                self._notify("platform", platform_id, "transfer_posted", transfer_id=transfer.id, reason=reason,
+                             role=role, person_id=person_id, amount_minor=amount_minor, order_id=order_id,
+                             program_id=program_id)
+        return transfer
 
     # ----------------------------------------------------------------------
     # Serialization. A market snapshot plus the scheduler's snapshot, taken
@@ -1270,6 +1438,16 @@ class MarketplaceEngine:
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
             "world": asdict(self.world),
             "sequences": {name: next(copy.copy(counter)) for name, counter in self._sequences.items()},
+            # Derived, not authoritative: restore() ignores this list and calls _rebuild_accounts()
+            # instead, so a restored run's own balances are the conservation proof, not an assumption.
+            # Sorted so insertion order (which a snapshot/restore cycle can reorder) never changes the
+            # emitted bytes -- otherwise a continuous run and a restored one could disagree cosmetically.
+            "accounts": [
+                {"role": a.role, "id": a.id, "opening_minor": a.opening_minor,
+                 "settlement_minor": a.settlement_minor, "transfer_minor": a.transfer_minor,
+                 "balance_minor": a.balance_minor}
+                for a in sorted(self.accounts.values(), key=lambda a: (a.role, type(a.id).__name__, str(a.id)))
+            ],
             **tables,
         }
 
@@ -1281,7 +1459,12 @@ class MarketplaceEngine:
         engine = cls(World(**snapshot["world"]), registry)
         for name, factory in _TABLES.items():
             table = getattr(engine, name)
-            for item in snapshot[name]:
+            # .get(name, []), not snapshot[name]: _TABLES gained "transfers" in phase 3 while
+            # SNAPSHOT_SCHEMA_VERSION stayed 2 (additive), so a pre-phase-3 snapshot has no
+            # "transfers" key at all -- same tolerance metrics.py's _tables() and _platform()
+            # below already extend to individual fields. An absent table restores empty and
+            # _rebuild_accounts() then derives correct zero-transfer balances from it.
+            for item in snapshot.get(name, []):
                 record = factory(item)
                 table[record.id] = record
         for name, value in snapshot["sequences"].items():
@@ -1290,6 +1473,7 @@ class MarketplaceEngine:
             if offer.state == "pending":
                 engine._pending_by_order.setdefault(offer.order_id, set()).add(offer.id)
                 engine._pending_by_driver.setdefault(offer.driver_id, set()).add(offer.id)
+        engine._rebuild_accounts()  # derived from settlements/transfers, never from snapshot["accounts"]
         return engine
 
     # ----------------------------------------------------------------------
@@ -1368,8 +1552,10 @@ def _motion(value):
 
 
 def _platform(item):
+    # .get, not [...]: a snapshot taken before starting_cash_minor existed still restores,
+    # with the platform's cash untracked (None), exactly the TripIntent.source_id precedent.
     return Platform(item["id"], item["name"], item["launched"],
-                    set(item["open_driver_ids"]), set(item["open_rider_ids"]))
+                    set(item["open_driver_ids"]), set(item["open_rider_ids"]), item.get("starting_cash_minor"))
 
 
 def _car(item):
@@ -1434,8 +1620,12 @@ def _settlement(item):
     return Settlement(**item)
 
 
+def _transfer(item):
+    return Transfer(**item)
+
+
 _TABLES = {
     "platforms": _platform, "cars": _car, "drivers": _driver, "riders": _rider, "shifts": _shift,
     "intents": _intent, "quotes": _quote, "orders": _order, "offers": _offer, "services": _service,
-    "settlements": _settlement,
+    "settlements": _settlement, "transfers": _transfer,
 }

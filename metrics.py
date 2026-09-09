@@ -247,8 +247,13 @@ def _reject_constant(value):
 
 
 def _tables(snapshot):
-    return {name: {record["id"]: record for record in snapshot["engine"][name]}
-            for name in ("shifts", "intents", "quotes", "orders", "offers", "services", "settlements")}
+    return {name: {record["id"]: record for record in snapshot["engine"].get(name, [])}
+            for name in ("shifts", "intents", "quotes", "orders", "offers", "services", "settlements", "transfers")}
+
+
+def _accounts(snapshot, role):
+    """{id: account} for one role from a boundary snapshot's engine.accounts (absent in pre-phase-3 logs)."""
+    return {a["id"]: a for a in snapshot["engine"].get("accounts", []) if a["role"] == role}
 
 
 def _new_terminal(before, after, state):
@@ -348,16 +353,29 @@ def _settlement_row(orders, settlements):
     fare and the accepted offer's frozen payout terms
     (marketplace_engine._drop_off calls _settle with order.fare.
     rider_payment_minor and order.assignment.payout.driver_payout_minor), so
-    only there do rider_gross_minor/rider_discount_minor and
-    driver_base_minor/driver_bonus_minor decompose those same frozen terms --
-    it is exactly what the settlement paid, not an estimate of it. Any other
-    reason (today: cancellation_fee) settles an amount the frozen terms do
-    not describe at all: a canceled order's fare was never charged and its
-    assignment's payout, if it has one, was never earned. That row instead
-    reports what actually moved: driver_base_minor is the settlement's own
-    driver_payout_minor (bonus 0 -- a cancellation has no bonus concept) and
+    only there does rider_gross_minor/rider_discount_minor decompose those
+    same frozen fare terms -- it is exactly what the rider paid, not an
+    estimate of it. Any other reason (today: cancellation_fee) settles an
+    amount the frozen fare does not describe at all: a canceled order's fare
+    was never charged. That row instead reports what actually moved:
     rider_gross_minor is the settlement's own rider_payment_minor (discount
     0), the same fallback an order with no assignment at all always used.
+
+    driver_base_minor/driver_bonus_minor (phase 3) split the settlement's OWN
+    driver_payout_minor using its own bonus_minor field, not a join against
+    the assignment: bonus = s.get("bonus_minor", <the accepted offer's
+    bonus_minor> if this is a completed_ride settlement with an assignment,
+    else 0). The fallback exists only for a settlement dict from a log
+    written before Settlement.bonus_minor existed (no such key at all); it
+    reproduces the exact same integer, because marketplace_engine._drop_off
+    has always settled a completed_ride with bonus_minor equal to
+    order.assignment.payout.bonus_minor, so the two sources agree bit for
+    bit -- this is a source change for the SAME numbers, not a new estimate.
+    driver_base_minor is then driver_payout_minor - bonus for every
+    settlement, completed_ride or not (a cancellation has no bonus concept:
+    bonus 0, so driver_base_minor is just driver_payout_minor there, as
+    before this field existed).
+
     rider_payment_minor, driver_payout_minor and platform_contribution_minor
     are always the settlement's own three fields (never re-derived), so
     residual_minor (rider_payment - driver_payout - platform_contribution) is
@@ -373,14 +391,15 @@ def _settlement_row(orders, settlements):
     for s in settlements:
         order = orders[s["order_id"]]
         assignment = order["assignment"]
-        if s["reason"] == "completed_ride" and assignment is not None:
+        completed_with_assignment = s["reason"] == "completed_ride" and assignment is not None
+        if completed_with_assignment:
             rider_gross += order["fare"]["gross_minor"]
             rider_discount += order["fare"]["discount_minor"]
-            driver_base += assignment["payout"]["payout_minor"]
-            driver_bonus += assignment["payout"]["bonus_minor"]
         else:
             rider_gross += s["rider_payment_minor"]
-            driver_base += s["driver_payout_minor"]
+        bonus = s.get("bonus_minor", assignment["payout"]["bonus_minor"] if completed_with_assignment else 0)
+        driver_bonus += bonus
+        driver_base += s["driver_payout_minor"] - bonus
         rider_payment += s["rider_payment_minor"]
         driver_payout += s["driver_payout_minor"]
         platform_contribution += s["platform_contribution_minor"]
@@ -390,28 +409,64 @@ def _settlement_row(orders, settlements):
             "residual_minor": rider_payment - driver_payout - platform_contribution}
 
 
-def _settlement_rows(orders, settlements):
-    """settlement_breakdown's shape (by_reason/totals/transfers) for one settlement list."""
+def _transfer_rows(transfers):
+    """count/by_reason/party_delta_minor for one transfer list -- the phase-3 half of _settlement_rows.
+
+    by_reason[r]["platform_delta_minor"] sums -amount_minor over that
+    reason's platform-counterparty transfers only (the debit posted to the
+    funding platform); an external transfer has no platform side and
+    contributes nothing to any platform_delta_minor. party_delta_minor sums
+    amount_minor over every EXTERNAL transfer in the list: a platform
+    counterparty's party deltas net to zero by construction (person
+    +amount, platform -amount), so only the external total survives the sum
+    -- 0 whenever the list holds no external transfer.
+    """
+    reasons = sorted({t["reason"] for t in transfers})
+    by_reason = {}
+    for reason in reasons:
+        rows = [t for t in transfers if t["reason"] == reason]
+        by_reason[reason] = {"count": len(rows), "amount_minor": sum(t["amount_minor"] for t in rows),
+                             "platform_delta_minor": -sum(t["amount_minor"] for t in rows
+                                                          if t["counterparty"] == "platform")}
+    return {"count": len(transfers), "by_reason": by_reason,
+            "party_delta_minor": sum(t["amount_minor"] for t in transfers if t["counterparty"] == "external")}
+
+
+def _settlement_rows(orders, settlements, transfers=()):
+    """settlement_breakdown's shape (by_reason/totals/transfers) for one settlement/transfer cohort.
+
+    transfers defaults to () so every pre-phase-3 caller (and any caller that
+    only has settlements to report) keeps the exact placeholder shape phase 1
+    published: count 0, by_reason {}, party_delta_minor 0.
+    """
     reasons = sorted({s["reason"] for s in settlements})
     by_reason = {reason: _settlement_row(orders, [s for s in settlements if s["reason"] == reason]) for reason in reasons}
     return {"by_reason": by_reason, "totals": _settlement_row(orders, settlements),
-            "transfers": {"count": 0, "by_reason": {}, "party_delta_minor": 0}}
+            "transfers": _transfer_rows(transfers)}
 
 
 def _new_settlements(before, after):
     return [s for identity, s in after["settlements"].items() if identity not in before["settlements"]]
 
 
-def settlement_breakdown(initial, final):
-    """Settlement money split into base/bonus/discount by reason, plus the phase-3 transfers shape.
+def _new_transfers(before, after):
+    return [t for identity, t in after["transfers"].items() if identity not in before["transfers"]]
 
-    Uses settlements new in this run (the same cohort as the global summary).
-    transfers is a placeholder: plans/scenario-readiness-plan.md section 4.A
-    (phase 3) adds the Transfer record and populates it; no Transfer exists
-    yet, so its counters stay at zero here regardless of the run.
+
+def settlement_breakdown(initial, final):
+    """Settlement money split into base/bonus/discount by reason, plus the phase-3 transfers section.
+
+    Uses settlements AND transfers new in this run (_new_settlements/
+    _new_transfers, the same "new in this run" cohort rule as everywhere
+    else). This is the global row: every Transfer with a platform
+    counterparty debits that platform, but an external transfer (lease,
+    operating cost) has none, so a per-platform sum of transfers
+    (money_by_platform) will not reproduce this row's transfers section
+    whenever an external transfer exists in the run -- documented there, not
+    a bug here (there is no platform to attribute an external transfer to).
     """
     before, after = _tables(initial), _tables(final)
-    return _settlement_rows(after["orders"], _new_settlements(before, after))
+    return _settlement_rows(after["orders"], _new_settlements(before, after), _new_transfers(before, after))
 
 
 def money_by_platform(initial, final):
@@ -422,13 +477,25 @@ def money_by_platform(initial, final):
     that platforms with no rides remain in every row. Summing any of the
     three settlement totals over every platform reproduces the same global
     sum computed directly from all new settlements (conservation() checks
-    this).
+    this: platform_money_matches_totals). Transfers bucket by their own
+    platform_id the same way, but an external transfer's platform_id is
+    always None, so it lands in no platform's bucket at all -- summing every
+    platform's transfers section here therefore does NOT reproduce
+    settlement_breakdown's global transfers section when the run has any
+    external transfer; that gap is the external total itself
+    (conservation()['transfer_party_delta_minor']), not an inconsistency to
+    fix by inventing a platform attribution.
     """
     before, after = _tables(initial), _tables(final)
     by_platform = {p["id"]: [] for p in final["engine"]["platforms"]}
+    transfers_by_platform = {p["id"]: [] for p in final["engine"]["platforms"]}
     for s in _new_settlements(before, after):
         by_platform.setdefault(s["platform_id"], []).append(s)
-    return {platform_id: _settlement_rows(after["orders"], rows) for platform_id, rows in by_platform.items()}
+    for t in _new_transfers(before, after):
+        if t["platform_id"] is not None:
+            transfers_by_platform.setdefault(t["platform_id"], []).append(t)
+    return {platform_id: _settlement_rows(after["orders"], rows, transfers_by_platform.get(platform_id, ()))
+            for platform_id, rows in by_platform.items()}
 
 
 def _blank_funnel_counts():
@@ -640,7 +707,7 @@ def _window_bounds(start, end, boundary_hours):
     return [start] + edges + [end]
 
 
-def _window_detail(orders, platforms, quotes, orders_list, offers, completed, canceled, settlements,
+def _window_detail(orders, platforms, quotes, orders_list, offers, completed, canceled, settlements, transfers,
                    left, right, *, inclusive_right):
     def _select(records, key):
         return [r for r in records if left <= key(r) <= right] if inclusive_right \
@@ -653,7 +720,12 @@ def _window_detail(orders, platforms, quotes, orders_list, offers, completed, ca
     by_platform = {pid: [] for pid in platforms}
     for s in _select(settlements, lambda s: s["at"]):
         by_platform.setdefault(s["platform_id"], []).append(s)
-    return {pid: {"money": _settlement_rows(orders, rows), "funnel": funnel[pid]} for pid, rows in by_platform.items()}
+    transfers_by_platform = {pid: [] for pid in platforms}
+    for t in _select(transfers, lambda t: t["at"]):
+        if t["platform_id"] is not None:
+            transfers_by_platform.setdefault(t["platform_id"], []).append(t)
+    return {pid: {"money": _settlement_rows(orders, rows, transfers_by_platform.get(pid, ())), "funnel": funnel[pid]}
+            for pid, rows in by_platform.items()}
 
 
 def window_rows(header, initial, final, boundary_hours):
@@ -665,15 +737,15 @@ def window_rows(header, initial, final, boundary_hours):
     aggregate_intervals. A boundary past the run's end clips to the end, so
     asking for a wider window than a short run safely reports an empty
     trailing window instead of failing. Each row's "platforms" holds that
-    window's own money (settlement_breakdown's shape) and funnel per
-    platform; settlements bucket by their own at, completions by
-    timeline.completed and cancellations by timeline.canceled (their own
-    event time), while quotes/orders/offers -- and offer dispositions --
-    bucket by their own creation time (see _funnel_rows). "cumulative" is
-    the same shape computed from the run's start through this window's
-    right edge, so the last window's cumulative equals the whole run's
-    totals (window boundaries are hours after start, see calculate_metrics
-    and the README).
+    window's own money (settlement_breakdown's shape, transfers included)
+    and funnel per platform; settlements and transfers bucket by their own
+    at, completions by timeline.completed and cancellations by
+    timeline.canceled (their own event time), while quotes/orders/offers --
+    and offer dispositions -- bucket by their own creation time (see
+    _funnel_rows). "cumulative" is the same shape computed from the run's
+    start through this window's right edge, so the last window's cumulative
+    equals the whole run's totals (window boundaries are hours after start,
+    see calculate_metrics and the README).
     """
     before, after = _tables(initial), _tables(final)
     start, end = initial["scheduler"]["clock_seconds"], final["scheduler"]["clock_seconds"]
@@ -685,6 +757,7 @@ def window_rows(header, initial, final, boundary_hours):
     completed = _new_terminal(before, after, "completed")
     canceled = _new_terminal(before, after, "canceled")
     settlements = _new_settlements(before, after)
+    transfers = _new_transfers(before, after)
     rows = []
     for index in range(len(bounds) - 1):
         left, right = bounds[index], bounds[index + 1]
@@ -695,9 +768,9 @@ def window_rows(header, initial, final, boundary_hours):
             "clock_start": clock_label(header["start_hour"] * 3600 + left),
             "clock_end": clock_label(header["start_hour"] * 3600 + right),
             "platforms": _window_detail(after["orders"], platforms, quotes, orders_list, offers, completed,
-                                        canceled, settlements, left, right, inclusive_right=last),
+                                        canceled, settlements, transfers, left, right, inclusive_right=last),
             "cumulative": _window_detail(after["orders"], platforms, quotes, orders_list, offers, completed,
-                                         canceled, settlements, start, right, inclusive_right=True),
+                                         canceled, settlements, transfers, start, right, inclusive_right=True),
         })
     return rows
 
@@ -773,6 +846,127 @@ def first_choice_periods(header, initial, final, period_days):
     return rows
 
 
+def _driver_ledger_row(driver_id, settlements, transfers, before_accounts, after_accounts):
+    before_account, after_account = before_accounts.get(driver_id), after_accounts.get(driver_id)
+    return {
+        "payout_minor": sum(s["driver_payout_minor"] for s in settlements),
+        "transfers_minor": sum(t["amount_minor"] for t in transfers),
+        "balance_start_minor": before_account["balance_minor"] if before_account else None,
+        "balance_end_minor": after_account["balance_minor"] if after_account else None,
+        "transfers_by_reason": {reason: {"count": row["count"], "amount_minor": row["amount_minor"]}
+                                for reason, row in _transfer_rows(transfers)["by_reason"].items()},
+    }
+
+
+def ledger_section(initial, final, *, per_driver=False):
+    """Cash-flow reconciliation from account balances plus the new-record cohorts (the ``--ledger`` section).
+
+    Each platform's cash_start_minor/cash_end_minor read that platform's OWN
+    account.balance_minor from the initial/final snapshot (None when
+    starting_cash_minor is None -- untracked, though its flows still post
+    and are reported); ride_contribution_minor sums platform_contribution_minor
+    over settlements new in this run, and transfers_minor sums the debit
+    (-amount_minor) of this run's new platform-counterparty transfers funded
+    by that platform. These are two INDEPENDENTLY derived numbers -- one
+    from the boundary balances, one from replaying new records -- so
+    cash_end_minor - cash_start_minor == net_minor
+    (ride_contribution_minor + transfers_minor) is a real offline
+    cross-check, the same conservation property marketplace_engine.restore's
+    _rebuild_accounts proves inside the engine, not a tautology.
+
+    The top-level "transfers" section is global (settlement_breakdown's
+    transfers shape plus an external_minor per reason): external_minor at
+    the top level and party_delta_minor are the same number by construction
+    (a platform-counterparty transfer's party deltas net to zero, so only
+    the external total survives either sum) -- both names are kept because
+    each reads naturally in a different sentence.
+
+    unattributed_driver_payout_minor names settlements whose
+    driver_payout_minor has no driver_id to post to at all (reachable today:
+    a rider cancels an unassigned order under
+    driver_cancellation_compensation_minor > 0). It is 0 in every run where
+    that combination never occurs, and is reported rather than silenced by
+    an engine-side rejection, which would change legality for scenarios that
+    already authored that parameter. drivers is filled only when per_driver
+    is requested (it is one row per driver, the "optional" half of --ledger).
+    """
+    before, after = _tables(initial), _tables(final)
+    new_settlements, new_transfers = _new_settlements(before, after), _new_transfers(before, after)
+    platform_accounts_before, platform_accounts_after = _accounts(initial, "platform"), _accounts(final, "platform")
+    platforms = {}
+    for p in final["engine"]["platforms"]:
+        pid = p["id"]
+        own_settlements = [s for s in new_settlements if s["platform_id"] == pid]
+        own_transfers = [t for t in new_transfers if t["platform_id"] == pid]  # always counterparty == platform
+        contribution = sum(s["platform_contribution_minor"] for s in own_settlements)
+        transfers_minor = -sum(t["amount_minor"] for t in own_transfers)
+        before_account, after_account = platform_accounts_before.get(pid), platform_accounts_after.get(pid)
+        platforms[pid] = {
+            "starting_cash_minor": p.get("starting_cash_minor"),  # .get: absent in a pre-phase-3 log
+            "cash_start_minor": before_account["balance_minor"] if before_account else None,
+            "cash_end_minor": after_account["balance_minor"] if after_account else None,
+            "ride_contribution_minor": contribution, "transfers_minor": transfers_minor,
+            "net_minor": contribution + transfers_minor,
+            "transfers_by_reason": _transfer_rows(own_transfers)["by_reason"],
+        }
+    global_rows = _transfer_rows(new_transfers)
+    by_reason = {reason: {**row, "external_minor": sum(t["amount_minor"] for t in new_transfers
+                                                        if t["reason"] == reason and t["counterparty"] == "external")}
+                for reason, row in global_rows["by_reason"].items()}
+    result = {
+        "platforms": platforms,
+        "transfers": {"count": global_rows["count"], "external_minor": global_rows["party_delta_minor"],
+                      "party_delta_minor": global_rows["party_delta_minor"], "by_reason": by_reason},
+        "unattributed_driver_payout_minor": sum(s["driver_payout_minor"] for s in new_settlements
+                                                if s["driver_id"] is None),
+    }
+    if per_driver:
+        driver_accounts_before, driver_accounts_after = _accounts(initial, "driver"), _accounts(final, "driver")
+        result["drivers"] = {
+            d["id"]: _driver_ledger_row(
+                d["id"], [s for s in new_settlements if s["driver_id"] == d["id"]],
+                [t for t in new_transfers if t["role"] == "driver" and t["person_id"] == d["id"]],
+                driver_accounts_before, driver_accounts_after)
+            for d in final["engine"]["drivers"]
+        }
+    return result
+
+
+def _account_deltas_match(initial, final, new_settlements, new_transfers):
+    """conservation()'s account_deltas_match_records: the offline twin of the engine's own rebuild check.
+
+    For every (role, id) account present in both boundary snapshots, the
+    settlement_minor delta between them must equal that party's own leg
+    summed over settlements new in this run, and likewise transfer_minor
+    against transfers new in this run -- exactly what
+    marketplace_engine._post_settlement/_post_transfer_record post, replayed
+    here from the raw log instead of from engine.accounts.
+    """
+    before_accounts = {(a["role"], a["id"]): a for a in initial["engine"].get("accounts", [])}
+    after_accounts = {(a["role"], a["id"]): a for a in final["engine"].get("accounts", [])}
+    settlement_leg, transfer_leg = {}, {}
+    for s in new_settlements:
+        settlement_leg[("platform", s["platform_id"])] = (
+            settlement_leg.get(("platform", s["platform_id"]), 0) + s["platform_contribution_minor"])
+        settlement_leg[("rider", s["rider_id"])] = settlement_leg.get(("rider", s["rider_id"]), 0) - s["rider_payment_minor"]
+        if s["driver_id"] is not None:
+            settlement_leg[("driver", s["driver_id"])] = (
+                settlement_leg.get(("driver", s["driver_id"]), 0) + s["driver_payout_minor"])
+    for t in new_transfers:
+        key = (t["role"], t["person_id"])
+        transfer_leg[key] = transfer_leg.get(key, 0) + t["amount_minor"]
+        if t["counterparty"] == "platform":
+            pkey = ("platform", t["platform_id"])
+            transfer_leg[pkey] = transfer_leg.get(pkey, 0) - t["amount_minor"]
+    for key in set(before_accounts) & set(after_accounts):
+        before_account, after_account = before_accounts[key], after_accounts[key]
+        if after_account["settlement_minor"] - before_account["settlement_minor"] != settlement_leg.get(key, 0):
+            return False
+        if after_account["transfer_minor"] - before_account["transfer_minor"] != transfer_leg.get(key, 0):
+            return False
+    return True
+
+
 def conservation(initial, final):
     """Order and money conservation identities: the residuals every --check script starts from.
 
@@ -792,6 +986,19 @@ def conservation(initial, final):
     the total), so a future change to the base/bonus/gross/discount split
     cannot silently stop reconciling with the money the settlements actually
     moved.
+
+    Three additive (phase 3) keys: transfer_party_delta_minor sums
+    amount_minor over every EXTERNAL transfer new in this run (0 per
+    platform-counterparty transfer, by construction of post_transfer, so
+    only external transfers can move it off zero).
+    unattributed_driver_payout_minor sums driver_payout_minor over new
+    settlements with no driver_id (see ledger_section); it is 0 in every run
+    that never exercises a rider cancellation's driver compensation on an
+    unassigned order. account_deltas_match_records is the offline twin of
+    marketplace_engine.restore's own _rebuild_accounts conservation check
+    (_account_deltas_match): every account's settlement_minor/transfer_minor
+    delta between the boundary snapshots must equal that party's own leg
+    summed over the records new in this run.
     """
     before, after = _tables(initial), _tables(final)
     new_orders = [o for identity, o in after["orders"].items() if identity not in before["orders"]]
@@ -800,6 +1007,7 @@ def conservation(initial, final):
     active_at_start = sum(1 for o in before["orders"].values() if o["state"] not in ("completed", "canceled"))
     active_at_end = sum(1 for o in after["orders"].values() if o["state"] not in ("completed", "canceled"))
     new_settlements = _new_settlements(before, after)
+    new_transfers = _new_transfers(before, after)
     money_keys = ("rider_payment_minor", "driver_payout_minor", "platform_contribution_minor")
     global_totals = {key: sum(s[key] for s in new_settlements) for key in money_keys}
     platform_totals = {key: sum(row["totals"][key] for row in money_by_platform(initial, final).values())
@@ -817,6 +1025,10 @@ def conservation(initial, final):
             row["driver_base_minor"] + row["driver_bonus_minor"] == row["driver_payout_minor"]
             and row["rider_gross_minor"] - row["rider_discount_minor"] == row["rider_payment_minor"]
             for row in split_rows),
+        "transfer_party_delta_minor": sum(t["amount_minor"] for t in new_transfers if t["counterparty"] == "external"),
+        "unattributed_driver_payout_minor": sum(s["driver_payout_minor"] for s in new_settlements
+                                                if s["driver_id"] is None),
+        "account_deltas_match_records": _account_deltas_match(initial, final, new_settlements, new_transfers),
     }
 
 
@@ -852,7 +1064,8 @@ class Checks:
 
 
 def calculate_metrics(path, interval_minutes=None, *, market_share_days=None,
-                      windows=None, platform_detail=False, first_choice_days=None):
+                      windows=None, platform_detail=False, first_choice_days=None,
+                      ledger=False, ledger_drivers=False):
     """Calculate the full run summary and optional intervals from one saved log.
 
     Uses only the standard library and raw values in the log. No current model
@@ -861,12 +1074,16 @@ def calculate_metrics(path, interval_minutes=None, *, market_share_days=None,
     settlement totals are retained in integer minor units.
 
     With no extra arguments the return value is exactly what it always was.
-    Three independent opt-in sections add offline detail without touching it:
+    Independent opt-in sections add offline detail without touching it:
     ``windows`` (an hour-boundary sequence, see window_rows) adds "windows"
     and "window_boundary_hours"; ``platform_detail=True`` adds
     "platform_detail" with per-platform money, funnel, cancellations, driver
     km, ETA drift, the settlement breakdown and the conservation identities;
-    ``first_choice_days`` adds "first_choice_days" and "first_choice_periods".
+    ``first_choice_days`` adds "first_choice_days" and "first_choice_periods";
+    ``ledger=True`` (or ``ledger_drivers=True``, which implies it) adds
+    "ledger" (see ledger_section) -- cash start/end per platform, ride
+    contribution, transfers by reason, and, only with ledger_drivers, one
+    row per driver.
     """
     header, initial, final, footer = load_run(path)
     start, end = initial["scheduler"]["clock_seconds"], final["scheduler"]["clock_seconds"]
@@ -952,6 +1169,8 @@ def calculate_metrics(path, interval_minutes=None, *, market_share_days=None,
     if first_choice_days is not None:
         result["first_choice_days"] = first_choice_days
         result["first_choice_periods"] = first_choice_periods(header, initial, final, first_choice_days)
+    if ledger or ledger_drivers:
+        result["ledger"] = ledger_section(initial, final, per_driver=ledger_drivers)
     return result
 
 
@@ -981,11 +1200,16 @@ def main():
                         help="Include per-platform money, funnel, cancellations, driver km, ETA drift and conservation")
     parser.add_argument("--first-choice-days", type=int,
                         help="Include first-choice query share against installed base in periods of this many days")
+    parser.add_argument("--ledger", action="store_true",
+                        help="Include per-platform cash start/end, ride contribution and transfers by reason")
+    parser.add_argument("--ledger-drivers", action="store_true",
+                        help="Like --ledger, plus one row per driver (implies --ledger)")
     args = parser.parse_args()
     try:
         result = calculate_metrics(args.log, args.interval_minutes, market_share_days=args.market_share_days,
                                    windows=args.windows, platform_detail=args.platform_detail,
-                                   first_choice_days=args.first_choice_days)
+                                   first_choice_days=args.first_choice_days,
+                                   ledger=args.ledger, ledger_drivers=args.ledger_drivers)
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.exit(2, f"Cannot analyze log: {error}\n")
     print(json.dumps(result, indent=2, allow_nan=False))

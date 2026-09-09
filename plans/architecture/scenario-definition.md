@@ -62,16 +62,26 @@ required key means a JSON definition or saved manifest from before this field
 existed fails `Scenario.load` with `notes: missing required setting`; add
 `"notes": {}` to migrate it. That failure is accepted, not patched with a
 silent default -- a hidden default would break the "complete definition"
-invariant and provenance the rest of this document describes.
+invariant and provenance the rest of this document describes. Phase 3's
+`platforms.<id>.starting_cash_minor` is the same class of required (nullable)
+key added to an existing complete `Map`: a definition or manifest saved
+before phase 3 fails `Scenario.load` with
+`platforms.<id>.starting_cash_minor: missing required setting`; add
+`"starting_cash_minor": null` per platform to migrate (see notes.md).
 
 `PRESETS['market-blank@1']` is `_base_v1` with empty `platforms` and empty
 `population.<role>.segments`: world, behavior defaults, `activity` generators
 set to `none`, evolution off. `compile_scenario` on it alone fails with
 `platforms: at least one platform is required`, which is the intended
 authoring-time signal that a script must add its own market.
-`platform(id, **parameters)` builds one complete `{id: <PLATFORM entry>}`
-table entry over `MARKETPLACE_DEFAULTS_V1` (rejecting an unknown parameter
-name with its exact path, at authoring time, before `compile_scenario` would);
+`platform(id, *, starting_cash_minor=None, **parameters)` builds one complete
+`{id: <PLATFORM entry>}` table entry over `MARKETPLACE_DEFAULTS_V1` (rejecting
+an unknown parameter name with its exact path, at authoring time, before
+`compile_scenario` would); `starting_cash_minor` is a separate explicit
+keyword, not one of `**parameters` -- it seeds the platform's cash account in
+`marketplace_engine.py` (see marketplace-engine.md "Money accounts"), not a
+`MarketplaceParameters` field, and every platform entry (phase 3) requires it
+(nullable; `None`, every preset's published default, means untracked).
 `two_platform(first, second, ...)` composes two `platform()` calls and one
 `both-apps` population segment per role into a ready `Scenario` on
 `market-blank@1`. Because `platforms` and `population.<role>.segments` are

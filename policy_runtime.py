@@ -11,7 +11,7 @@ from behavior_policy import (DriverPolicy, EvolutionPolicy, ExpandApps, OpenApp,
 from marketplace_policy import (EtaProposal, MarketplacePolicy, OfferProposal, PlatformPolicy,
                                 QuoteProposal)
 from marketplace_engine import CommandRejected
-from policy_contracts import Cancel, Decision, RandomValues, Stop, Wait, finite_number, freeze, plain
+from policy_contracts import Cancel, Decision, RandomValues, Stop, Transfer, Wait, finite_number, freeze, plain
 
 
 # Policy implementations are selected by identity and version, never by an
@@ -275,8 +275,18 @@ class PolicyRuntime:
         if a.order_id != request.order_id or a.party != request.party:
             raise ValueError('Cancellation may only affect the requested order and party')
         self.engine.cancel_order(a.order_id, a.party, a.reason, rider_fee_minor=a.rider_fee_minor,
-                                 driver_compensation_minor=a.driver_compensation_minor)
+                                 driver_compensation_minor=a.driver_compensation_minor,
+                                 driver_penalty_minor=a.driver_penalty_minor)
         return True
+
+    def apply_transfer(self, platform_id, action):
+        """Apply a Transfer proposal from platform `platform_id`. A platform may only fund its own."""
+        if action.counterparty == 'platform' and action.platform_id not in (None, platform_id):
+            raise ValueError('A platform may only post its own transfers')
+        self.engine.post_transfer(action.reason, action.role, action.person_id, action.amount_minor,
+                                  platform_id=platform_id if action.counterparty == 'platform' else None,
+                                  counterparty=action.counterparty, order_id=action.order_id,
+                                  program_id=action.program_id)
 
     def queue_rider(self, intent_id, delay):
         m = self.intents[str(intent_id)]
@@ -592,7 +602,10 @@ class PolicyRuntime:
         decision = policy.controller(freeze({'now': self.now, 'platform_id': p}),
             freeze(self.platform_memory[p]), RandomValues(self.seed, ('controller', p, self.now)))
         self.record('platform', p, 'controller', decision, policy.config.version)
-        if not isinstance(decision.action, Stop):
+        action = decision.action
+        if isinstance(action, Transfer):
+            self.apply_transfer(p, action)
+        elif not isinstance(action, Stop):
             raise ValueError('The fixed controller does not support automatic policy updates')
         self.platform_memory[p] = decision.memory
         interval = event.payload['interval_seconds']
