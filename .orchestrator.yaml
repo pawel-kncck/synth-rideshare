@@ -1,0 +1,41 @@
+version: 1
+base_branch: main
+verification:
+  test:
+    - python3 scripts/check_scenario_readiness.py
+  lint:
+    disabled: true
+    reason: This repository has no configured lint standard; correctness is checked by scenario execution and Opus review.
+  typecheck:
+    disabled: true
+    reason: This repository has no configured static type checker; runtime scenario checks and Opus review apply.
+  security:
+    disabled: true
+    reason: The simulator uses only the Python standard library; Opus must review security-sensitive changes in every PR.
+github:
+  required_checks: [test]
+  merge_method: squash
+  # The PR author publishes the AI verdict. GitHub disallows self-approval;
+  # exact-SHA Opus approval is enforced by the orchestrator before merge.
+  review_publication: comment
+codex:
+  binary: codex
+  reasoning_effort: high
+claude:
+  timeout_seconds: 3600
+worker_instructions: |
+  Implement only the assigned Scenario readiness issue, against main.
+  Read plans/scenario-readiness-plan.md, the owning architecture documents,
+  and projects/26f5bf87-06d9-4e47-ab7c-46df83889508/PLAN.md when present.
+  Follow the current Linear acceptance criteria and the latest planning checkpoint.
+  Every new mechanism defaults off. Preserve @1 implementations and seed-0 behavior.
+  Use scenario runs and throwaway validation scripts; do not add a unit-test suite.
+  Check continuous versus snapshot/restored execution for new record types,
+  money conservation including transfers, order conservation, and hidden-state-free
+  candidate lists. Update the owning architecture document with each phase.
+  Record phase-specific commands and results. The baseline CI script alone does
+  not establish correctness of new mechanisms. Reviewers must request changes
+  when phase-specific evidence or acceptance criteria are missing.
+  Do not change CI gates or the orchestrator configuration as part of an issue.
+protected:
+  paths: [.github/**, .orchestrator.yaml, scripts/check_scenario_readiness.py, .env*, secrets/**]
