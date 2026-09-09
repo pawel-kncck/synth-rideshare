@@ -906,8 +906,8 @@ def two_platform(first, second, *, name=None, riders=0, drivers=0, horizon_hours
     if first == second:
         raise ScenarioError('two_platform: platform ids must be distinct')
     shared = shared or {}
-    platforms = (platform(first, **shared, **(first_parameters or {}))
-                | platform(second, **shared, **(second_parameters or {})))
+    platforms = (platform(first, **{**shared, **(first_parameters or {})})
+                | platform(second, **{**shared, **(second_parameters or {})}))
     return Scenario(preset='market-blank@1', name=name).with_changes({
         'world.horizon_hours': horizon_hours,
         'population.riders.count': riders, 'population.drivers.count': drivers,

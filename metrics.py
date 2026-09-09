@@ -343,28 +343,43 @@ def aggregate_market_share(completed, platforms, start_seconds, end_seconds, per
 def _settlement_row(orders, settlements):
     """One money row: gross/discount, base/bonus and the settlement's own three fields, summed.
 
-    rider_gross_minor/rider_discount_minor come from the order's frozen quote
-    fare; driver_base_minor/driver_bonus_minor come from the accepted offer's
-    frozen payout terms. A settlement whose order has no assignment (a rider
-    cancellation fee on an order that was never assigned a driver) has no
-    offer payout to decompose, so its base is the settlement's own
-    driver_payout_minor and its bonus is 0. rider_payment_minor,
-    driver_payout_minor and platform_contribution_minor are always the
-    settlement's own three fields (never re-derived), so residual_minor
-    (rider_payment - driver_payout - platform_contribution) is exactly 0 by
-    construction of Settlement; it is reported here, not assumed.
+    Only a completed_ride settlement's own rider_payment_minor/
+    driver_payout_minor are themselves derived from the order's frozen quote
+    fare and the accepted offer's frozen payout terms
+    (marketplace_engine._drop_off calls _settle with order.fare.
+    rider_payment_minor and order.assignment.payout.driver_payout_minor), so
+    only there do rider_gross_minor/rider_discount_minor and
+    driver_base_minor/driver_bonus_minor decompose those same frozen terms --
+    it is exactly what the settlement paid, not an estimate of it. Any other
+    reason (today: cancellation_fee) settles an amount the frozen terms do
+    not describe at all: a canceled order's fare was never charged and its
+    assignment's payout, if it has one, was never earned. That row instead
+    reports what actually moved: driver_base_minor is the settlement's own
+    driver_payout_minor (bonus 0 -- a cancellation has no bonus concept) and
+    rider_gross_minor is the settlement's own rider_payment_minor (discount
+    0), the same fallback an order with no assignment at all always used.
+    rider_payment_minor, driver_payout_minor and platform_contribution_minor
+    are always the settlement's own three fields (never re-derived), so
+    residual_minor (rider_payment - driver_payout - platform_contribution) is
+    exactly 0 by construction of Settlement; it is reported here, not
+    assumed. This split is a per-settlement identity -- driver_base_minor +
+    driver_bonus_minor always equals driver_payout_minor and
+    rider_gross_minor - rider_discount_minor always equals
+    rider_payment_minor, for every settlement and therefore for any sum of
+    rows -- and conservation() checks it.
     """
     rider_gross = rider_discount = driver_base = driver_bonus = 0
     rider_payment = driver_payout = platform_contribution = 0
     for s in settlements:
         order = orders[s["order_id"]]
-        rider_gross += order["fare"]["gross_minor"]
-        rider_discount += order["fare"]["discount_minor"]
         assignment = order["assignment"]
-        if assignment is not None:
+        if s["reason"] == "completed_ride" and assignment is not None:
+            rider_gross += order["fare"]["gross_minor"]
+            rider_discount += order["fare"]["discount_minor"]
             driver_base += assignment["payout"]["payout_minor"]
             driver_bonus += assignment["payout"]["bonus_minor"]
         else:
+            rider_gross += s["rider_payment_minor"]
             driver_base += s["driver_payout_minor"]
         rider_payment += s["rider_payment_minor"]
         driver_payout += s["driver_payout_minor"]
@@ -500,22 +515,36 @@ def cancellations_by_party(initial, final):
 def driver_distance(initial, final):
     """Empty (pickup) and loaded (transport) kilometres per driver, from service legs.
 
-    A leg is attributed in full to the run segment containing its
-    started_at (see plans/architecture/experiment-runner.md), so a leg never
-    splits across a snapshot boundary and continuous/restored runs agree.
-    Reposition legs do not exist yet (plan phase 6, marketplace-engine.md)
-    and would land in other_km; boarding legs have zero length and add
-    nothing to any bucket. loaded_km equals summary.completed_distance_km
-    whenever every transport leg in the run belongs to a completed order
-    (true exactly when orders_active_at_end is 0). loaded_share_pct is null
-    for a driver (or the fleet) with no logged distance at all.
+    A leg is attributed to the run segment where it first appears -- cohorted
+    by identity (service_id, its index in that service's own legs list), the
+    same "new in this run" rule collect_metric_records and every other
+    function in this module use, not by testing its started_at against the
+    segment's clock bounds. A service's legs list is append-only
+    (marketplace_engine.py never pops or reorders it) and a leg's started_at
+    is always the clock at the instant it was appended, so a snapshot
+    boundary can land exactly on a leg's own started_at (Snapshot() is an
+    event-boundary checkpoint, so this is an ordinary case, not a contrived
+    one): a filter inclusive on both ends would then count that one leg
+    twice, once in the segment that produced it and again in the next,
+    restored one. Cohorting by identity instead means a leg is counted
+    exactly once no matter where a snapshot falls, which is what makes a
+    continuous run and a restored continuation agree byte-for-byte on driver
+    distance (see plans/architecture/experiment-runner.md). Reposition legs
+    do not exist yet (plan phase 6, marketplace-engine.md) and would land in
+    other_km; boarding legs have zero length and add nothing to any bucket.
+    loaded_km equals summary.completed_distance_km whenever every transport
+    leg in the run belongs to a completed order (true exactly when
+    orders_active_at_end is 0). loaded_share_pct is null for a driver (or the
+    fleet) with no logged distance at all.
     """
-    start, end = initial["scheduler"]["clock_seconds"], final["scheduler"]["clock_seconds"]
+    end = final["scheduler"]["clock_seconds"]
+    before_services = {s["id"]: s for s in initial["engine"]["services"]}
     by_driver = {d["id"]: {"empty": [], "loaded": [], "other": []} for d in final["engine"]["drivers"]}
     for service in final["engine"]["services"]:
         bucket = by_driver.setdefault(service["driver_id"], {"empty": [], "loaded": [], "other": []})
-        for leg in service["legs"]:
-            if not start <= leg["started_at"] <= end:
+        already = len(before_services[service["id"]]["legs"]) if service["id"] in before_services else 0
+        for index, leg in enumerate(service["legs"]):
+            if index < already or leg["started_at"] > end:
                 continue
             distance = math.dist(leg["origin"], leg["destination"])
             key = "empty" if leg["kind"] == "pickup" else "loaded" if leg["kind"] == "transport" else "other"
@@ -555,17 +584,25 @@ def eta_drift(initial, final):
     counted in "canceled") when the platform had no supply at quote time
     (eta_seconds is None) or, defensively, eta_predictions is empty.
     revisions counts eta_predictions entries appended by revise_pickup_eta
-    (source == "revision") with a timestamp inside this run, for every order
-    of the platform, whether or not it was later canceled; it is reported
-    only by platform, not split by party.
+    (source == "revision") that are new in this run, for every order of the
+    platform, whether or not it was later canceled; it is reported only by
+    platform, not split by party. Cohorted the same way driver_distance
+    cohorts legs: eta_predictions is append-only, so comparing each order's
+    own list length in `initial` against `final` and counting only the
+    entries beyond what was already there identifies exactly the entries new
+    to this run, without testing each entry's own timestamp against the
+    run's clock bounds -- a boundary inclusive on both ends would double
+    count a revision recorded in the same instant a snapshot was taken, the
+    same way it would double count a leg in driver_distance.
     """
     before, after = _tables(initial), _tables(final)
-    start, end = initial["scheduler"]["clock_seconds"], final["scheduler"]["clock_seconds"]
+    end = final["scheduler"]["clock_seconds"]
     rows = {p["id"]: _blank_eta_row() for p in final["engine"]["platforms"]}
-    for order in after["orders"].values():
+    for identity, order in after["orders"].items():
         row = rows.setdefault(order["platform_id"], _blank_eta_row())
-        row["revisions"] += sum(1 for p in order["eta_predictions"]
-                                if p["source"] == "revision" and start <= p["at"] <= end)
+        already = len(before["orders"][identity]["eta_predictions"]) if identity in before["orders"] else 0
+        row["revisions"] += sum(1 for p in order["eta_predictions"][already:]
+                                if p["source"] == "revision" and p["at"] <= end)
     for order in _new_terminal(before, after, "canceled"):
         row = rows.setdefault(order["platform_id"], _blank_eta_row())
         party = order["cancellation"]["by"]
@@ -671,7 +708,13 @@ def first_choice_periods(header, initial, final, period_days):
     "First choice" is the platform of a rider's earliest quote (ordered by
     (at, id)) among intents created in this run; drivers never query, so
     this is rider-side only. An intent with no quote at all (no supply
-    observation was even attempted) contributes to no period. "Installed
+    observation was even attempted) contributes to no period. Each quote
+    lands in exactly one period -- the half-open interval containing its
+    `at`, except the last period, which also includes the run's own end --
+    the same single-assignment bucket rule aggregate_market_share uses for
+    completions, so a quote landing exactly on a period boundary is never
+    counted in both the period it closes and the one it opens; queries and
+    sum(first_choice_counts.values()) always agree. "Installed
     base" at a period's start is the initial snapshot's engine.riders[*].apps,
     replayed forward with every policies.observations app_installed record
     (role == "rider") at or before that instant -- app installs are
@@ -706,22 +749,27 @@ def first_choice_periods(header, initial, final, period_days):
             cursor += 1
         installed_riders = {p: sum(p in a for a in apps.values()) for p in platforms}
         total_installed = sum(installed_riders.values())
-        counts = {p: 0 for p in platforms}
-        queries = 0
-        for at, platform_id in first_choice:
-            if left <= at <= right:
-                counts[platform_id] += 1
-                queries += 1
         rows.append({
             "start_seconds": left, "end_seconds": right,
             "clock_start": clock_label(header["start_hour"] * 3600 + left),
             "clock_end": clock_label(header["start_hour"] * 3600 + right),
-            "queries": queries, "first_choice_counts": counts,
-            "first_choice_share_pct": {p: 100 * n / queries if queries else None for p, n in counts.items()},
+            "queries": 0, "first_choice_counts": {p: 0 for p in platforms},
+            "first_choice_share_pct": {p: None for p in platforms},
             "installed_riders": installed_riders,
             "installed_share_pct": {p: 100 * n / total_installed if total_installed else None
                                     for p, n in installed_riders.items()},
         })
+    # Single-assignment bucketing (aggregate_market_share's rule): each quote
+    # lands in exactly one row, so a boundary instant is never double counted.
+    for at, platform_id in first_choice:
+        if start <= at <= end:
+            index = min(len(rows) - 1, int((at - start) // width))
+            rows[index]["first_choice_counts"][platform_id] += 1
+            rows[index]["queries"] += 1
+    for row in rows:
+        queries = row["queries"]
+        row["first_choice_share_pct"] = {p: 100 * n / queries if queries else None
+                                         for p, n in row["first_choice_counts"].items()}
     return rows
 
 
@@ -737,7 +785,13 @@ def conservation(initial, final):
     platform_money_matches_totals confirms that summing money_by_platform's
     per-platform totals reproduces the same three sums computed directly
     from every new settlement, so a bucketing bug cannot hide inside a
-    per-platform split.
+    per-platform split. settlement_split_reconciles checks the per-row
+    identity _settlement_row's docstring promises -- base+bonus equals that
+    row's own driver_payout_minor, and gross-discount equals its own
+    rider_payment_minor -- on every settlement_breakdown row (each reason and
+    the total), so a future change to the base/bonus/gross/discount split
+    cannot silently stop reconciling with the money the settlements actually
+    moved.
     """
     before, after = _tables(initial), _tables(final)
     new_orders = [o for identity, o in after["orders"].items() if identity not in before["orders"]]
@@ -750,6 +804,8 @@ def conservation(initial, final):
     global_totals = {key: sum(s[key] for s in new_settlements) for key in money_keys}
     platform_totals = {key: sum(row["totals"][key] for row in money_by_platform(initial, final).values())
                        for key in money_keys}
+    breakdown = settlement_breakdown(initial, final)
+    split_rows = list(breakdown["by_reason"].values()) + [breakdown["totals"]]
     return {
         "orders_created": len(new_orders), "completed": len(completed), "canceled": len(canceled),
         "active_at_end": active_at_end,
@@ -757,6 +813,10 @@ def conservation(initial, final):
         "settlement_residual_minor": sum(s["rider_payment_minor"] - s["driver_payout_minor"] - s["platform_contribution_minor"]
                                          for s in new_settlements),
         "platform_money_matches_totals": platform_totals == global_totals,
+        "settlement_split_reconciles": all(
+            row["driver_base_minor"] + row["driver_bonus_minor"] == row["driver_payout_minor"]
+            and row["rider_gross_minor"] - row["rider_discount_minor"] == row["rider_payment_minor"]
+            for row in split_rows),
     }
 
 
