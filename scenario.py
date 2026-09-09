@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import math
 import random
@@ -76,6 +77,82 @@ def _is_number(value):
 
 def join(path, key):
     return f'{path}.{key}' if path else str(key)
+
+
+# ----------------------------------------------------------------------
+# Registered generators: trips, shifts and population, identified and versioned like policies
+# (register_policy/policy_class in policy_runtime.py) but registered here -- generators are
+# compile/prepare-time artifacts with no engine access, so POLICY_FAMILIES' hook/parameter-schema
+# contract does not apply to them. Call contracts (`definition`/`people`/`parameters`/`random` in,
+# a session-dict list or a {person_id: declaration} mapping out) are documented in
+# plans/architecture/scenario-definition.md and re-validated at prepare time by _check_session
+# and the population-generator path in _realize_population; compile time only proves the selected
+# identifier is registered (mirroring Implementation's policy-identifier check).
+# ----------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class GeneratorDeclaration:
+    """A registered generator's identity (`name@version`) and family; `inputs`/`outputs` are free-form
+    documentation, not validated against anything."""
+    name: str
+    version: str
+    family: str
+    inputs: tuple = ()
+    outputs: tuple = ()
+
+
+GENERATOR_FAMILIES = ('trips', 'shifts', 'population')
+GENERATOR_REGISTRY = {family: {} for family in GENERATOR_FAMILIES}
+GENERATOR_SOURCES = {family: {} for family in GENERATOR_FAMILIES}
+
+
+def generator_id(implementation):
+    declaration = implementation.declaration
+    return f'{declaration.name}@{declaration.version}'
+
+
+def register_generator(family, implementation):
+    """Register a trusted generator under its declared name and version, mirroring `register_policy`.
+
+    The source is hashed with `inspect.getsource` right here, at registration
+    time, not invented later when a manifest is written -- so the recorded
+    hash always reflects what actually ran. A generator whose source cannot
+    be retrieved (`inspect.getsource` raising `OSError`, e.g. one defined at
+    an interactive prompt) cannot be registered, because there would be
+    nothing to hash for provenance. The hash detects source drift, not
+    impurity: a generator that reads the clock, a global, or an unseeded
+    `random` module call can still silently break `Inputs.reuse_for` and
+    paired variants without changing its source at all.
+    """
+    if family not in GENERATOR_FAMILIES:
+        raise ValueError(f'Unknown generator family {family!r}')
+    declaration = getattr(implementation, 'declaration', None)
+    if (declaration is None or not isinstance(declaration.name, str) or not declaration.name
+            or not isinstance(declaration.version, str) or not declaration.version):
+        raise ValueError(f'{family} generator needs a GeneratorDeclaration with a name and version')
+    if declaration.family != family:
+        raise ValueError(f'{family} generator declaration must declare family {family!r}, got {declaration.family!r}')
+    if not callable(getattr(implementation, 'generate', None)):
+        raise ValueError(f'{family} generator must implement a callable generate(...)')
+    identifier = generator_id(implementation)
+    existing = GENERATOR_REGISTRY[family].get(identifier)
+    if existing is not None and existing is not implementation:
+        raise ValueError(f'{family} generator {identifier} is already registered')
+    try:
+        source = inspect.getsource(implementation)
+    except OSError:
+        raise ValueError(f'{family} generator {identifier} needs retrievable source for provenance') from None
+    GENERATOR_REGISTRY[family][identifier] = implementation
+    GENERATOR_SOURCES[family][identifier] = hashlib.sha256(source.encode()).hexdigest()
+    return identifier
+
+
+def generator_class(family, identifier):
+    try:
+        return GENERATOR_REGISTRY[family][identifier]
+    except KeyError:
+        known = ', '.join(sorted(GENERATOR_REGISTRY.get(family, {}))) or 'none'
+        raise ValueError(f'Unknown {family} generator {identifier!r}; registered: {known}') from None
 
 
 # ----------------------------------------------------------------------
@@ -391,6 +468,37 @@ class Params(Spec):
         return Scalar('any'), (value or {}).get(key)
 
 
+class Distribution(Spec):
+    """One sampled distribution (`uniform`/`normal`/`choice`) outside a `Params` map, e.g. `activity.*.distance_km`.
+
+    Reuses `Params.check_distribution` so there is exactly one implementation
+    of the distribution-shape rule. The default (replace) `Spec.merge` is
+    correct here -- a variant that names a new `distance_km` means exactly
+    that distribution, not a merge with the base's.
+    """
+    nullable = True
+
+    def check(self, value, path, diag, complete):
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            diag.error(path, f'expected a distribution, got {value!r}')
+            return value
+        Params.check_distribution(value, path, diag)
+        return dict(value)
+
+
+class Json(Spec):
+    """Any JSON-serializable value; its contents are a registered generator's own contract, not this schema's."""
+
+    def check(self, value, path, diag, complete):
+        try:
+            canonical(value)
+        except (TypeError, ValueError):
+            diag.error(path, 'must be a JSON-serializable value')
+        return copy.deepcopy(value)
+
+
 class Implementation(Spec):
     """A registered policy selection. Its parameter schema comes from the implementation's declaration."""
 
@@ -445,6 +553,20 @@ APPS = Seq(Scalar('string'))
 NONNEGATIVE_HOURS = Scalar('number', minimum=0)
 POSITIVE_HOURS = Scalar('number', positive=True)
 
+# Per-segment geometry for the weekly/rotation generators (plan section 4.F). Both are
+# `partial=True`: an absent key is the default-off state, so a segment that names none of
+# this keeps its `activity: {}` and realization takes the unchanged `_sample_point` path.
+SPATIAL_PEAK = Map({'id': Scalar('string'), 'zones': Seq(Scalar('string')),
+                    'weekdays': Seq(Scalar('integer', minimum=0, maximum=6)),
+                    'start_hour': Scalar('integer', minimum=0, maximum=23),
+                    'end_hour': Scalar('integer', minimum=0, maximum=24),
+                    'multiplier': Scalar('number', minimum=0)})
+RIDER_ACTIVITY = Map({'origin_zones': Table(Scalar('number', minimum=0)),
+                      'destination_zones': Table(Table(Scalar('number', minimum=0))),
+                      'distance_km': Distribution(),
+                      'spatial_peaks': Keyed(SPATIAL_PEAK)}, partial=True)
+DRIVER_ACTIVITY = Map({'start_zone': Scalar('string', nullable=True)}, partial=True)
+
 
 def segment_fields(role, *, explicit):
     fields_ = {
@@ -453,6 +575,7 @@ def segment_fields(role, *, explicit):
         'initial_scores': Table(Scalar('number', minimum=-2, maximum=2)),
         role: Params(TRAITS[role], sampled=not explicit, partial=True),
         'evolution': Params(EvolutionTraits, sampled=not explicit, partial=True),
+        'activity': RIDER_ACTIVITY if role == 'rider' else DRIVER_ACTIVITY,
     }
     if role == 'driver':
         fields_['registrations'] = Seq(Scalar('string'), nullable=True)
@@ -464,7 +587,8 @@ def segment_fields(role, *, explicit):
 def population_spec(role):
     return Map({'count': Scalar('integer', minimum=0),
                 'segments': Table(Map(segment_fields(role, explicit=False))),
-                'people': Keyed(Map(segment_fields(role, explicit=True), partial=True))})
+                'people': Keyed(Map(segment_fields(role, explicit=True), partial=True)),
+                'generator': Choice('kind', {'segments': Map({}), 'registered': registered_generator()})})
 
 
 CAMPAIGN = Map({
@@ -485,11 +609,30 @@ PLATFORM = Map({
 PEAK = Map({'id': Scalar('string'), 'weekdays': Seq(Scalar('integer', minimum=0, maximum=6)),
             'start_hour': Scalar('integer', minimum=0, maximum=23), 'end_hour': Scalar('integer', minimum=0, maximum=24),
             'multiplier': Scalar('number', minimum=1)})
+ZONE = Map({'min': Point(), 'max': Point()})  # closed axis-aligned box in km; map_km stays a sampling extent, not a fence
+
+
+def registered_generator():
+    """A `{'implementation': 'name@version', 'parameters': {...}}` option, as a FACTORY.
+
+    `Choice.__init__` mutates each option `Map` it is given (writing the
+    discriminator field and `partial` flag onto it in place), so one shared
+    instance reused across `SHIFTS`, `TRIPS` and the two population
+    `Choice`s would alias all four -- this must be called fresh every time.
+    `parameters` is `Table(Json())`, an open bag: unlike a policy's
+    parameter schema, a generator's own contract is not known until it is
+    selected, so it is validated by the generator itself at prepare time,
+    not by this schema.
+    """
+    return Map({'implementation': Scalar('string'), 'parameters': Table(Json())})
+
+
 SHIFTS = Choice('generator', {
     'rotation': Map({'crews': Scalar('integer', minimum=1), 'shift_hours': POSITIVE_HOURS,
                      'days': Scalar('integer', minimum=1, nullable=True), 'first_start_hours': NONNEGATIVE_HOURS}),
     'explicit': Map({'items': Keyed(Map({'id': Scalar('string'), 'driver': Scalar('string'), 'at_hours': NONNEGATIVE_HOURS,
                                          'hours': Scalar('number', positive=True, nullable=True), 'location': Point()}))}),
+    'registered': registered_generator(),
     'none': Map({}),
 })
 TRIPS = Choice('generator', {
@@ -498,6 +641,7 @@ TRIPS = Choice('generator', {
                    'assignment': Scalar('string', choices=('round_robin', 'random'))}),
     'explicit': Map({'items': Keyed(Map({'id': Scalar('string'), 'rider': Scalar('string'), 'at_hours': NONNEGATIVE_HOURS,
                                          'origin': Point(), 'destination': Point()}))}),
+    'registered': registered_generator(),
     'none': Map({}),
 })
 INTERVENTION = Choice('kind', {
@@ -517,6 +661,7 @@ SCENARIO = Map({
         'speed_kmh': Scalar('number', positive=True), 'boarding_seconds': Scalar('number', minimum=0),
         'minor_units_per_major': Scalar('integer', minimum=1), 'map_km': Point(positive=True),
         'sampling': Scalar('string', choices=('grid', 'continuous')), 'grid_step_km': Scalar('number', positive=True),
+        'zones': Table(ZONE),
         'calendar': Map({'weekday': Scalar('integer', minimum=0, maximum=6), 'hour': Scalar('number', minimum=0, maximum=24)}),
         'horizon_hours': POSITIVE_HOURS,
     }),
@@ -583,13 +728,27 @@ def peak(id, *, weekdays, start_hour, end_hour, multiplier):
                          'multiplier': multiplier}, f'peak {id}')
 
 
+def spatial_peak(id, *, zones, weekdays, start_hour, end_hour, multiplier):
+    """One `activity.<role>.segments.<sid>.activity.spatial_peaks` item: a clock window that multiplies
+    the listed zones' `origin_zones` weight for a rider whose segment declares one (origins only)."""
+    return _build(SPATIAL_PEAK, {'id': id, 'zones': list(zones), 'weekdays': list(weekdays), 'start_hour': start_hour,
+                                 'end_hour': end_hour, 'multiplier': multiplier}, f'spatial_peak {id}')
+
+
 def segment(*, weight, apps, preferred_app, accounts=None, registrations=None, awareness=None, disclosed_to=(),
-            initial_scores=None, rider=None, driver=None, evolution=None):
-    """A population segment: correlated access and trait bundle. Omit `registrations` for riders."""
+            initial_scores=None, rider=None, driver=None, evolution=None, activity=None):
+    """A population segment: correlated access and trait bundle. Omit `registrations` for riders.
+
+    `activity` is the segment's geometry declaration (`origin_zones`,
+    `destination_zones`, `distance_km`, `spatial_peaks` for a rider segment;
+    `start_zone` for a driver segment) -- omit it (the default) for the
+    map-wide `_sample_point` behavior every segment had before phase 2.
+    """
     value = {'weight': weight, 'apps': list(apps), 'preferred_app': preferred_app,
              'accounts': None if accounts is None else list(accounts),
              'awareness': list(apps if awareness is None else awareness), 'disclosed_to': list(disclosed_to),
-             'initial_scores': dict(initial_scores or {}), 'evolution': dict(evolution or {})}
+             'initial_scores': dict(initial_scores or {}), 'evolution': dict(evolution or {}),
+             'activity': dict(activity or {})}
     if driver is not None or registrations is not None:
         value.update({'driver': dict(driver or {}), 'registrations': None if registrations is None else list(registrations)})
     else:
@@ -674,7 +833,8 @@ def _segments_v1(role):
     result = {}
     for name, weight, apps, preferred in mix:
         item = {'weight': weight, 'apps': list(apps), 'preferred_app': preferred, 'accounts': None,
-                'awareness': list(ALL_APPS), 'disclosed_to': [], 'initial_scores': {}, trait: {}, 'evolution': {}}
+                'awareness': list(ALL_APPS), 'disclosed_to': [], 'initial_scores': {}, trait: {}, 'evolution': {},
+                'activity': {}}
         if role == 'driver':
             item['registrations'] = None
         result[name] = item
@@ -685,13 +845,13 @@ def _base_v1(name, *, horizon_hours, calendar):
     return {
         'name': name, 'schema_version': SCHEMA_VERSION, 'preset': None, 'calibration': 'synthetic', 'notes': {},
         'world': {'speed_kmh': 30, 'boarding_seconds': 30, 'minor_units_per_major': 100, 'map_km': [10, 10],
-                  'sampling': 'grid', 'grid_step_km': 1, 'calendar': dict(calendar), 'horizon_hours': horizon_hours},
+                  'sampling': 'grid', 'grid_step_km': 1, 'zones': {}, 'calendar': dict(calendar), 'horizon_hours': horizon_hours},
         'platforms': {app: _platform_v1() for app in ALL_APPS},
         'behavior': {'rider': {'implementation': 'rider_search@1', 'parameters': dict(RIDER_DEFAULTS_V1)},
                      'driver': {'implementation': 'driver_participation@1', 'parameters': dict(DRIVER_DEFAULTS_V1)},
                      'evolution': {'implementation': 'personal_evolution@1', 'parameters': dict(EVOLUTION_DEFAULTS_V1)}},
-        'population': {'riders': {'count': 0, 'segments': _segments_v1('rider'), 'people': []},
-                       'drivers': {'count': 0, 'segments': _segments_v1('driver'), 'people': []}},
+        'population': {'riders': {'count': 0, 'segments': _segments_v1('rider'), 'people': [], 'generator': {'kind': 'segments'}},
+                       'drivers': {'count': 0, 'segments': _segments_v1('driver'), 'people': [], 'generator': {'kind': 'segments'}}},
         'activity': {'shifts': {'generator': 'none'}, 'trips': {'generator': 'none'}, 'conflicts': 'fail'},
         'evolution': {'checkpoint_hours': None, 'first_checkpoint_hours': None},
         'interventions': [],
@@ -788,6 +948,27 @@ def platform(id, *, launched=True, version='modern-v1', rules=(), campaigns=(), 
                         'parameters': {**MARKETPLACE_DEFAULTS_V1, **parameters},
                         'rules': list(rules), 'campaigns': list(campaigns), 'fallback': fallback}}
     checked = PLATFORM.check(entry, f'platform {id}', diag, complete=True)
+    diag.raise_errors()
+    return {id: checked}
+
+
+def zone(id, *, min, max):
+    """One complete `{id: {'min': [x0, y0], 'max': [x1, y1]}}` table entry, validated at authoring time.
+
+    Mirrors `platform()`: `id` is validated as a `Table` key would be, and
+    the box itself is checked against `ZONE` immediately, before
+    `compile_scenario` would. Combine entries with `|` and set them with
+    `.with_changes({"world.zones": zone(...) | zone(...)})` -- `world.zones`
+    is a `Table`, so this merges by ID into whatever zones the base scenario
+    already has. `min`/`max` are plain `(x, y)` pairs in kilometres; `Point()`
+    (not `Point(positive=True)`) accepts `[0, 0]` and negative corners
+    because `map_km` is a sampling extent, not a fence -- see `_check_zones`
+    for the box/map/grid checks `compile_scenario` runs afterwards.
+    """
+    diag = Diagnostics()
+    if not isinstance(id, str) or not id or '.' in id:
+        diag.error('zone', 'IDs must be nonempty strings without dots')
+    checked = ZONE.check({'min': list(min), 'max': list(max)}, f'zone {id}', diag, complete=True)
     diag.raise_errors()
     return {id: checked}
 
@@ -1006,6 +1187,7 @@ class Plan:
     checkpoints: tuple
     interventions: tuple
     fingerprints: dict
+    generators: dict  # {'trips'|'shifts'|'population.rider'|'population.driver': {'implementation', 'source_sha256'}}
 
     @property
     def name(self):
@@ -1020,6 +1202,11 @@ class Plan:
         """The free-form authoring notes: {id: text}, never part of the controls fingerprint."""
         return copy.deepcopy(self.resolved['notes'])
 
+    @property
+    def zones(self):
+        """`{id: {'min': [x0, y0], 'max': [x1, y1]}}`. Never reaches `World`; the engine still does not fence coordinates."""
+        return copy.deepcopy(self.resolved['world']['zones'])
+
     def manifest(self):
         """Everything needed to reconstruct and identify this plan without today's defaults."""
         return {'name': self.name, 'preset': self.resolved['preset'], 'calibration': self.resolved['calibration'],
@@ -1029,7 +1216,7 @@ class Plan:
                 'fingerprints': dict(self.fingerprints), 'implementations': copy.deepcopy(self.implementations),
                 'resolved': copy.deepcopy(self.resolved), 'provenance': dict(self.provenance),
                 'interventions': copy.deepcopy(list(self.interventions)), 'checkpoints': list(self.checkpoints),
-                'warnings': list(self.warnings)}
+                'warnings': list(self.warnings), 'generators': copy.deepcopy(self.generators)}
 
     def prepare(self, seed=0):
         return prepare_inputs(self, seed)
@@ -1047,6 +1234,7 @@ def compile_scenario(scenario):
         world = World(world_def['speed_kmh'], world_def['boarding_seconds'], world_def['minor_units_per_major'])
     except ValueError as error:
         diag.error('world', str(error))
+    _check_zones(world_def, diag)
     horizon = world_def['horizon_hours'] * HOUR
     platforms = {}
     launched_at = {}
@@ -1124,6 +1312,7 @@ def compile_scenario(scenario):
         for sid, item in section['segments'].items():
             access = _check_access(role, item, f'{path}.segments.{sid}', platforms, launched_at, behavior, diag, sampled=True)
             segments[role][sid] = {**access, 'weight': item['weight'], 'initial_scores': dict(item['initial_scores']),
+                                   'activity': dict(item['activity']),
                                    'traits': {role: dict(item[role]), 'evolution': dict(item['evolution'])}}
         ids = [f'{role}-{index}' for index in range(1, section['count'] + 1)]
         explicit = []
@@ -1139,23 +1328,12 @@ def compile_scenario(scenario):
                     diag.error(f'{label}.segment', f'unknown segment {item["segment"]!r}')
                 else:
                     base = section['segments'][item['segment']]
-            merged = {key: value for key, value in base.items() if key not in ('weight', role, 'evolution', 'initial_scores')}
-            merged.update({key: value for key, value in item.items() if key not in ('id', 'segment', role, 'evolution', 'initial_scores')})
-            for key in ('apps', 'preferred_app'):
-                if key not in merged:
-                    diag.error(f'{label}.{key}', 'required for an explicit person without a segment')
-                    merged[key] = [] if key == 'apps' else ''
-            merged.setdefault('awareness', list(merged['apps']))
-            merged.setdefault('disclosed_to', [])
-            merged.setdefault('accounts', None)
-            if role == 'driver':
-                merged.setdefault('registrations', None)
-            merged[role] = {**base.get(role, {}), **item.get(role, {})}
-            merged['evolution'] = {**base.get('evolution', {}), **item.get('evolution', {})}
-            merged['initial_scores'] = {**base.get('initial_scores', {}), **item.get('initial_scores', {})}
+            merged, missing = _merge_person(role, item, base)
+            for key in missing:
+                diag.error(f'{label}.{key}', 'required for an explicit person without a segment')
             access = _check_access(role, merged, label, platforms, launched_at, behavior, diag, sampled=False)
             explicit_people[role].append({**access, 'id': item['id'], 'segment': item['segment'],
-                                          'initial_scores': merged['initial_scores'],
+                                          'initial_scores': merged['initial_scores'], 'activity': merged['activity'],
                                           'traits': {role: merged[role], 'evolution': merged['evolution']}})
         person_ids[role] = tuple(ids + explicit)
     for pid, plan_ in platforms.items():
@@ -1210,6 +1388,16 @@ def compile_scenario(scenario):
         for item in activity[kind].get('items', ()):
             if item['at_hours'] * HOUR > horizon:
                 diag.warn(f"activity.{kind}.items.{item['id']}", 'starts after the horizon')
+    # Segment/explicit-person geometry: a second pass, now that shifts/trips generator kinds are
+    # known, so the two generator-mismatch warnings below can compare against them.
+    for role in ROLES:
+        path = f'population.{role}s'
+        for sid, item in segments[role].items():
+            _check_segment_activity(item['activity'], f'{path}.segments.{sid}.activity', world_def['zones'], world_def,
+                                    trips['generator'], shifts['generator'], diag)
+        for person in explicit_people[role]:
+            _check_segment_activity(person['activity'], f"{path}.people.{person['id']}.activity", world_def['zones'],
+                                    world_def, trips['generator'], shifts['generator'], diag)
     checkpoints = ()
     evolution = resolved['evolution']
     if evolution['checkpoint_hours'] is not None:
@@ -1225,22 +1413,53 @@ def compile_scenario(scenario):
                    for role in ROLES for sid in segments[role] for key in ('adoption_rate_per_day', 'learning_rate'))
     if learning and not checkpoints:
         diag.warn('evolution.checkpoint_hours', 'adoption or learning rates are nonzero but no checkpoint is scheduled')
+    # Registered generators: identity + source hash for the manifest and implementation fingerprint.
+    # The generator itself runs at prepare time (_run_registered / _realize_population); compile time
+    # only proves the selected identifier is registered, mirroring Implementation's policy-identifier check.
+    generators = {}
+    for family, section in (('shifts', shifts), ('trips', trips)):
+        if section['generator'] != 'registered':
+            continue
+        identifier = section['implementation']
+        if identifier not in GENERATOR_REGISTRY[family]:
+            diag.error(f'activity.{family}.implementation',
+                       f'unknown {family} generator {identifier!r}; registered: {sorted(GENERATOR_REGISTRY[family])}')
+        else:
+            generators[family] = {'implementation': identifier, 'source_sha256': GENERATOR_SOURCES[family][identifier]}
+    if generators.get('trips') and not person_ids['rider']:
+        diag.warn('activity.trips', 'registered demand without riders produces no trips')
+    for role in ROLES:
+        gen = resolved['population'][f'{role}s']['generator']
+        if gen['kind'] != 'registered':
+            continue
+        identifier = gen['implementation']
+        if identifier not in GENERATOR_REGISTRY['population']:
+            diag.error(f'population.{role}s.generator.implementation',
+                       f'unknown population generator {identifier!r}; registered: {sorted(GENERATOR_REGISTRY["population"])}')
+        else:
+            generators[f'population.{role}'] = {'implementation': identifier, 'source_sha256': GENERATOR_SOURCES['population'][identifier]}
+            if resolved['population'][f'{role}s']['count'] == 0:
+                diag.warn(f'population.{role}s.generator', 'produces no people')
     diag.raise_errors()
     # Controlled inputs: identities, segment assignment, sampled trait draws and
     # schedules depend only on these sections and the seed, never on treatments.
     controls = {'world': resolved['world'], 'population': resolved['population'], 'activity': resolved['activity'],
                 'seed_derivation_version': SEED_DERIVATION_VERSION}
     fingerprints = {'definition': fingerprint(resolved), 'controls': fingerprint(controls),
-                    'implementation': implementation_fingerprint(implementations)}
+                    'implementation': implementation_fingerprint(implementations, generators)}
     fingerprints['plan'] = fingerprint([fingerprints['definition'], fingerprints['implementation'], COMPILER_VERSION])
     return Plan(resolved, provenance, tuple(diag.warnings), world, horizon, platforms, implementations, behavior,
-                segments, explicit_people, person_ids, checkpoints, tuple(interventions), fingerprints)
+                segments, explicit_people, person_ids, checkpoints, tuple(interventions), fingerprints, generators)
 
 
-def implementation_fingerprint(implementations):
+def implementation_fingerprint(implementations, generators=None):
+    """Selected policy implementations plus registered-generator identity and source hash, so a swapped
+    generator (or its source drifting since registration) changes `fingerprints['implementation']`/`['plan']`
+    exactly like a swapped policy does."""
     source_dir = Path(__file__).resolve().parent
     sources = {name: hashlib.sha256((source_dir / name).read_bytes()).hexdigest() for name in SOURCE_FILES}
-    return fingerprint({'sources': sources, 'implementations': implementations, 'compiler': COMPILER_VERSION})
+    return fingerprint({'sources': sources, 'implementations': implementations, 'generators': generators or {},
+                        'compiler': COMPILER_VERSION})
 
 
 def _compile_policy(definition, path, diag):
@@ -1254,6 +1473,74 @@ def _compile_policy(definition, path, diag):
     except (TypeError, ValueError) as error:
         diag.error(path, str(error))
         return None
+
+
+def _has_grid_point(lo, hi, step):
+    """Whether some multiple of `step` lies in the closed interval `[lo, hi]`."""
+    nearest = math.ceil(lo / step - 1e-9) * step
+    return nearest <= hi + 1e-9
+
+
+def _check_zones(world_def, diag):
+    """`world.zones`: max greater than min on both axes, a warning when a box extends beyond `map_km`,
+    and (grid sampling only) an error when either axis has no multiple of `grid_step_km` inside the box
+    -- `_sample_in_zone` draws each axis independently, so a missing grid point on either one would hang.
+
+    Overlapping zones are legal and are not diagnosed: sampling always picks
+    a zone first (`_pick_zone`), so overlap never double-counts a point --
+    a point on a shared edge simply belongs to both boxes under this closed-box test.
+    """
+    map_km, sampling, step = world_def['map_km'], world_def['sampling'], world_def['grid_step_km']
+    for zid, box in world_def['zones'].items():
+        path = f'world.zones.{zid}'
+        lo, hi = box['min'], box['max']
+        if hi[0] <= lo[0] or hi[1] <= lo[1]:
+            diag.error(path, f'a zone box needs max greater than min on both axes, got min={lo!r} max={hi!r}')
+            continue
+        if lo[0] < 0 or lo[1] < 0 or hi[0] > map_km[0] or hi[1] > map_km[1]:
+            diag.warn(path, 'extends beyond map_km; sampled points can fall outside the sampling extent')
+        if sampling == 'grid' and not all(_has_grid_point(lo[axis], hi[axis], step) for axis in (0, 1)):
+            diag.error(path, f'contains no grid point at grid_step_km={step}')
+
+
+def _merge_person(role, item, base):
+    """Merge one person declaration (an explicit person, or a registered population generator's
+    returned declaration) onto its named segment's resolved fields (`base`, or `{}` if it names none).
+
+    Access fields (apps/preferred_app/accounts/awareness/disclosed_to/registrations) are inherited
+    wholesale from `item` if it names them, else from `base`; the trait/evolution/initial_scores/activity
+    maps merge key-wise instead, so a person can override just one field of its segment's bundle.
+    Shared by `compile_scenario`'s explicit-person loop and `_realize_registered_population`, so segment
+    and generated people go through one implementation. Returns `(merged, missing)`; `missing` lists
+    which of ('apps', 'preferred_app') neither `item` nor `base` supplied -- required whenever there is
+    no segment (or an unresolved one) to supply them, which the caller reports with its own path.
+    """
+    merged = {key: value for key, value in base.items() if key not in ('weight', role, 'evolution', 'initial_scores', 'activity')}
+    merged.update({key: value for key, value in item.items() if key not in ('id', 'segment', role, 'evolution', 'initial_scores', 'activity')})
+    missing = [key for key in ('apps', 'preferred_app') if key not in merged]
+    for key in missing:
+        merged[key] = [] if key == 'apps' else ''
+    merged.setdefault('awareness', list(merged['apps']))
+    merged.setdefault('disclosed_to', [])
+    merged.setdefault('accounts', None)
+    if role == 'driver':
+        merged.setdefault('registrations', None)
+    merged[role] = {**base.get(role, {}), **item.get(role, {})}
+    merged['evolution'] = {**base.get('evolution', {}), **item.get('evolution', {})}
+    merged['initial_scores'] = {**base.get('initial_scores', {}), **item.get('initial_scores', {})}
+    merged['activity'] = {**base.get('activity', {}), **item.get('activity', {})}
+    return merged, missing
+
+
+def _launch_times(plan):
+    """Rebuild the compile-time `{platform_id: launched_at_seconds_or_None}` map from `plan` alone, for
+    `_check_access` calls made after compilation (a registered population generator's declarations;
+    `Inputs.explicit`'s people) -- no new `Plan` field needed."""
+    launched_at = {pid: (0 if item.launched else None) for pid, item in plan.platforms.items()}
+    for entry in plan.interventions:
+        if entry['kind'] == 'launch':
+            launched_at[entry['platform']] = entry['at_seconds']
+    return launched_at
 
 
 def _check_access(role, item, path, platforms, launched_at, behavior, diag, *, sampled):
@@ -1316,6 +1603,90 @@ def _check_explicit_windows(items, role, known_ids, path, diag, patience=None):
                 diag.warn(f"{path}.{current['id']}", f"within search patience of {previous['id']!r}; a live intent would fail the run")
 
 
+def _check_segment_activity(activity, path, zones, world_def, trips_generator, shifts_generator, diag):
+    """One segment's or explicit person's `activity` block: zone references, weight sums, `distance_km`
+    feasibility against `world.map_km`/`sampling`, and the two generator-mismatch warnings.
+
+    Called for every rider/driver segment and every explicit person (the
+    role split in `segment_fields` already restricts a driver's `activity`
+    to `start_zone` and a rider's to the other four keys, so most branches
+    below are no-ops for a driver's block).
+    """
+    origin, destination = activity.get('origin_zones'), activity.get('destination_zones')
+    distance, peaks = activity.get('distance_km'), activity.get('spatial_peaks')
+    start_zone = activity.get('start_zone')
+
+    def zone_ref(zid, subpath):
+        if zid not in zones:
+            diag.error(subpath, f'unknown zone {zid!r}; declared: {sorted(zones)}')
+
+    if origin is not None:
+        for zid in origin:
+            zone_ref(zid, f'{path}.origin_zones.{zid}')
+        if sum(origin.values()) <= 0:
+            diag.error(f'{path}.origin_zones', 'origin_zones weights must sum to a positive number')
+    if destination is not None:
+        if origin is None:
+            diag.error(f'{path}.destination_zones',
+                       'destination_zones requires origin_zones: the destination mix is conditional on the origin zone')
+        else:
+            for oz, weight in origin.items():
+                if weight > 0 and oz not in destination:
+                    diag.error(f'{path}.destination_zones', f'missing a row for origin zone {oz!r}')
+        for oz, row in destination.items():
+            zone_ref(oz, f'{path}.destination_zones.{oz}')
+            for dz in row:
+                zone_ref(dz, f'{path}.destination_zones.{oz}.{dz}')
+            if sum(row.values()) <= 0:
+                diag.error(f'{path}.destination_zones.{oz}', 'weights must sum to a positive number')
+        if distance is not None:
+            diag.error(path, 'declare either destination_zones or distance_km, not both')
+    if distance is not None:
+        (name, args), = distance.items()
+        if name == 'choice':
+            values = [v for v, _ in args]
+            numeric = [v for v in values if _is_number(v)]
+            if len(numeric) != len(values):
+                diag.error(f'{path}.distance_km', 'distance_km: choice values must be numbers')
+            lower, upper = (min(numeric), max(numeric)) if numeric else (None, None)
+        elif name == 'uniform':
+            lower, upper = args[0], args[1]
+        else:  # normal
+            lower, upper = args[2], args[3]
+        if lower is not None and lower <= 0:
+            diag.error(f'{path}.distance_km', 'distance_km must be strictly positive')
+        if upper is not None:
+            width, height = world_def['map_km']
+            half_diagonal = math.hypot(width, height) / 2
+            if upper > half_diagonal:
+                diag.error(f'{path}.distance_km', f'distance_km up to {upper:g} km cannot fit inside '
+                           f'map_km {width:g}x{height:g} from every origin')
+            elif upper > min(width, height):
+                diag.warn(f'{path}.distance_km', 'rejection sampling will discard most directions near the map centre')
+        if world_def['sampling'] == 'grid':
+            diag.warn(f'{path}.distance_km',
+                      'grid sampling snaps the destination to the grid, so the realized distance differs from the drawn one')
+    if peaks is not None:
+        if origin is None:
+            diag.error(f'{path}.spatial_peaks', 'spatial_peaks require origin_zones')
+        for item in peaks:
+            label = f"{path}.spatial_peaks.{item['id']}"
+            for zid in item['zones']:
+                zone_ref(zid, f'{label}.zones.{zid}')
+            if item['start_hour'] == item['end_hour']:
+                diag.error(label, 'peak hours must be distinct')
+            if not item['weekdays']:
+                diag.error(f'{label}.weekdays', 'a peak needs at least one weekday')
+            if not item['zones']:
+                diag.error(f'{label}.zones', 'a spatial peak needs at least one zone')
+    if start_zone is not None:
+        zone_ref(start_zone, f'{path}.start_zone')
+    if (origin is not None or destination is not None or distance is not None or peaks is not None) and trips_generator != 'weekly':
+        diag.warn(path, f'segment geometry applies to the weekly trip generator; activity.trips is {trips_generator!r}')
+    if start_zone is not None and shifts_generator != 'rotation':
+        diag.warn(path, f'start_zone applies to the rotation shift generator; activity.shifts is {shifts_generator!r}')
+
+
 def diff_plans(baseline, variant):
     """Semantic difference of two resolved definitions, leaf by leaf, keyed lists by ID."""
     before = dict(SCENARIO.leaves(baseline.resolved, ''))
@@ -1367,12 +1738,64 @@ class Inputs:
             raise ScenarioError('inputs: controlled schedules diverged despite equal controls')
         return shared
 
+    @classmethod
+    def explicit(cls, plan, seed=0, *, people=None, sessions=None):
+        """Throwaway fixture inputs on a compiled plan: explicit people and/or sessions, validated the
+        same way as a registered generator's output -- for a short script that wants to schedule a few
+        trips without authoring a definition (plan section 3.2's "direct Inputs construction").
+
+        `people` (default: the plan's own population) is a list of `person()`-shaped declarations, each
+        needing a `role` key; realized through the same schema-check -> `_merge_person` -> `_check_access`
+        -> `_realize_person` path as an explicit or registered-generator person, so it has the identical
+        shape and validation. `sessions` (default: the plan's own generated activity) is a list of
+        trip/shift dicts, each checked with `_check_session` against `people` (not `plan.person_ids`,
+        when `people` was supplied) then sorted and checked with `_check_realized_conflicts`, exactly
+        like a registered generator's output.
+
+        No new `Inputs` field: `to_dict()` and every snapshot's `inputs` blob keep their shape.
+        `reuse_for` already refuses inputs like these for any OTHER plan -- re-preparing that plan
+        yields ITS OWN generated people/sessions, which will not match what was supplied here, so
+        `reuse_for`'s existing "controlled schedules diverged despite equal controls" error fires.
+        There is no separate opt-out flag; that refusal is by design.
+        """
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ScenarioError('seed: must be an integer')
+        if people is None:
+            registered_activity = {}
+            realized_people = tuple(_realize_population(plan, seed, registered_activity))
+        else:
+            realized_people = tuple(_realize_explicit_people(plan, seed, people))
+            registered_activity = None
+        if sessions is None:
+            realized_sessions = tuple(_realize_activity(plan, seed, realized_people, registered_activity))
+        else:
+            if people is None:
+                known_ids = {'rider': set(plan.person_ids['rider']), 'driver': set(plan.person_ids['driver'])}
+            else:
+                known_ids = {role: {p['id'] for p in realized_people if p['role'] == role} for role in ROLES}
+            checked = []
+            for index, item in enumerate(sessions):
+                kind = item.get('kind') if isinstance(item, dict) else None
+                if kind not in ('trip', 'shift'):
+                    raise ScenarioError(f'sessions[{index}]: expected kind "trip" or "shift", got {kind!r}')
+                checked.append(_check_session(item, kind, known_ids, f'sessions[{index}]'))
+            checked.sort(key=lambda s: (s['at_seconds'], s['kind'] != 'shift', s['id']))
+            _check_realized_conflicts(checked, plan)
+            realized_sessions = tuple(checked)
+        digest = fingerprint({'controls': plan.fingerprints['controls'], 'seed': seed,
+                              'people': realized_people, 'sessions': realized_sessions})
+        return cls(plan, seed, realized_people, realized_sessions, digest)
+
 
 def prepare_inputs(plan, seed=0):
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ScenarioError('seed: must be an integer')
-    people = tuple(_realize_population(plan, seed))
-    sessions = tuple(_realize_activity(plan, seed, people))
+    # A registered population generator's people are not in plan.explicit_people and may have no
+    # segment, so _activity_index (compile-time sources only) cannot recover their activity; this
+    # dict, filled as _realize_population runs, is the third source _realize_activity overlays.
+    registered_activity = {}
+    people = tuple(_realize_population(plan, seed, registered_activity))
+    sessions = tuple(_realize_activity(plan, seed, people, registered_activity))
     digest = fingerprint({'controls': plan.fingerprints['controls'], 'seed': seed, 'people': people, 'sessions': sessions})
     return Inputs(plan, seed, people, sessions, digest)
 
@@ -1399,39 +1822,111 @@ def _sample(spec, rng):
     return rng.choices(values, weights=weights, k=1)[0]
 
 
-def _realize_population(plan, seed):
+def _realize_population(plan, seed, registered_activity=None):
+    """`registered_activity`, when given, is filled with `{person_id: activity}` for every
+    registered-population-generated person with a nonempty merged activity -- the only source that
+    knows it, since such a person is never in `plan.explicit_people` and may declare no segment at all.
+    """
     resolved = plan.resolved
     for role in ROLES:
         section = resolved['population'][f'{role}s']
-        rng = random.Random(derive_seed(seed, ['population', role]))
-        weights = {sid: item['weight'] for sid, item in plan.segments[role].items()}
-        assignment = _allocate(section['count'], weights, rng) if section['count'] else []
-        members = [{**plan.segments[role][sid], 'id': f'{role}-{index + 1}', 'segment': sid}
-                   for index, sid in enumerate(assignment)] + list(plan.explicit_people[role])
+        if section['generator']['kind'] == 'registered':
+            members = _realize_registered_population(role, section, plan, seed)
+            if registered_activity is not None:
+                for member in members:
+                    if member['activity']:
+                        registered_activity[member['id']] = member['activity']
+        else:
+            rng = random.Random(derive_seed(seed, ['population', role]))
+            weights = {sid: item['weight'] for sid, item in plan.segments[role].items()}
+            assignment = _allocate(section['count'], weights, rng) if section['count'] else []
+            members = [{**plan.segments[role][sid], 'id': f'{role}-{index + 1}', 'segment': sid}
+                       for index, sid in enumerate(assignment)] + list(plan.explicit_people[role])
         for member in members:
-            person_id = member['id']
-            traits = {}
-            for family in (role, 'evolution'):
-                values = {**plan.behavior[family], **member['traits'][family]}
-                for name, value in values.items():
-                    if isinstance(value, dict):
-                        values[name] = _sample(value, random.Random(derive_seed(seed, ['trait', role, person_id, family, name])))
-                try:
-                    traits[family] = plain(TRAITS[family](**values))
-                except (TypeError, ValueError) as error:
-                    raise ScenarioError(f'population.{role}s {person_id} {family}: {error}') from None
-            profile = {'apps': member['apps'], 'preferred_app': member['preferred_app'], 'accounts': member['accounts'],
-                       'registrations': member['registrations'] if role == 'driver' else member['accounts'],
-                       'awareness': member['awareness'], 'segment': member['segment'] if member['segment'] is not None else 'explicit',
-                       'disclosed_to': member['disclosed_to'],
-                       'rider': traits.get('rider', plan.behavior['rider']), 'driver': traits.get('driver', plan.behavior['driver']),
-                       'evolution': traits['evolution']}
-            profile = plain(_profile(profile))
-            record = {'role': role, 'id': person_id, 'segment': member['segment'], 'profile': profile,
-                      'initial_scores': dict(member['initial_scores'])}
-            if role == 'driver':
-                record['car'] = {'id': f'car-{person_id}', 'registrations': list(profile['registrations'])}
-            yield record
+            yield _realize_person(plan, role, member, seed)
+
+
+def _realize_person(plan, role, member, seed):
+    """One realized person record from a `member` dict shaped like `plan.segments[role][sid]` (plus
+    `id`/`segment`) for a segment-allocated person, or like `plan.explicit_people[role]`'s entries for
+    an explicit or registered-generator one -- the same trait sampling and profile assembly either way.
+    Traits are sampled once per person from declared distributions, seeded by identity so paired variants
+    that share a seed and controls reproduce the same draws.
+    """
+    person_id = member['id']
+    traits = {}
+    for family in (role, 'evolution'):
+        values = {**plan.behavior[family], **member['traits'][family]}
+        for name, value in values.items():
+            if isinstance(value, dict):
+                values[name] = _sample(value, random.Random(derive_seed(seed, ['trait', role, person_id, family, name])))
+        try:
+            traits[family] = plain(TRAITS[family](**values))
+        except (TypeError, ValueError) as error:
+            raise ScenarioError(f'population.{role}s {person_id} {family}: {error}') from None
+    profile = {'apps': member['apps'], 'preferred_app': member['preferred_app'], 'accounts': member['accounts'],
+               'registrations': member['registrations'] if role == 'driver' else member['accounts'],
+               'awareness': member['awareness'], 'segment': member['segment'] if member['segment'] is not None else 'explicit',
+               'disclosed_to': member['disclosed_to'],
+               'rider': traits.get('rider', plan.behavior['rider']), 'driver': traits.get('driver', plan.behavior['driver']),
+               'evolution': traits['evolution']}
+    profile = plain(_profile(profile))
+    record = {'role': role, 'id': person_id, 'segment': member['segment'], 'profile': profile,
+              'initial_scores': dict(member['initial_scores'])}
+    if role == 'driver':
+        record['car'] = {'id': f'car-{person_id}', 'registrations': list(profile['registrations'])}
+    return record
+
+
+def _realize_registered_population(role, section, plan, seed):
+    """One role's people from a registered population generator: `count` still fixes the identities
+    (`role-1..role-n`, plan section 3.2's "per-person callable" replacing segment allocation, not
+    identity); the generator supplies each counted id's declaration. This is why every compile-time
+    cross-check that already validated against `plan.person_ids` (explicit activity references,
+    preference interventions, `Inputs.reuse_for` controls) keeps working: the generator cannot invent
+    an identity the compiler never saw.
+
+    Each declaration is checked with the same partial `segment_fields(role, explicit=True)` schema an
+    explicit person uses, merged with its named segment (if any) through `_merge_person`, and validated
+    with the same `_check_access` -- so a generated person has the identical shape and validation as a
+    segment-allocated or explicit one, ready for `_realize_person`.
+    """
+    identifier = section['generator']['implementation']
+    implementation = generator_class('population', identifier)
+    expected = [f'{role}-{index}' for index in range(1, section['count'] + 1)]
+    rng = random.Random(derive_seed(seed, ['population', role, identifier]))
+    produced = implementation.generate(definition=copy.deepcopy(plan.resolved), role=role, person_ids=list(expected),
+                                       parameters=copy.deepcopy(section['generator']['parameters']), random=rng)
+    if not isinstance(produced, dict):
+        raise ScenarioError(f'population.{role}s.generator.{identifier}: generate() must return a '
+                            f'{{person_id: declaration}} mapping, got {produced!r}')
+    missing, unexpected = sorted(set(expected) - set(produced)), sorted(set(produced) - set(expected))
+    if missing or unexpected:
+        detail = '; '.join(filter(None, [f'missing {missing}' if missing else '', f'unexpected {unexpected}' if unexpected else '']))
+        raise ScenarioError(f'population.{role}s.generator.{identifier}: {detail}')
+    declaration_schema = Map(segment_fields(role, explicit=True), partial=True)
+    known_segments = plan.resolved['population'][f'{role}s']['segments']
+    launched_at = _launch_times(plan)
+    members = []
+    for person_id in expected:
+        path = f'population.{role}s.generator.{identifier}.{person_id}'
+        diag = Diagnostics()
+        checked = declaration_schema.check(produced[person_id], path, diag, complete=False)
+        segment_id = checked.get('segment') if isinstance(checked, dict) else None
+        base = {}
+        if segment_id is not None:
+            if segment_id not in known_segments:
+                diag.error(f'{path}.segment', f'unknown segment {segment_id!r}')
+            else:
+                base = known_segments[segment_id]
+        merged, missing_keys = _merge_person(role, checked if isinstance(checked, dict) else {}, base)
+        for key in missing_keys:
+            diag.error(f'{path}.{key}', 'required for a generated person without a segment')
+        access = _check_access(role, merged, path, plan.platforms, launched_at, plan.behavior, diag, sampled=False)
+        diag.raise_errors()
+        members.append({**access, 'id': person_id, 'segment': segment_id, 'initial_scores': merged['initial_scores'],
+                        'activity': merged['activity'], 'traits': {role: merged[role], 'evolution': merged['evolution']}})
+    return members
 
 
 def _profile(values):
@@ -1444,6 +1939,49 @@ def load_profile(values):
     return _profile(values)
 
 
+def _realize_explicit_people(plan, seed, people):
+    """`Inputs.explicit(people=...)`: realize a list of `person()`-shaped declarations, each needing a
+    `role` key (checked before the per-role schema, since it selects which schema and segment table
+    apply), through exactly the same schema-check -> `_merge_person` -> `_check_access` -> `_realize_person`
+    path as an explicit or registered-generator person. Ids must be unique within their role (matching
+    `plan.person_ids`' own per-role uniqueness -- a rider and a driver may share an id).
+    """
+    role_field = Scalar('string', choices=ROLES)
+    schemas = {role: Map(segment_fields(role, explicit=True), partial=True) for role in ROLES}
+    launched_at = _launch_times(plan)
+    seen = {role: set() for role in ROLES}
+    for index, item in enumerate(people):
+        label = f'people[{index}]'
+        if not isinstance(item, dict):
+            raise ScenarioError(f'{label}: expected a person mapping, got {item!r}')
+        diag = Diagnostics()
+        role = item.get('role')
+        role_field.check(role, f'{label}.role', diag, complete=True)
+        diag.raise_errors()
+        checked = schemas[role].check({key: value for key, value in item.items() if key != 'role'}, label, diag, complete=False)
+        identity = checked.get('id')
+        if not isinstance(identity, str) or not identity or '.' in identity:
+            diag.error(f'{label}.id', 'person ids must be nonempty strings without dots')
+        elif identity in seen[role]:
+            diag.error(f'{label}.id', f'duplicate {role} id {identity!r}')
+        base = {}
+        segment_id = checked.get('segment')
+        if segment_id is not None:
+            if segment_id not in plan.segments[role]:
+                diag.error(f'{label}.segment', f'unknown segment {segment_id!r}')
+            else:
+                base = plan.resolved['population'][f'{role}s']['segments'][segment_id]
+        merged, missing = _merge_person(role, checked, base)
+        for key in missing:
+            diag.error(f'{label}.{key}', 'required for an explicit person without a segment')
+        access = _check_access(role, merged, label, plan.platforms, launched_at, plan.behavior, diag, sampled=False)
+        diag.raise_errors()
+        seen[role].add(identity)
+        member = {**access, 'id': identity, 'segment': segment_id, 'initial_scores': merged['initial_scores'],
+                 'activity': merged['activity'], 'traits': {role: merged[role], 'evolution': merged['evolution']}}
+        yield _realize_person(plan, role, member, seed)
+
+
 def _sample_point(world, rng):
     width, height = world['map_km']
     if world['sampling'] == 'grid':
@@ -1452,10 +1990,238 @@ def _sample_point(world, rng):
     return [rng.uniform(0, width), rng.uniform(0, height)]
 
 
-def _realize_activity(plan, seed, people):
+# ----------------------------------------------------------------------
+# Segment/registered geometry: entered only when a rider or driver declares
+# `activity`; the map-wide `_sample_point` calls above are never touched by
+# any of this, which is how seed-0 stays byte-identical (see `_realize_activity`).
+# ----------------------------------------------------------------------
+
+_MAX_GEOMETRY_ATTEMPTS = 100
+
+
+def _activity_index(plan, people):
+    """`{person_id: activity}` for every realized person with a nonempty geometry declaration, from the
+    two compile-time sources: explicit people are looked up by id in `plan.explicit_people[role]`
+    (already merged with their named segment's `activity`, if any, in `compile_scenario`); segment-
+    allocated people are looked up by their assigned segment in `plan.segments[role]`. Built from `plan`
+    + `people`, never from a new key on the person records themselves (those flow verbatim into
+    snapshots and must not grow a key).
+
+    A registered-population person is neither: it is not in `plan.explicit_people`, and may declare no
+    segment at all, so `.get(record['segment'])` here safely yields nothing for one -- `_realize_activity`
+    overlays the third source (`registered_activity` from `_realize_population`) on top of this index.
+    """
+    explicit = {person['id']: person['activity'] for role in ROLES for person in plan.explicit_people[role]}
+    index = {}
+    for record in people:
+        pid = record['id']
+        if pid in explicit:
+            item = explicit[pid]
+        else:
+            item = (plan.segments[record['role']].get(record['segment']) or {}).get('activity')
+        if item:
+            index[pid] = item
+    return index
+
+
+def _clock_at(calendar, at_seconds):
+    """`(weekday, hour)` at `at_seconds` after the calendar origin -- the same integer hour-bucket
+    convention `_sample_times`/`_peak_weight` use for clock-hour peaks."""
+    clock = math.floor(calendar['hour'] + at_seconds / HOUR)
+    return int((calendar['weekday'] + clock // 24) % 7), clock % 24
+
+
+def _zone_box(zones, zone_id):
+    box = zones[zone_id]
+    return tuple(box['min']), tuple(box['max'])
+
+
+def _snap_to_grid(value, extent, step):
+    """Nearest multiple of `step` inside `[0, extent]`, clamped the same way `_sample_point`'s grid draw is."""
+    max_index = math.floor(extent / step + 1e-9)
+    return min(max(round(value / step), 0), max_index) * step
+
+
+def _sample_in_zone(world, box, rng):
+    """A point inside the closed `box`; 2 draws, mirroring `_sample_point`'s shape exactly.
+
+    Grid sampling draws uniformly among the multiples of `grid_step_km`
+    that lie in the box on each axis independently -- `_check_zones`
+    guarantees at least one exists per axis for every declared zone.
+    """
+    (x0, y0), (x1, y1) = box
+    if world['sampling'] == 'grid':
+        step = world['grid_step_km']
+        lo_x, hi_x = math.ceil(x0 / step - 1e-9), math.floor(x1 / step + 1e-9)
+        lo_y, hi_y = math.ceil(y0 / step - 1e-9), math.floor(y1 / step + 1e-9)
+        return [rng.randint(lo_x, hi_x) * step, rng.randint(lo_y, hi_y) * step]
+    return [rng.uniform(x0, x1), rng.uniform(y0, y1)]
+
+
+def _pick_zone(weights, rng):
+    """One zone id, drawn with `rng.choices` over ids sorted for determinism; `weights` maps id -> weight."""
+    names = sorted(weights)
+    return rng.choices(names, weights=[weights[name] for name in names], k=1)[0]
+
+
+def _origin_weights(activity, calendar, at_seconds):
+    """`origin_zones` weights at this instant: each baseline weight times the largest multiplier of every
+    `spatial_peaks` entry whose zones contain it and whose window contains `(weekday, hour)` -- `max`
+    mirrors `_peak_weight`'s aggregation of overlapping windows. `rng.choices` normalizes the result."""
+    weekday, hour = _clock_at(calendar, at_seconds)
+    weights = {}
+    for zone_id, base_weight in activity['origin_zones'].items():
+        multiplier = 1
+        for item in activity.get('spatial_peaks') or ():
+            if zone_id not in item['zones']:
+                continue
+            if item['start_hour'] < item['end_hour']:
+                inside = weekday in item['weekdays'] and item['start_hour'] <= hour < item['end_hour']
+            else:  # wraps past midnight into the next weekday, same convention as _peak_weight
+                inside = ((weekday in item['weekdays'] and hour >= item['start_hour'])
+                          or ((weekday - 1) % 7 in item['weekdays'] and hour < item['end_hour']))
+            if inside:
+                multiplier = max(multiplier, item['multiplier'])
+        weights[zone_id] = base_weight * multiplier
+    return weights
+
+
+def _sample_geometry(world, zones, activity, calendar, at_seconds, rng, context):
+    """One rider's origin/destination for a trip whose segment (or explicit person) declares `activity`.
+
+    Fixed draw order:
+    1. origin -- `origin_zones` declared: `_pick_zone(_origin_weights(...))` then `_sample_in_zone`;
+       otherwise the unchanged map-wide `_sample_point`.
+    2. destination, tried up to `_MAX_GEOMETRY_ATTEMPTS` times (steps 2 and 3 share this one budget):
+       `destination_zones` declared -> `_pick_zone(destination_zones[origin_zone])` then `_sample_in_zone`;
+       elif `distance_km` declared -> `d` is drawn once before the loop, then a fresh direction
+       `theta = rng.random() * 2 * math.pi` each attempt, accepting the first `origin + d*(cos, sin)`
+       inside `[0, map_km]` on both axes (grid sampling snaps each axis to the nearest grid point after
+       acceptance); else the unchanged map-wide `_sample_point`.
+    3. redraw (same rule, same budget) while the candidate equals the origin.
+    Exhausting the budget raises `ScenarioError` -- a deterministic failure, never an infinite loop.
+    """
+    origin_zones = activity.get('origin_zones')
+    if origin_zones is not None:
+        origin_zone = _pick_zone(_origin_weights(activity, calendar, at_seconds), rng)
+        origin = _sample_in_zone(world, _zone_box(zones, origin_zone), rng)
+    else:
+        origin_zone, origin = None, _sample_point(world, rng)
+    destination_zones, distance = activity.get('destination_zones'), activity.get('distance_km')
+    width, height = world['map_km']
+    d = _sample(distance, rng) if distance is not None else None
+    for _ in range(_MAX_GEOMETRY_ATTEMPTS):
+        if destination_zones is not None:
+            candidate = _sample_in_zone(world, _zone_box(zones, _pick_zone(destination_zones[origin_zone], rng)), rng)
+        elif d is not None:
+            theta = rng.random() * 2 * math.pi
+            x, y = origin[0] + d * math.cos(theta), origin[1] + d * math.sin(theta)
+            if not (0 <= x <= width and 0 <= y <= height):
+                continue
+            if world['sampling'] == 'grid':
+                step = world['grid_step_km']
+                x, y = _snap_to_grid(x, width, step), _snap_to_grid(y, height, step)
+            candidate = [x, y]
+        else:
+            candidate = _sample_point(world, rng)
+        if candidate != origin:
+            return origin, candidate
+    detail = f'{d:.3f} km' if d is not None else 'a destination different from the origin'
+    raise ScenarioError(f'activity.trips: no destination at {detail} fits inside map_km from {origin} for {context}')
+
+
+def _check_session(item, kind, known_ids, path):
+    """One realized session dict (trip or shift): exact key set, known person of the right role, finite
+    times, JSON-serializable coordinates. Used for every registered-generator session and every
+    `Inputs.explicit(sessions=...)` item, so downstream code (the sort and `_check_realized_conflicts`
+    at the end of `_realize_activity`, and `main.Simulation`'s scheduler payload) sees one uniform shape
+    regardless of where a session came from.
+
+    `known_ids` is `{'rider': set_of_ids, 'driver': set_of_ids}` -- `plan.person_ids` for a registered
+    generator, or the supplied people for `Inputs.explicit`.
+    """
+    if not isinstance(item, dict):
+        raise ScenarioError(f'{path}: expected a session mapping, got {item!r}')
+    role = 'rider' if kind == 'trip' else 'driver'
+    expected = ({'kind', 'id', 'rider', 'at_seconds', 'origin', 'destination'} if kind == 'trip'
+               else {'kind', 'id', 'driver', 'at_seconds', 'shift_seconds', 'location'})
+    if set(item) != expected:
+        raise ScenarioError(f'{path}: expected exactly the keys {sorted(expected)}, got {sorted(item)}')
+    if item.get('kind') != kind:
+        raise ScenarioError(f"{path}.kind: expected {kind!r}, got {item.get('kind')!r}")
+    identity = item['id']
+    if not isinstance(identity, str) or not identity or '.' in identity:
+        raise ScenarioError(f'{path}.id: session ids must be nonempty strings without dots')
+    person_id = item[role]
+    if person_id not in known_ids[role]:
+        raise ScenarioError(f'{path}.{role}: unknown {role} {person_id!r}')
+    at = item['at_seconds']
+    if not _is_number(at) or at < 0:
+        raise ScenarioError(f'{path}.at_seconds: must be a finite number >= 0, got {at!r}')
+
+    def point(key):
+        value = item[key]
+        if not isinstance(value, (list, tuple)) or len(value) != 2 or not all(_is_number(v) for v in value):
+            raise ScenarioError(f'{path}.{key}: expected an (x, y) pair of finite numbers, got {value!r}')
+        return [float(value[0]), float(value[1])]
+
+    if kind == 'trip':
+        result = {'kind': kind, 'id': identity, 'rider': person_id, 'at_seconds': at,
+                  'origin': point('origin'), 'destination': point('destination')}
+    else:
+        shift_seconds = item['shift_seconds']
+        if shift_seconds is not None and not (_is_number(shift_seconds) and shift_seconds > 0):
+            raise ScenarioError(f'{path}.shift_seconds: must be None or a finite positive number, got {shift_seconds!r}')
+        result = {'kind': kind, 'id': identity, 'driver': person_id, 'at_seconds': at,
+                  'shift_seconds': shift_seconds, 'location': point('location')}
+    try:
+        canonical(result)
+    except (TypeError, ValueError) as error:
+        raise ScenarioError(f'{path}: session is not JSON-serializable: {error}') from None
+    return result
+
+
+def _run_registered(family, section, plan, seed, people):
+    """Invoke a registered trips/shifts generator and validate every returned item with `_check_session`.
+
+    `definition`/`people` are deep copies so the generator cannot mutate the plan or the realized
+    population from here on; `random` is a seed-derived stream keyed by family and identity
+    (`derive_seed(seed, ['activity', family, identifier])`), distinct from every other stream, so
+    swapping the generator cannot silently reuse another generator's draws. Ids need only be unique
+    within this generator's own batch -- the same guarantee `explicit` items get from `Keyed.check`.
+    The produced sessions join the same list as the built-in generators, so the sort and
+    `_check_realized_conflicts` at the end of `_realize_activity` cover them unchanged.
+    """
+    identifier = section['implementation']
+    implementation = generator_class(family, identifier)
+    rng = random.Random(derive_seed(seed, ['activity', family, identifier]))
+    produced = implementation.generate(definition=copy.deepcopy(plan.resolved), people=copy.deepcopy(list(people)),
+                                       parameters=copy.deepcopy(section['parameters']), random=rng)
+    if not isinstance(produced, (list, tuple)):
+        raise ScenarioError(f'activity.{family}.registered.{identifier}: generate() must return a list of session dicts')
+    known_ids = {'rider': set(plan.person_ids['rider']), 'driver': set(plan.person_ids['driver'])}
+    kind = 'trip' if family == 'trips' else 'shift'
+    seen, sessions = set(), []
+    for index, item in enumerate(produced):
+        label = item.get('id') if isinstance(item, dict) else None
+        path = f"activity.{family}.registered.{identifier}.{label if isinstance(label, str) and label else index}"
+        checked = _check_session(item, kind, known_ids, path)
+        if checked['id'] in seen:
+            raise ScenarioError(f"{path}: duplicate session id {checked['id']!r}")
+        seen.add(checked['id'])
+        sessions.append(checked)
+    return sessions
+
+
+def _realize_activity(plan, seed, people, registered_activity=None):
     world, activity = plan.resolved['world'], plan.resolved['activity']
     drivers = [p['id'] for p in people if p['role'] == 'driver']
     riders = [p['id'] for p in people if p['role'] == 'rider']
+    # {person_id: activity} for anyone who declared geometry; empty for everyone else, which is how
+    # the branches below fall through to the literally unchanged _sample_point lines on the default path.
+    geometry = _activity_index(plan, people)
+    if registered_activity:
+        geometry.update(registered_activity)
     sessions = []
     shifts = activity['shifts']
     rng = random.Random(derive_seed(seed, ['activity', 'shifts']))
@@ -1466,14 +2232,19 @@ def _realize_activity(plan, seed, people):
                 start = (shifts['first_start_hours'] + day * 24 + (index % shifts['crews']) * shifts['shift_hours']) * HOUR
                 if start > plan.horizon_seconds:
                     continue
+                start_zone = (geometry.get(driver_id) or {}).get('start_zone')
+                location = (_sample_point(world, rng) if start_zone is None
+                           else _sample_in_zone(world, _zone_box(world['zones'], start_zone), rng))
                 sessions.append({'kind': 'shift', 'id': f'shift-{driver_id}-{day + 1}', 'driver': driver_id,
                                  'at_seconds': start, 'shift_seconds': shifts['shift_hours'] * HOUR,
-                                 'location': _sample_point(world, rng)})
+                                 'location': location})
     elif shifts['generator'] == 'explicit':
         for item in shifts['items']:
             sessions.append({'kind': 'shift', 'id': item['id'], 'driver': item['driver'], 'at_seconds': item['at_hours'] * HOUR,
                              'shift_seconds': None if item['hours'] is None else item['hours'] * HOUR,
                              'location': list(item['location'])})
+    elif shifts['generator'] == 'registered':
+        sessions.extend(_run_registered('shifts', shifts, plan, seed, people))
     trips = activity['trips']
     rng = random.Random(derive_seed(seed, ['activity', 'trips']))
     if trips['generator'] == 'weekly' and riders:
@@ -1482,16 +2253,24 @@ def _realize_activity(plan, seed, people):
         times = _sample_times(count, duration, trips, world['calendar'], rng)
         for index, at in enumerate(times):
             rider_id = riders[index % len(riders)] if trips['assignment'] == 'round_robin' else rng.choice(riders)
-            origin = _sample_point(world, rng)
-            destination = _sample_point(world, rng)
-            while destination == origin:
+            trip_id = f'trip-{index + 1}'
+            activity_for_rider = geometry.get(rider_id)
+            if not activity_for_rider:
+                origin = _sample_point(world, rng)          # unchanged lines, unchanged draw order
                 destination = _sample_point(world, rng)
-            sessions.append({'kind': 'trip', 'id': f'trip-{index + 1}', 'rider': rider_id, 'at_seconds': at,
+                while destination == origin:
+                    destination = _sample_point(world, rng)
+            else:
+                origin, destination = _sample_geometry(world, world['zones'], activity_for_rider, world['calendar'],
+                                                        at, rng, f'{rider_id} ({trip_id})')
+            sessions.append({'kind': 'trip', 'id': trip_id, 'rider': rider_id, 'at_seconds': at,
                              'origin': origin, 'destination': destination})
     elif trips['generator'] == 'explicit':
         for item in trips['items']:
             sessions.append({'kind': 'trip', 'id': item['id'], 'rider': item['rider'], 'at_seconds': item['at_hours'] * HOUR,
                              'origin': list(item['origin']), 'destination': list(item['destination'])})
+    elif trips['generator'] == 'registered':
+        sessions.extend(_run_registered('trips', trips, plan, seed, people))
     sessions.sort(key=lambda s: (s['at_seconds'], s['kind'] != 'shift', s['id']))
     _check_realized_conflicts(sessions, plan)
     return sessions
