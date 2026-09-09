@@ -16,14 +16,37 @@ Other existing parameters (fares, delays, shift length) are taken as given and
 misbehave in the obvious way if nonsensical; the engine's World rejects a
 nonpositive speed.
 
-Realism implemented:
-- Baselines: 55% session-to-order with supply, 70% offer acceptance at reference conditions.
-- Seeded decisions respond to fare and pickup ETA. Riders prefer cheaper fares,
-  drivers prefer higher fares; both prefer shorter pickup ETA.
-- Rejection tries the next eligible driver, separately from offer expiration.
-- Rebu offers to drivers with a free own order slot, including one still
-  serving a Rebu ride, and estimates that pickup from its known remaining service.
-- The three-platform-week@1 preset adds weekday commute peaks and Friday/
-  Saturday nights through 03:00 the next day, with rotating eight-hour crews.
-- Reports expose observed conversion and acceptance, arrival counts, pending
-  outcomes, and the parameters used. These are synthetic assumptions, not calibration data.
+Authoring restrictions added in phase 1 (`scenario.py`):
+- `notes` values must be nonempty strings (`Table(Scalar('string'))`); a
+  scenario without one fails `Scenario.load` on old saved definitions --
+  add `"notes": {}` to migrate.
+- `rule().when` keys must be in `marketplace_policy.VISIBLE_FIELDS`
+  (currently `segment`, `new_user`, `completed_rides`, `role`); an empty
+  `when` or an unrecognized field is rejected at authoring time, before
+  `compile_scenario`.
+- `market-blank@1` has no platforms and no population segments; it must be
+  given at least one platform (`platform()`/`with_changes`) before
+  `compile_scenario` succeeds.
+
+Multi-platform realism, current as of phase 1 (see the linked architecture
+docs for the normative contract):
+- Baselines: roughly 55% session-to-order with supply, 70% offer acceptance
+  at reference conditions, per platform.
+- Seeded decisions respond to fare and pickup ETA. Riders prefer cheaper
+  fares and shorter pickup ETA; drivers prefer higher payout and shorter
+  private pickup delay. Both use a fixed outside/reservation option.
+- A platform offers to any driver with a free local commitment slot,
+  including one still serving that platform's own ride, and estimates
+  pickup from its own known remaining service -- never a competitor's.
+  Two platforms' offers to the same driver are never compared jointly
+  ([behavior-policy.md](plans/architecture/behavior-policy.md)).
+- Rejection or expiry tries the next eligible driver, distinct dispositions
+  for each ([marketplace-engine.md](plans/architecture/marketplace-engine.md)).
+- The `three-platform-week@1` preset adds weekday commute peaks and
+  Friday/Saturday nights through 03:00 the next day, with rotating
+  eight-hour crews; `market-blank@1` (phase 1) carries none of that and
+  starts with no platforms, for scripts that build their own market.
+- `metrics.py` reports observed conversion, acceptance, arrivals and
+  pending outcomes by default; `--platform-detail`, `--windows` and
+  `--first-choice-days` (phase 1) add per-platform and per-window detail.
+  These are synthetic assumptions, not calibration data.

@@ -1,4 +1,13 @@
-"""Offline metric reconstruction, aggregation and summary from a single raw run log."""
+"""Offline metric reconstruction, aggregation and summary from a single raw run log.
+
+The default output's `summary` (and `summary.settlements` in particular) is
+global: totals across every platform, with bonus already folded into
+`driver_payout_minor` rather than broken out separately. Per-platform money,
+cancellations by party, driver km splits, ETA-drift cancellations and a
+platform funnel are opt-in through `--platform-detail` (see
+platform_funnel, money_by_platform, cancellations_by_party, driver_distance
+and eta_drift below), not reconstructed by hand from the snapshot.
+"""
 
 import argparse
 import json
@@ -321,13 +330,543 @@ def aggregate_market_share(completed, platforms, start_seconds, end_seconds, per
     return rows
 
 
-def calculate_metrics(path, interval_minutes=None, *, market_share_days=None):
+# ----------------------------------------------------------------------
+# Phase 1: opt-in per-platform, per-window and per-check metrics. Every
+# function below is additive: none is called unless a caller asks for it,
+# so calculate_metrics(path) with no extra arguments is unaffected. Each
+# reuses the "new in this run" / _new_terminal cohort rules above so a
+# continuation and a fresh run agree; see plans/architecture/experiment-
+# runner.md for the shared definitions (window boundaries, leg-start
+# attribution, first-choice, installed base, ETA drift).
+# ----------------------------------------------------------------------
+
+def _settlement_row(orders, settlements):
+    """One money row: gross/discount, base/bonus and the settlement's own three fields, summed.
+
+    Only a completed_ride settlement's own rider_payment_minor/
+    driver_payout_minor are themselves derived from the order's frozen quote
+    fare and the accepted offer's frozen payout terms
+    (marketplace_engine._drop_off calls _settle with order.fare.
+    rider_payment_minor and order.assignment.payout.driver_payout_minor), so
+    only there do rider_gross_minor/rider_discount_minor and
+    driver_base_minor/driver_bonus_minor decompose those same frozen terms --
+    it is exactly what the settlement paid, not an estimate of it. Any other
+    reason (today: cancellation_fee) settles an amount the frozen terms do
+    not describe at all: a canceled order's fare was never charged and its
+    assignment's payout, if it has one, was never earned. That row instead
+    reports what actually moved: driver_base_minor is the settlement's own
+    driver_payout_minor (bonus 0 -- a cancellation has no bonus concept) and
+    rider_gross_minor is the settlement's own rider_payment_minor (discount
+    0), the same fallback an order with no assignment at all always used.
+    rider_payment_minor, driver_payout_minor and platform_contribution_minor
+    are always the settlement's own three fields (never re-derived), so
+    residual_minor (rider_payment - driver_payout - platform_contribution) is
+    exactly 0 by construction of Settlement; it is reported here, not
+    assumed. This split is a per-settlement identity -- driver_base_minor +
+    driver_bonus_minor always equals driver_payout_minor and
+    rider_gross_minor - rider_discount_minor always equals
+    rider_payment_minor, for every settlement and therefore for any sum of
+    rows -- and conservation() checks it.
+    """
+    rider_gross = rider_discount = driver_base = driver_bonus = 0
+    rider_payment = driver_payout = platform_contribution = 0
+    for s in settlements:
+        order = orders[s["order_id"]]
+        assignment = order["assignment"]
+        if s["reason"] == "completed_ride" and assignment is not None:
+            rider_gross += order["fare"]["gross_minor"]
+            rider_discount += order["fare"]["discount_minor"]
+            driver_base += assignment["payout"]["payout_minor"]
+            driver_bonus += assignment["payout"]["bonus_minor"]
+        else:
+            rider_gross += s["rider_payment_minor"]
+            driver_base += s["driver_payout_minor"]
+        rider_payment += s["rider_payment_minor"]
+        driver_payout += s["driver_payout_minor"]
+        platform_contribution += s["platform_contribution_minor"]
+    return {"count": len(settlements), "rider_gross_minor": rider_gross, "rider_discount_minor": rider_discount,
+            "rider_payment_minor": rider_payment, "driver_base_minor": driver_base, "driver_bonus_minor": driver_bonus,
+            "driver_payout_minor": driver_payout, "platform_contribution_minor": platform_contribution,
+            "residual_minor": rider_payment - driver_payout - platform_contribution}
+
+
+def _settlement_rows(orders, settlements):
+    """settlement_breakdown's shape (by_reason/totals/transfers) for one settlement list."""
+    reasons = sorted({s["reason"] for s in settlements})
+    by_reason = {reason: _settlement_row(orders, [s for s in settlements if s["reason"] == reason]) for reason in reasons}
+    return {"by_reason": by_reason, "totals": _settlement_row(orders, settlements),
+            "transfers": {"count": 0, "by_reason": {}, "party_delta_minor": 0}}
+
+
+def _new_settlements(before, after):
+    return [s for identity, s in after["settlements"].items() if identity not in before["settlements"]]
+
+
+def settlement_breakdown(initial, final):
+    """Settlement money split into base/bonus/discount by reason, plus the phase-3 transfers shape.
+
+    Uses settlements new in this run (the same cohort as the global summary).
+    transfers is a placeholder: plans/scenario-readiness-plan.md section 4.A
+    (phase 3) adds the Transfer record and populates it; no Transfer exists
+    yet, so its counters stay at zero here regardless of the run.
+    """
+    before, after = _tables(initial), _tables(final)
+    return _settlement_rows(after["orders"], _new_settlements(before, after))
+
+
+def money_by_platform(initial, final):
+    """settlement_breakdown's structure, keyed by platform_id.
+
+    Every platform in the final snapshot is present, even with zero
+    settlements in this run, matching aggregate_market_share's convention
+    that platforms with no rides remain in every row. Summing any of the
+    three settlement totals over every platform reproduces the same global
+    sum computed directly from all new settlements (conservation() checks
+    this).
+    """
+    before, after = _tables(initial), _tables(final)
+    by_platform = {p["id"]: [] for p in final["engine"]["platforms"]}
+    for s in _new_settlements(before, after):
+        by_platform.setdefault(s["platform_id"], []).append(s)
+    return {platform_id: _settlement_rows(after["orders"], rows) for platform_id, rows in by_platform.items()}
+
+
+def _blank_funnel_counts():
+    return {"quotes": 0, "quotes_with_supply": 0, "orders": 0, "offers": 0,
+            "accepted_offers": 0, "rejected_offers": 0, "expired_offers": 0, "canceled_offers": 0,
+            "failed_offers": 0, "pending_offers": 0, "completed": 0, "canceled": 0}
+
+
+def _funnel_rows(platforms, quotes, orders, offers, completed, canceled):
+    """Flow counts per platform from already-cohorted record lists, plus their ratios.
+
+    Each list is pre-filtered by its caller (the whole run, or one window);
+    offers and their disposition are counted together by the offer's own
+    creation, so a later acceptance is attributed back to the offer's own
+    row and offer_acceptance_pct never drifts past 100% the way it would if
+    disposition followed its own resolution time instead.
+    """
+    rows = {pid: _blank_funnel_counts() for pid in platforms}
+    for quote in quotes:
+        row = rows.setdefault(quote["platform_id"], _blank_funnel_counts())
+        row["quotes"] += 1
+        row["quotes_with_supply"] += int(quote["eta_seconds"] is not None)
+    for order in orders:
+        rows.setdefault(order["platform_id"], _blank_funnel_counts())["orders"] += 1
+    for offer in offers:
+        row = rows.setdefault(offer["platform_id"], _blank_funnel_counts())
+        row["offers"] += 1
+        row[OFFER_OUTCOME_KEYS[offer["state"]]] += 1
+    for order in completed:
+        rows.setdefault(order["platform_id"], _blank_funnel_counts())["completed"] += 1
+    for order in canceled:
+        rows.setdefault(order["platform_id"], _blank_funnel_counts())["canceled"] += 1
+    for row in rows.values():
+        row["offer_acceptance_pct"] = 100 * row["accepted_offers"] / row["offers"] if row["offers"] else None
+        row["order_completion_pct"] = 100 * row["completed"] / row["orders"] if row["orders"] else None
+    return rows
+
+
+def platform_funnel(initial, final):
+    """Per-platform funnel from quotes through completion or cancellation.
+
+    Quotes, orders and offers use the "new in this run" cohort; completed
+    and canceled use _new_terminal, so an order carried in from a previous
+    run segment still counts its transition here. active_at_end counts
+    every order of this platform not yet terminal at the final boundary,
+    including carry-in orders -- unlike the flow counts above it is a
+    snapshot, not an event count, so it cannot be reconstructed per window
+    (window_rows omits it). Ratios are null when their denominator is zero.
+    """
+    before, after = _tables(initial), _tables(final)
+    platforms = [p["id"] for p in final["engine"]["platforms"]]
+    new_quotes = [q for identity, q in after["quotes"].items() if identity not in before["quotes"]]
+    new_orders = [o for identity, o in after["orders"].items() if identity not in before["orders"]]
+    new_offers = [of for identity, of in after["offers"].items() if identity not in before["offers"]]
+    rows = _funnel_rows(platforms, new_quotes, new_orders, new_offers,
+                        _new_terminal(before, after, "completed"), _new_terminal(before, after, "canceled"))
+    active = {pid: 0 for pid in platforms}
+    for order in after["orders"].values():
+        if order["state"] not in ("completed", "canceled"):
+            active[order["platform_id"]] = active.get(order["platform_id"], 0) + 1
+    for pid, row in rows.items():
+        row["active_at_end"] = active.get(pid, 0)
+    return rows
+
+
+def cancellations_by_party(initial, final):
+    """Canceled orders in this run, by platform and the party who canceled, with reasons.
+
+    Uses _new_terminal(..., "canceled"), the same cohort as the global
+    cancelled_orders count, so a carried-in order that cancels during this
+    run counts here. by_reason further splits each platform's cancellations
+    by the cancellation policy's stated reason string.
+    """
+    before, after = _tables(initial), _tables(final)
+    rows = {p["id"]: {"rider": 0, "driver": 0, "platform": 0, "by_reason": {}} for p in final["engine"]["platforms"]}
+    for order in _new_terminal(before, after, "canceled"):
+        row = rows.setdefault(order["platform_id"], {"rider": 0, "driver": 0, "platform": 0, "by_reason": {}})
+        by, reason = order["cancellation"]["by"], order["cancellation"]["reason"]
+        row[by] += 1
+        row["by_reason"][reason] = row["by_reason"].get(reason, 0) + 1
+    return rows
+
+
+def driver_distance(initial, final):
+    """Empty (pickup) and loaded (transport) kilometres per driver, from service legs.
+
+    A leg is attributed to the run segment where it first appears -- cohorted
+    by identity (service_id, its index in that service's own legs list), the
+    same "new in this run" rule collect_metric_records and every other
+    function in this module use, not by testing its started_at against the
+    segment's clock bounds. A service's legs list is append-only
+    (marketplace_engine.py never pops or reorders it) and a leg's started_at
+    is always the clock at the instant it was appended, so a snapshot
+    boundary can land exactly on a leg's own started_at (Snapshot() is an
+    event-boundary checkpoint, so this is an ordinary case, not a contrived
+    one): a filter inclusive on both ends would then count that one leg
+    twice, once in the segment that produced it and again in the next,
+    restored one. Cohorting by identity instead means a leg is counted
+    exactly once no matter where a snapshot falls, which is what makes a
+    continuous run and a restored continuation agree byte-for-byte on driver
+    distance (see plans/architecture/experiment-runner.md). Reposition legs
+    do not exist yet (plan phase 6, marketplace-engine.md) and would land in
+    other_km; boarding legs have zero length and add nothing to any bucket.
+    loaded_km equals summary.completed_distance_km whenever every transport
+    leg in the run belongs to a completed order (true exactly when
+    orders_active_at_end is 0). loaded_share_pct is null for a driver (or the
+    fleet) with no logged distance at all.
+    """
+    end = final["scheduler"]["clock_seconds"]
+    before_services = {s["id"]: s for s in initial["engine"]["services"]}
+    by_driver = {d["id"]: {"empty": [], "loaded": [], "other": []} for d in final["engine"]["drivers"]}
+    for service in final["engine"]["services"]:
+        bucket = by_driver.setdefault(service["driver_id"], {"empty": [], "loaded": [], "other": []})
+        already = len(before_services[service["id"]]["legs"]) if service["id"] in before_services else 0
+        for index, leg in enumerate(service["legs"]):
+            if index < already or leg["started_at"] > end:
+                continue
+            distance = math.dist(leg["origin"], leg["destination"])
+            key = "empty" if leg["kind"] == "pickup" else "loaded" if leg["kind"] == "transport" else "other"
+            bucket[key].append(distance)
+
+    def _row(bucket):
+        empty_km, loaded_km, other_km = math.fsum(bucket["empty"]), math.fsum(bucket["loaded"]), math.fsum(bucket["other"])
+        total_km = empty_km + loaded_km + other_km
+        return {"empty_km": empty_km, "loaded_km": loaded_km, "other_km": other_km, "total_km": total_km,
+                "loaded_share_pct": 100 * loaded_km / total_km if total_km else None}
+
+    result = {driver_id: _row(bucket) for driver_id, bucket in by_driver.items()}
+    result["totals"] = _row({"empty": [v for b in by_driver.values() for v in b["empty"]],
+                             "loaded": [v for b in by_driver.values() for v in b["loaded"]],
+                             "other": [v for b in by_driver.values() for v in b["other"]]})
+    return result
+
+
+def _blank_eta_totals():
+    return {"canceled": 0, "drift_defined": 0, "drift_positive": 0, "drift_seconds_total": 0.0,
+            "drift_seconds_min": None, "drift_seconds_max": None, "drift_seconds_avg": None}
+
+
+def _blank_eta_row():
+    return {**_blank_eta_totals(), "revisions": 0, "by_party": {}}
+
+
+def eta_drift(initial, final):
+    """ETA-drift cancellations: how long past the first promised pickup a cancellation landed.
+
+    promised_arrival is the quote-time prediction: eta_predictions[0] (always
+    present and always the quote's own estimate, appended in place_order) is
+    p0, and promised_arrival = p0["at"] + p0["eta_seconds"]. An ETA-drift
+    cancellation is one whose drift (the cancellation instant minus
+    promised_arrival) is positive: the platform ran later than first quoted.
+    drift stays undefined (excluded from the drift_* statistics, but still
+    counted in "canceled") when the platform had no supply at quote time
+    (eta_seconds is None) or, defensively, eta_predictions is empty.
+    revisions counts eta_predictions entries appended by revise_pickup_eta
+    (source == "revision") that are new in this run, for every order of the
+    platform, whether or not it was later canceled; it is reported only by
+    platform, not split by party. Cohorted the same way driver_distance
+    cohorts legs: eta_predictions is append-only, so comparing each order's
+    own list length in `initial` against `final` and counting only the
+    entries beyond what was already there identifies exactly the entries new
+    to this run, without testing each entry's own timestamp against the
+    run's clock bounds -- a boundary inclusive on both ends would double
+    count a revision recorded in the same instant a snapshot was taken, the
+    same way it would double count a leg in driver_distance.
+    """
+    before, after = _tables(initial), _tables(final)
+    end = final["scheduler"]["clock_seconds"]
+    rows = {p["id"]: _blank_eta_row() for p in final["engine"]["platforms"]}
+    for identity, order in after["orders"].items():
+        row = rows.setdefault(order["platform_id"], _blank_eta_row())
+        already = len(before["orders"][identity]["eta_predictions"]) if identity in before["orders"] else 0
+        row["revisions"] += sum(1 for p in order["eta_predictions"][already:]
+                                if p["source"] == "revision" and p["at"] <= end)
+    for order in _new_terminal(before, after, "canceled"):
+        row = rows.setdefault(order["platform_id"], _blank_eta_row())
+        party = order["cancellation"]["by"]
+        party_row = row["by_party"].setdefault(party, _blank_eta_totals())
+        row["canceled"] += 1
+        party_row["canceled"] += 1
+        predictions = order["eta_predictions"]
+        p0 = predictions[0] if predictions else None
+        if p0 is not None and p0["eta_seconds"] is not None:
+            drift = order["timeline"]["canceled"] - (p0["at"] + p0["eta_seconds"])
+            for target in (row, party_row):
+                target["drift_defined"] += 1
+                target["drift_positive"] += int(drift > 0)
+                target["drift_seconds_total"] += drift
+                target["drift_seconds_min"] = drift if target["drift_seconds_min"] is None else min(target["drift_seconds_min"], drift)
+                target["drift_seconds_max"] = drift if target["drift_seconds_max"] is None else max(target["drift_seconds_max"], drift)
+    for row in rows.values():
+        row["drift_seconds_avg"] = row["drift_seconds_total"] / row["drift_defined"] if row["drift_defined"] else None
+        for party_row in row["by_party"].values():
+            party_row["drift_seconds_avg"] = (party_row["drift_seconds_total"] / party_row["drift_defined"]
+                                              if party_row["drift_defined"] else None)
+    return rows
+
+
+def _window_bounds(start, end, boundary_hours):
+    if (boundary_hours is None or isinstance(boundary_hours, (str, bytes)) or not hasattr(boundary_hours, "__iter__")):
+        raise ValueError("window boundaries must be a nonempty sequence of hour offsets")
+    boundary_hours = list(boundary_hours)
+    if not boundary_hours or any(isinstance(h, bool) or not isinstance(h, (int, float))
+                                 or not math.isfinite(h) or h <= 0 for h in boundary_hours):
+        raise ValueError("window boundaries must be finite positive numbers")
+    if any(a >= b for a, b in zip(boundary_hours, boundary_hours[1:])):
+        raise ValueError("window boundaries must be strictly increasing")
+    edges = [min(end, start + hours * 3600) for hours in boundary_hours]
+    return [start] + edges + [end]
+
+
+def _window_detail(orders, platforms, quotes, orders_list, offers, completed, canceled, settlements,
+                   left, right, *, inclusive_right):
+    def _select(records, key):
+        return [r for r in records if left <= key(r) <= right] if inclusive_right \
+            else [r for r in records if left <= key(r) < right]
+
+    funnel = _funnel_rows(platforms, _select(quotes, lambda q: q["at"]), _select(orders_list, lambda o: o["created_at"]),
+                          _select(offers, lambda of: of["created_at"]),
+                          _select(completed, lambda o: o["timeline"]["completed"]),
+                          _select(canceled, lambda o: o["timeline"]["canceled"]))
+    by_platform = {pid: [] for pid in platforms}
+    for s in _select(settlements, lambda s: s["at"]):
+        by_platform.setdefault(s["platform_id"], []).append(s)
+    return {pid: {"money": _settlement_rows(orders, rows), "funnel": funnel[pid]} for pid, rows in by_platform.items()}
+
+
+def window_rows(header, initial, final, boundary_hours):
+    """Consecutive windows of the run split at hour offsets from its own start, plus running totals.
+
+    boundary_hours are finite, strictly increasing hour offsets from this
+    run's own start (not calendar hours); N boundaries make N+1 windows, all
+    half-open except the last, which includes the run's end, matching
+    aggregate_intervals. A boundary past the run's end clips to the end, so
+    asking for a wider window than a short run safely reports an empty
+    trailing window instead of failing. Each row's "platforms" holds that
+    window's own money (settlement_breakdown's shape) and funnel per
+    platform; settlements bucket by their own at, completions by
+    timeline.completed and cancellations by timeline.canceled (their own
+    event time), while quotes/orders/offers -- and offer dispositions --
+    bucket by their own creation time (see _funnel_rows). "cumulative" is
+    the same shape computed from the run's start through this window's
+    right edge, so the last window's cumulative equals the whole run's
+    totals (window boundaries are hours after start, see calculate_metrics
+    and the README).
+    """
+    before, after = _tables(initial), _tables(final)
+    start, end = initial["scheduler"]["clock_seconds"], final["scheduler"]["clock_seconds"]
+    bounds = _window_bounds(start, end, boundary_hours)
+    platforms = [p["id"] for p in final["engine"]["platforms"]]
+    quotes = [q for identity, q in after["quotes"].items() if identity not in before["quotes"]]
+    orders_list = [o for identity, o in after["orders"].items() if identity not in before["orders"]]
+    offers = [of for identity, of in after["offers"].items() if identity not in before["offers"]]
+    completed = _new_terminal(before, after, "completed")
+    canceled = _new_terminal(before, after, "canceled")
+    settlements = _new_settlements(before, after)
+    rows = []
+    for index in range(len(bounds) - 1):
+        left, right = bounds[index], bounds[index + 1]
+        last = index == len(bounds) - 2
+        rows.append({
+            "start_seconds": left, "end_seconds": right,
+            "start_hours": (left - start) / 3600, "end_hours": (right - start) / 3600,
+            "clock_start": clock_label(header["start_hour"] * 3600 + left),
+            "clock_end": clock_label(header["start_hour"] * 3600 + right),
+            "platforms": _window_detail(after["orders"], platforms, quotes, orders_list, offers, completed,
+                                        canceled, settlements, left, right, inclusive_right=last),
+            "cumulative": _window_detail(after["orders"], platforms, quotes, orders_list, offers, completed,
+                                         canceled, settlements, start, right, inclusive_right=True),
+        })
+    return rows
+
+
+def first_choice_periods(header, initial, final, period_days):
+    """Daily (or period_days-wide) first-choice query share against each period's installed base.
+
+    "First choice" is the platform of a rider's earliest quote (ordered by
+    (at, id)) among intents created in this run; drivers never query, so
+    this is rider-side only. An intent with no quote at all (no supply
+    observation was even attempted) contributes to no period. Each quote
+    lands in exactly one period -- the half-open interval containing its
+    `at`, except the last period, which also includes the run's own end --
+    the same single-assignment bucket rule aggregate_market_share uses for
+    completions, so a quote landing exactly on a period boundary is never
+    counted in both the period it closes and the one it opens; queries and
+    sum(first_choice_counts.values()) always agree. "Installed
+    base" at a period's start is the initial snapshot's engine.riders[*].apps,
+    replayed forward with every policies.observations app_installed record
+    (role == "rider") at or before that instant -- app installs are
+    cumulative and idempotent per rider (a set), so replaying an install
+    from before this run segment began is harmless. A rider can multi-home,
+    so installed_share_pct is a share of total installs and can sum above
+    100% within a period; that is expected, not an error (see
+    plans/architecture/experiment-runner.md).
+    """
+    if isinstance(period_days, bool) or not isinstance(period_days, int) or period_days <= 0:
+        raise ValueError("first_choice_days must be a positive integer")
+    before, after = _tables(initial), _tables(final)
+    start, end = initial["scheduler"]["clock_seconds"], final["scheduler"]["clock_seconds"]
+    width = period_days * 86400
+    platforms = [p["id"] for p in final["engine"]["platforms"]]
+    apps = {r["id"]: set(r["apps"]) for r in initial["engine"]["riders"]}
+    installs = sorted((o for o in final["policies"]["observations"]
+                       if o["type"] == "app_installed" and o["role"] == "rider"), key=lambda o: o["at_seconds"])
+    first_choice = []
+    for identity, intent in after["intents"].items():
+        if identity in before["intents"] or not intent["quote_ids"]:
+            continue
+        earliest = min(intent["quote_ids"], key=lambda q: (after["quotes"][q]["at"], q))
+        quote = after["quotes"][earliest]
+        first_choice.append((quote["at"], quote["platform_id"]))
+    rows, cursor = [], 0
+    for index in range(max(1, math.ceil((end - start) / width))):
+        left = start + index * width
+        right = min(end, start + (index + 1) * width)
+        while cursor < len(installs) and installs[cursor]["at_seconds"] <= left:
+            apps.setdefault(installs[cursor]["person_id"], set()).add(installs[cursor]["platform_id"])
+            cursor += 1
+        installed_riders = {p: sum(p in a for a in apps.values()) for p in platforms}
+        total_installed = sum(installed_riders.values())
+        rows.append({
+            "start_seconds": left, "end_seconds": right,
+            "clock_start": clock_label(header["start_hour"] * 3600 + left),
+            "clock_end": clock_label(header["start_hour"] * 3600 + right),
+            "queries": 0, "first_choice_counts": {p: 0 for p in platforms},
+            "first_choice_share_pct": {p: None for p in platforms},
+            "installed_riders": installed_riders,
+            "installed_share_pct": {p: 100 * n / total_installed if total_installed else None
+                                    for p, n in installed_riders.items()},
+        })
+    # Single-assignment bucketing (aggregate_market_share's rule): each quote
+    # lands in exactly one row, so a boundary instant is never double counted.
+    for at, platform_id in first_choice:
+        if start <= at <= end:
+            index = min(len(rows) - 1, int((at - start) // width))
+            rows[index]["first_choice_counts"][platform_id] += 1
+            rows[index]["queries"] += 1
+    for row in rows:
+        queries = row["queries"]
+        row["first_choice_share_pct"] = {p: 100 * n / queries if queries else None
+                                         for p, n in row["first_choice_counts"].items()}
+    return rows
+
+
+def conservation(initial, final):
+    """Order and money conservation identities: the residuals every --check script starts from.
+
+    orders_balanced is (orders active at this run's start + orders_created)
+    == (completed + canceled + active_at_end); completed/canceled use
+    _new_terminal so a carried-in order's transition during this run still
+    counts. settlement_residual_minor sums rider_payment - driver_payout -
+    platform_contribution over every settlement new in this run; it is
+    exactly 0 by construction of Settlement (reported, not assumed).
+    platform_money_matches_totals confirms that summing money_by_platform's
+    per-platform totals reproduces the same three sums computed directly
+    from every new settlement, so a bucketing bug cannot hide inside a
+    per-platform split. settlement_split_reconciles checks the per-row
+    identity _settlement_row's docstring promises -- base+bonus equals that
+    row's own driver_payout_minor, and gross-discount equals its own
+    rider_payment_minor -- on every settlement_breakdown row (each reason and
+    the total), so a future change to the base/bonus/gross/discount split
+    cannot silently stop reconciling with the money the settlements actually
+    moved.
+    """
+    before, after = _tables(initial), _tables(final)
+    new_orders = [o for identity, o in after["orders"].items() if identity not in before["orders"]]
+    completed = _new_terminal(before, after, "completed")
+    canceled = _new_terminal(before, after, "canceled")
+    active_at_start = sum(1 for o in before["orders"].values() if o["state"] not in ("completed", "canceled"))
+    active_at_end = sum(1 for o in after["orders"].values() if o["state"] not in ("completed", "canceled"))
+    new_settlements = _new_settlements(before, after)
+    money_keys = ("rider_payment_minor", "driver_payout_minor", "platform_contribution_minor")
+    global_totals = {key: sum(s[key] for s in new_settlements) for key in money_keys}
+    platform_totals = {key: sum(row["totals"][key] for row in money_by_platform(initial, final).values())
+                       for key in money_keys}
+    breakdown = settlement_breakdown(initial, final)
+    split_rows = list(breakdown["by_reason"].values()) + [breakdown["totals"]]
+    return {
+        "orders_created": len(new_orders), "completed": len(completed), "canceled": len(canceled),
+        "active_at_end": active_at_end,
+        "orders_balanced": active_at_start + len(new_orders) == len(completed) + len(canceled) + active_at_end,
+        "settlement_residual_minor": sum(s["rider_payment_minor"] - s["driver_payout_minor"] - s["platform_contribution_minor"]
+                                         for s in new_settlements),
+        "platform_money_matches_totals": platform_totals == global_totals,
+        "settlement_split_reconciles": all(
+            row["driver_base_minor"] + row["driver_bonus_minor"] == row["driver_payout_minor"]
+            and row["rider_gross_minor"] - row["rider_discount_minor"] == row["rider_payment_minor"]
+            for row in split_rows),
+    }
+
+
+CHECK_STATES = ("PASS", "FAIL", "NOT-EVALUABLE")
+
+
+class Checks:
+    """Observable-check verdicts for one scenario script: pass, fail, or not evaluable with a reason.
+
+    Every scenario script under scenarios/reviews/ builds one from its own
+    evaluate(), records one verdict per check in DESCRIPTION.md's Observable
+    Checks list, prints them with report(), and exits with its return code.
+    NOT-EVALUABLE is never a failure -- it names the reason and the owning
+    phase, so a script is honest about today's limits instead of fabricating
+    a verdict. The line format is fixed so PR evidence stays diffable:
+    "PASS  s1.1 payout ratio — 42/42 completed orders equal round_half_up((1-c)*gross)".
+    """
+
+    def __init__(self, scenario):
+        self.scenario = scenario
+        self._rows = []
+
+    def verdict(self, name, passed, detail=""):
+        self._rows.append((name, "PASS" if passed else "FAIL", detail))
+
+    def not_evaluable(self, name, reason):
+        self._rows.append((name, "NOT-EVALUABLE", reason))
+
+    def report(self):
+        for name, state, detail in self._rows:
+            print(f"{state}  {name}" + (f" — {detail}" if detail else ""))
+        return 1 if any(state == "FAIL" for _, state, _ in self._rows) else 0
+
+
+def calculate_metrics(path, interval_minutes=None, *, market_share_days=None,
+                      windows=None, platform_detail=False, first_choice_days=None):
     """Calculate the full run summary and optional intervals from one saved log.
 
     Uses only the standard library and raw values in the log. No current model
     defaults, engine objects, reporting files, or other run artifacts are needed.
     The input is never modified. All timestamps are simulated seconds; exact
     settlement totals are retained in integer minor units.
+
+    With no extra arguments the return value is exactly what it always was.
+    Three independent opt-in sections add offline detail without touching it:
+    ``windows`` (an hour-boundary sequence, see window_rows) adds "windows"
+    and "window_boundary_hours"; ``platform_detail=True`` adds
+    "platform_detail" with per-platform money, funnel, cancellations, driver
+    km, ETA drift, the settlement breakdown and the conservation identities;
+    ``first_choice_days`` adds "first_choice_days" and "first_choice_periods".
     """
     header, initial, final, footer = load_run(path)
     start, end = initial["scheduler"]["clock_seconds"], final["scheduler"]["clock_seconds"]
@@ -397,7 +936,36 @@ def calculate_metrics(path, interval_minutes=None, *, market_share_days=None):
         result["market_share_days"] = market_share_days
         result["market_share_periods"] = aggregate_market_share(
             completed, platform_completions, start, end, market_share_days)
+    if windows is not None:
+        result["window_boundary_hours"] = list(windows)
+        result["windows"] = window_rows(header, initial, final, windows)
+    if platform_detail:
+        result["platform_detail"] = {
+            "money": money_by_platform(initial, final),
+            "funnel": platform_funnel(initial, final),
+            "cancellations": cancellations_by_party(initial, final),
+            "driver_distance": driver_distance(initial, final),
+            "eta_drift": eta_drift(initial, final),
+            "settlement_breakdown": settlement_breakdown(initial, final),
+            "conservation": conservation(initial, final),
+        }
+    if first_choice_days is not None:
+        result["first_choice_days"] = first_choice_days
+        result["first_choice_periods"] = first_choice_periods(header, initial, final, first_choice_days)
     return result
+
+
+def _hours_list(text):
+    """argparse type= for --windows: a comma-separated, strictly increasing list of positive hours."""
+    try:
+        values = [float(part) for part in text.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid window boundaries: {text!r}; expected comma-separated hours") from None
+    if not values or any(not math.isfinite(v) or v <= 0 for v in values):
+        raise argparse.ArgumentTypeError("window boundaries must be finite positive numbers")
+    if any(a >= b for a, b in zip(values, values[1:])):
+        raise argparse.ArgumentTypeError("window boundaries must be strictly increasing")
+    return values
 
 
 def main():
@@ -407,9 +975,17 @@ def main():
                         help="Include interval metrics; omitted by default")
     parser.add_argument("--market-share-days", type=int,
                         help="Include platform completion shares in periods of this many days")
+    parser.add_argument("--windows", type=_hours_list, metavar="H1,H2,...",
+                        help="Include money/funnel windows split at these hour offsets from run start; omitted by default")
+    parser.add_argument("--platform-detail", action="store_true",
+                        help="Include per-platform money, funnel, cancellations, driver km, ETA drift and conservation")
+    parser.add_argument("--first-choice-days", type=int,
+                        help="Include first-choice query share against installed base in periods of this many days")
     args = parser.parse_args()
     try:
-        result = calculate_metrics(args.log, args.interval_minutes, market_share_days=args.market_share_days)
+        result = calculate_metrics(args.log, args.interval_minutes, market_share_days=args.market_share_days,
+                                   windows=args.windows, platform_detail=args.platform_detail,
+                                   first_choice_days=args.first_choice_days)
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.exit(2, f"Cannot analyze log: {error}\n")
     print(json.dumps(result, indent=2, allow_nan=False))

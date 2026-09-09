@@ -149,6 +149,68 @@ ownership at arbitrary window starts. Keep calculations in `metrics.py`; future
 exports or visualizations must consume its results instead of reimplementing
 metric formulas.
 
+### Phase-1 metric families (`metrics.py`)
+
+These offline, opt-in families (`--windows`/`--platform-detail`/
+`--first-choice-days`) define the semantics any later exporter or report must
+reuse rather than recompute:
+
+- **Window boundaries** are hour offsets from the run's own start (not
+  calendar hours), producing consecutive half-open windows plus a final
+  inclusive one, matching `aggregate_intervals`'s own boundary rule; each
+  window also carries a `cumulative` total in the same shape, from run start
+  through that window's right edge.
+- **Leg-start km attribution**: a service leg (`pickup` = empty km,
+  `transport` = loaded km) is attributed whole to the run segment containing
+  its own `started_at`. This is the rule that makes a continuous run and a
+  restored continuation agree byte-for-byte on driver distance -- a leg is
+  never split across a snapshot boundary. Because a snapshot is an
+  event-boundary checkpoint, a leg's own `started_at` can land exactly on it
+  (the segment that produced the leg ends there, and a restored continuation
+  begins there); `driver_distance`/`eta_drift` implement the rule by
+  cohorting legs and ETA revisions by identity -- new in `final` versus
+  `initial`, the same rule every other function in this module uses -- not by
+  testing each one's own timestamp against the segment's clock bounds, so
+  that boundary instant is never double counted.
+- **First choice** is the platform of a rider's *earliest* quote (ordered by
+  `(at, id)`) among intents created in the run; drivers never query, so this
+  is rider-side only. Each quote is assigned to exactly one daily (or
+  `period_days`-wide) period -- the same half-open, last-inclusive bucket
+  rule as window boundaries above and `aggregate_market_share`'s completion
+  periods -- so a quote landing exactly on a period boundary is counted once,
+  not in both the period it closes and the one it opens.
+- **Installed base** at a period's start is the initial snapshot's
+  `engine.riders[*].apps`, replayed forward with every `app_installed`
+  observation (role `rider`) at or before that instant. Riders multi-home, so
+  installed shares can sum past 100% within a period; that is expected, not a
+  bug to normalize away.
+- **ETA drift** on a canceled order is `timeline.canceled - (p0.at +
+  p0.eta_seconds)`, where `p0` is the order's first (quote-time)
+  `eta_predictions` entry; it is `null` when the platform had no supply at
+  quote time. A positive drift means the platform ran later than first
+  promised.
+- **Transfers**: `settlement_breakdown`'s `transfers` block is always
+  `{"count": 0, "by_reason": {}, "party_delta_minor": 0}` today -- a
+  documented placeholder for the `Transfer` record phase 3 (section 4.A of
+  the [readiness plan](../scenario-readiness-plan.md)) adds and populates,
+  not a claim that a transfer mechanism exists yet.
+- **Settlement split**: `settlement_breakdown`/`money_by_platform` decompose
+  a settlement into `driver_base_minor`/`driver_bonus_minor` and
+  `rider_gross_minor`/`rider_discount_minor` from the order's frozen quote
+  fare and the accepted offer's frozen payout terms only for a
+  `completed_ride` settlement, because only there are those frozen terms
+  what the settlement actually paid (`rider_payment_minor` and
+  `driver_payout_minor` are themselves defined from them). Any other reason
+  (today: `cancellation_fee`) settles an amount those frozen terms do not
+  describe, so its row instead reports what actually moved:
+  `driver_base_minor` equals the settlement's own `driver_payout_minor`
+  (`driver_bonus_minor` 0) and `rider_gross_minor` equals its own
+  `rider_payment_minor` (`rider_discount_minor` 0). This makes
+  `driver_base_minor + driver_bonus_minor == driver_payout_minor` and
+  `rider_gross_minor - rider_discount_minor == rider_payment_minor` a
+  per-settlement identity for every reason, which `conservation()`'s
+  `settlement_split_reconciles` checks on every `settlement_breakdown` row.
+
 ## Comparison and interpretation
 
 For each metric, retain raw numerator/denominator or event data and the value

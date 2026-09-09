@@ -101,6 +101,25 @@ parameter types, permitted observations, typed outputs, lifecycle hooks and
 versioned JSON memory fields. Snapshots preserve the selected built-in versions
 and platform-local completion memory.
 
+**Not in this release**: zone- or time-window surge rules (a scenario can only
+approximate a zone with a map-wide `policy_change`, as the review scenarios
+under `scenarios/reviews/` do); a driver-side pass-through surcharge distinct
+from the tariff; first-N or budgeted campaign redemption (a campaign discounts
+every eligible ride in its window, not just a rider's first few); driver
+earnings guarantees or top-ups; driver cancellation penalties or platform-side
+dispatch lockouts; platform or driver cash balances and any ledger `Transfer`;
+and service areas (a platform cannot refuse a query or a candidate by
+location). Plan sections 4.A-4.C name the phases that add each of these.
+
+The fare binds at quote time and the commission at offer/acceptance time
+(both frozen into the order/assignment, per "Pricing, incentives, and
+commitments" below); nothing later reprices either. A policy cannot refuse to
+quote today: `quote()` always returns a `QuoteProposal`, even when
+`candidates()` finds no eligible driver (`eta_seconds` is then `None`) or when
+a scenario would want to reject a query outside a service area — that refusal
+is part of the not-yet-implemented service-area mechanism above, not a
+capability of `quote()` itself.
+
 ## Policy responsibilities
 
 | Policy family | Inputs available to the platform | Result |

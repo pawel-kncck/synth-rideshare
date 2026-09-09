@@ -21,7 +21,7 @@ from pathlib import Path
 
 from behavior_policy import DriverTraits, EvolutionTraits, PersonProfile, RiderTraits
 from marketplace_engine import World
-from marketplace_policy import MarketplaceParameters, PlatformPolicy
+from marketplace_policy import MarketplaceParameters, PlatformPolicy, VISIBLE_FIELDS
 from policy_contracts import plain
 from policy_runtime import BUILTIN_IMPLEMENTATIONS, POLICY_REGISTRY, policy_class
 
@@ -512,6 +512,7 @@ SCENARIO = Map({
     'schema_version': Scalar('integer', choices=(SCHEMA_VERSION,)),
     'preset': Scalar('string', nullable=True),
     'calibration': Scalar('string'),
+    'notes': Table(Scalar('string')),
     'world': Map({
         'speed_kmh': Scalar('number', positive=True), 'boarding_seconds': Scalar('number', minimum=0),
         'minor_units_per_major': Scalar('integer', minimum=1), 'map_km': Point(positive=True),
@@ -557,7 +558,24 @@ def campaign(id, *, start_hours, end_hours, discount_minor=0, discount_fraction=
 
 
 def rule(id, *, priority, when, parameters):
-    return _build(RULE, {'id': id, 'priority': priority, 'when': dict(when), 'parameters': dict(parameters)}, f'rule {id}')
+    """A conditional policy override, validated against today's VISIBLE_FIELDS at authoring time.
+
+    `ConditionalRule.__post_init__` enforces the same two conditions at
+    `compile_scenario` time; checking them here surfaces the offending
+    field names immediately instead of after a full scenario resolves. The
+    visible-field set is `marketplace_policy.VISIBLE_FIELDS`; plan section
+    4.H adds zone and window keys to it in a later phase, so `rule()` reads
+    the set rather than duplicating it -- today it is exactly VISIBLE_FIELDS.
+    """
+    checked = _build(RULE, {'id': id, 'priority': priority, 'when': dict(when), 'parameters': dict(parameters)}, f'rule {id}')
+    unknown = sorted(set(checked['when']) - VISIBLE_FIELDS)
+    if not checked['when'] or unknown:
+        raise ScenarioError(f'rule {id}.when: conditions must use declared platform-visible fields '
+                            f'{sorted(VISIBLE_FIELDS)}' + (f'; got {unknown}' if unknown else '; got none'))
+    unknown = sorted(set(checked['parameters']) - {f.name for f in fields(MarketplaceParameters)})
+    if unknown:
+        raise ScenarioError(f'rule {id}.parameters: unknown policy parameter(s) {unknown}')
+    return checked
 
 
 def peak(id, *, weekdays, start_hour, end_hour, multiplier):
@@ -665,7 +683,7 @@ def _segments_v1(role):
 
 def _base_v1(name, *, horizon_hours, calendar):
     return {
-        'name': name, 'schema_version': SCHEMA_VERSION, 'preset': None, 'calibration': 'synthetic',
+        'name': name, 'schema_version': SCHEMA_VERSION, 'preset': None, 'calibration': 'synthetic', 'notes': {},
         'world': {'speed_kmh': 30, 'boarding_seconds': 30, 'minor_units_per_major': 100, 'map_km': [10, 10],
                   'sampling': 'grid', 'grid_step_km': 1, 'calendar': dict(calendar), 'horizon_hours': horizon_hours},
         'platforms': {app: _platform_v1() for app in ALL_APPS},
@@ -706,9 +724,30 @@ def _three_platform_week_v1():
     return base
 
 
+def _market_blank_v1():
+    """World and behavior defaults with no platforms and no segments: the base for authored markets.
+
+    Everything in `_base_v1` besides platforms/segments is inherited
+    unchanged: world, behavior implementations and defaults, `activity` off
+    (`shifts`/`trips` generators are `none`), evolution off, no
+    interventions, empty notes. `compile_scenario` on the bare preset raises
+    `platforms: at least one platform is required` -- that is the intended
+    authoring-time error (see README.md and scenario-definition.md), and the
+    empty segments tables are exactly what let `platform()`/`two_platform()`
+    and a `with_changes({"platforms": ...})` merge in a whole market without
+    first removing the three-platform preset's four named segments per role.
+    """
+    base = _base_v1('market-blank', horizon_hours=24, calendar={'weekday': 0, 'hour': 0})
+    base['platforms'] = {}
+    for role in ('riders', 'drivers'):
+        base['population'][role]['segments'] = {}
+    return base
+
+
 PRESETS = {
     'three-platform-day@1': _three_platform_day_v1,
     'three-platform-week@1': _three_platform_week_v1,
+    'market-blank@1': _market_blank_v1,
 }
 
 
@@ -718,6 +757,39 @@ def preset_definition(identifier):
     definition = PRESETS[identifier]()
     definition['preset'] = identifier
     return definition
+
+
+def platform(id, *, launched=True, version='modern-v1', rules=(), campaigns=(), fallback='default',
+            controller=None, **parameters):
+    """One complete platform entry keyed by its ID: ``{id: <PLATFORM entry>}``.
+
+    Unnamed keyword parameters override `MARKETPLACE_DEFAULTS_V1`; every
+    other tariff/dispatch parameter keeps its published default. Combine
+    entries with the ``|`` dict operator and set them in one change, e.g.
+    ``.with_changes({"platforms": platform("alpha", commission_fraction=.2)
+    | platform("beta", commission_fraction=.1)})`` -- ``platforms`` is a
+    `Table`, so this merges into (or replaces named entries in) whatever
+    platforms the base scenario already has; starting from `market-blank@1`
+    (no platforms) the result is exactly the platforms named here.
+
+    Validation is immediate and at authoring time: an empty or dotted `id`
+    is rejected the same way a `Table` key would be; an unknown or
+    misspelled parameter name is rejected with the exact path (for example
+    ``platform alpha.policy.parameters.comission_fraction``); `controller`
+    must be `None` or `{"interval_hours": ..., "until_hours": ...}`.
+    `compile_scenario` still re-validates cross-field combinations one
+    platform cannot see alone, such as `max_local_commitments > 2`.
+    """
+    diag = Diagnostics()
+    if not isinstance(id, str) or not id or '.' in id:
+        diag.error('platform', 'IDs must be nonempty strings without dots')
+    entry = {'launched': launched, 'controller': controller,
+             'policy': {'implementation': BUILTIN_IMPLEMENTATIONS['marketplace'], 'version': version,
+                        'parameters': {**MARKETPLACE_DEFAULTS_V1, **parameters},
+                        'rules': list(rules), 'campaigns': list(campaigns), 'fallback': fallback}}
+    checked = PLATFORM.check(entry, f'platform {id}', diag, complete=True)
+    diag.raise_errors()
+    return {id: checked}
 
 
 # ----------------------------------------------------------------------
@@ -812,6 +884,39 @@ class Scenario:
     def to_dict(self):
         return {'preset': self.preset, 'definition': self.definition, 'name': self.name,
                 'changes': [{'op': op, 'path': path, 'value': value} for op, path, value in self.changes]}
+
+
+def two_platform(first, second, *, name=None, riders=0, drivers=0, horizon_hours=24, shared=None,
+                 first_parameters=None, second_parameters=None):
+    """A ready duopoly on `market-blank@1`: two launched platforms and one multi-homing segment per role.
+
+    ``shared`` parameters (a plain dict) apply to both platforms;
+    ``first_parameters``/``second_parameters`` further override just that
+    one platform on top of ``shared``. Every generated rider and driver
+    installs both apps with active accounts and prefers ``first`` (the
+    ``both-apps`` segment, weight 1) -- a script that needs lopsided access
+    or several segments still replaces or extends
+    ``population.<role>.segments`` itself; this only removes the setup that
+    is identical across every two-platform script. Returns a `Scenario`
+    (not yet compiled), so callers keep chaining `.with_changes(...)` /
+    `.add(...)`. Replaces, per script, roughly the preset choice, the
+    eight-line segment-removal loop and two platform/segment blocks that
+    `scenarios/*.py` still writes by hand.
+    """
+    if first == second:
+        raise ScenarioError('two_platform: platform ids must be distinct')
+    shared = shared or {}
+    platforms = (platform(first, **{**shared, **(first_parameters or {})})
+                | platform(second, **{**shared, **(second_parameters or {})}))
+    return Scenario(preset='market-blank@1', name=name).with_changes({
+        'world.horizon_hours': horizon_hours,
+        'population.riders.count': riders, 'population.drivers.count': drivers,
+        'platforms': platforms,
+        'population.riders.segments': {
+            'both-apps': segment(weight=1, apps=(first, second), preferred_app=first)},
+        'population.drivers.segments': {
+            'both-apps': segment(weight=1, apps=(first, second), preferred_app=first, driver={})},
+    })
 
 
 def _navigate(root, path):
@@ -910,9 +1015,15 @@ class Plan:
     def calendar(self):
         return dict(self.resolved['world']['calendar'])
 
+    @property
+    def notes(self):
+        """The free-form authoring notes: {id: text}, never part of the controls fingerprint."""
+        return copy.deepcopy(self.resolved['notes'])
+
     def manifest(self):
         """Everything needed to reconstruct and identify this plan without today's defaults."""
         return {'name': self.name, 'preset': self.resolved['preset'], 'calibration': self.resolved['calibration'],
+                'notes': copy.deepcopy(self.resolved['notes']),
                 'schema_version': SCHEMA_VERSION, 'compiler_version': COMPILER_VERSION,
                 'seed_derivation_version': SEED_DERIVATION_VERSION, 'horizon_seconds': self.horizon_seconds,
                 'fingerprints': dict(self.fingerprints), 'implementations': copy.deepcopy(self.implementations),

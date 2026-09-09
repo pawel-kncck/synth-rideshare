@@ -16,3 +16,17 @@ A reviewer should select a folder, follow its README, and write `ANALYSIS-{MODEL
 8. [Mid-Trip Regulatory Price Cap and Contract Immutability (Difficult)](08-regulatory-price-cap/README.md)
 9. [Cross-App Exploitation of Guaranteed Hourly Driver Earnings (Difficult)](09-guaranteed-hourly-earnings/README.md)
 10. [Three-Way Platform War with Endogenous Solvency and Driver Vehicle Debt (Difficult)](10-platform-solvency-and-driver-debt/README.md)
+
+## Runnable scripts and units
+
+`scenarios/reviews/sNN_<slug>.py` (repository root, one per folder above)
+builds each scenario's market with today's simulator and runs its
+`DESCRIPTION.md` "Observable Checks" through `--check`; see the top-level
+[README](../README.md#scenarios) for the CLI and `../plans/scenario-
+readiness-plan.md` for the consolidated plan these scripts and their `notes`
+cite. A platform's DESCRIPTION.md name (e.g. "Platform Alpha") maps to a
+free-string id each script chooses itself (e.g. `"alpha"`) -- platform ids
+are never required to be `rebu`/`blot`/`flyt`. Wherever a review says "unit"
+or "coordinate unit" it means one kilometre; money is integer minor units
+(`minor_units_per_major = 100`, so 100 minor = $1.00); `t` is hours after the
+scenario's calendar origin, as in `at_hours=`.

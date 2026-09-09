@@ -252,7 +252,7 @@ class Simulation:
 
     def _on_trip_start(self, event):
         self.engine.begin_intent(event.payload['rider'], tuple(event.payload['origin']),
-                                 tuple(event.payload['destination']))
+                                 tuple(event.payload['destination']), source_id=event.payload['id'])
 
 
 if __name__ == '__main__':

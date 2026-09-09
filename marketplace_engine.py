@@ -241,6 +241,7 @@ class TripIntent:
     ended_at: Optional[float] = None
     outcome: Optional[str] = None  # completed or abandoned
     reason: Optional[str] = None
+    source_id: Optional[str] = None  # the scenario session that started this intent, if any
 
     @property
     def live(self):
@@ -843,15 +844,19 @@ class MarketplaceEngine:
     # Trip intents, quotes, and orders
     # ----------------------------------------------------------------------
 
-    def begin_intent(self, rider_id, origin, destination):
+    def begin_intent(self, rider_id, origin, destination, source_id=None):
+        """source_id is scenario metadata (which session started this intent), not a rider observation:
+        it is not disclosed in the intent_started notification."""
         rider = self._rider(rider_id)
         origin, destination = point(origin, "Origin"), point(destination, "Destination")
+        if not (source_id is None or (isinstance(source_id, str) and source_id)):
+            raise CommandRejected("source_id must be a nonempty string or None")
         if rider.intent_id is not None:
             raise CommandRejected(f"Rider {rider_id!r} already has a live trip intent")
         if rider.service_id is not None:
             raise CommandRejected(f"Rider {rider_id!r} is onboard a ride")
         with self._transition():
-            intent = TripIntent(self._next_id("intent"), rider_id, origin, destination, self.now)
+            intent = TripIntent(self._next_id("intent"), rider_id, origin, destination, self.now, source_id=source_id)
             self.intents[intent.id] = intent
             rider.intent_id = intent.id
             rider.location = origin
@@ -1387,10 +1392,11 @@ def _shift(item):
 
 
 def _intent(item):
+    # .get, not [...]: a snapshot taken before source_id existed still restores, with source_id None.
     return TripIntent(item["id"], item["rider_id"], tuple(item["origin"]), tuple(item["destination"]),
                       item["created_at"], list(item["quote_ids"]), list(item["order_ids"]),
                       item["live_order_id"], item["converted_at"], item["ended_at"],
-                      item["outcome"], item["reason"])
+                      item["outcome"], item["reason"], item.get("source_id"))
 
 
 def _quote(item):

@@ -48,7 +48,7 @@ occupancy legality does not change with them.
 | `Driver` | Installed apps, open apps, car binding, current shift, ordered accepted commitments, and current physical service. |
 | `Car` | Registrations, the controlling driver, and one `Motion` (origin, destination, start, arrival) resolving position at any time. |
 | `Shift` | A driver's physical presence: start, exit request, and actual end. |
-| `TripIntent` | One rider's desired trip across platform attempts: quotes, orders, once-only conversion time, and terminal outcome. |
+| `TripIntent` | One rider's desired trip across platform attempts: quotes, orders, once-only conversion time, terminal outcome, and the originating scenario session id (`source_id`, optional). |
 | `Quote` | A platform's frozen `FareTerms` (gross, discount, in minor units), estimated distance/duration, and its pickup ETA estimate or `None`. |
 | `Order` | Owning platform, intent, bound fare terms, `open`/`assigned`/`completed`/`canceled` state, `Assignment`, offer ids, service id, timeline, cancellation, settlements. |
 | `Offer` | One proposal to one driver: frozen `PayoutTerms`, displayed ETA, deadline, and exactly one disposition. |
@@ -60,6 +60,18 @@ serializes: `snapshot()` and `MarketplaceEngine.restore(snapshot, registry)`
 rebuild every table and counter. Taken with the scheduler's own snapshot at
 the same event boundary, a restored market continues identically, including
 an occupied ride with a queued order and outstanding competitor offers.
+
+`TripIntent.source_id` is the id of the scenario session (`main.Simulation
+._on_trip_start` passes the exogenous `trip.start` payload's own `id`) that
+started the intent, or `None` when one is begun some other way. It is
+scenario metadata for offline lookup (e.g. finding "the order for trip-42"
+in a saved log without event-replay), never mutated after construction, and
+deliberately absent from the `intent_started` notification -- it identifies
+authored demand, not something a rider observes. It is appended last in the
+dataclass and `_intent`'s positional restore reads it with `.get`, so a
+snapshot taken before this field existed still restores (with `source_id`
+`None`); `SNAPSHOT_SCHEMA_VERSION` stays unchanged because the field is
+additive and optional.
 
 One car per driver is bound at `add_driver`; rebinding is not supported.
 Platform status stays separate from physical status: `Order.phase` reports
@@ -80,7 +92,7 @@ being delivered; they always observe a completed transition.
 | `add_platform`, `add_car`, `add_driver`, `add_rider`, `install_app`, `register_car`, `launch_platform` | Population and access. Memberships must be nonempty. |
 | `start_shift(driver, location)`, `end_shift(driver)` | Physical presence. Ending is a request: new acceptance stops now, pending offers close as `canceled`, and the shift ends once commitments are drained. |
 | `open_app(role, person, platform)`, `close_app(...)` | App participation. Drivers need a shift and a registered car. Closing cancels that platform's pending offers; accepted orders survive. |
-| `begin_intent(rider, origin, destination)`, `end_intent(intent, reason)` | A rider's trip across attempts. An intent with a live order cannot be ended. |
+| `begin_intent(rider, origin, destination, source_id=None)`, `end_intent(intent, reason)` | A rider's trip across attempts. An intent with a live order cannot be ended. |
 | `issue_quote(platform, intent, gross, discount, distance_km=, duration_seconds=, eta_seconds=)` | Frozen rider terms for an open app session. |
 | `place_order(intent, quote)` | Creates the platform order and converts the intent once. One live order per intent. |
 | `create_offer(platform, order, driver, payout, bonus, expires_at=, eta_seconds=)` | Proposes an open order to an accepting driver; schedules `offer.expire`. |

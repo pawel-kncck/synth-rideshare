@@ -57,6 +57,33 @@ profiles, model equations, adoption and learning in
 [Behavior policy](plans/architecture/behavior-policy.md); commercial
 configuration in [Marketplace policy](plans/architecture/marketplace-policy.md).
 
+Platform IDs are free strings: nothing requires `rebu`/`blot`/`flyt`, and
+`market-blank@1` starts with no platforms and no segments so a script can
+build any market it names. `platform(id, **parameters)` returns one complete
+`{id: entry}` platform, overriding `MARKETPLACE_DEFAULTS_V1`; `two_platform(...)`
+returns a ready two-platform `Scenario` on `market-blank@1` in one call:
+
+```python
+from scenario import two_platform
+
+scenario = two_platform("alpha", "beta", riders=200, drivers=40, horizon_hours=24,
+                        shared={"base_fare_minor": 200, "per_km_minor": 150},
+                        first_parameters={"commission_fraction": .2},
+                        second_parameters={"commission_fraction": .1})
+```
+
+`.with_changes(...)`/`.add(...)` chain from either builder's result exactly as
+from any other `Scenario`. `platform()`/`rule()` validate parameter and
+condition names at authoring time, before `compile_scenario` re-validates
+cross-field combinations a single platform or rule cannot see alone.
+
+"Multiplier" means three different things depending on where it appears:
+`platforms.<id>.policy.parameters.multiplier` scales a platform's raw quoted
+tariff (`MarketplaceParameters.multiplier`); a demand `peak`'s `multiplier` is
+an *arrival-rate* weight in `_sample_times`, not a price; a campaign's
+`discount_fraction` is a fare reduction, never called a multiplier despite
+also being a ratio. Keep them straight when reading or writing a scenario.
+
 ## Architecture
 
 | File | Responsibility |
@@ -101,6 +128,22 @@ multi-replication experiment runner remains phase 4 work.
 | `scenarios/flyt_growth_month.py` | 1,000 riders, 50 drivers and 30 days: Flyt runs a tapered rider/driver campaign after a baseline week. Includes a `--control` variant; [assumptions and analysis](scenarios/flyt_growth_month.md). |
 | `scenarios/fixture_cross_platform_queue.py` | An explicit one-driver, two-rider market where Blot accepts an order during a Rebu ride and its ETA lacks the remaining Rebu service. |
 | `scenarios/scale_week.py` | 30,000 riders with seven trips each and 555 drivers: the profiling workload. Expect hours at full size; platform context construction dominates. |
+| `scenarios/reviews/sNN_*.py` | Ten scenario-review markets built with `two_platform`/`platform`/`market-blank@1` (`scenario-reviews/NN-*/DESCRIPTION.md`); each documents its approximations and exposes `build()`/`evaluate()` plus a `--check` CLI (see below). |
+
+Every `scenarios/reviews/sNN_*.py` script accepts `--check`: it runs (or,
+with `--log PATH`, re-evaluates an existing log without running again) and
+prints one `PASS`/`FAIL`/`NOT-EVALUABLE` line per observable check from its
+`scenario-reviews/NN-*/DESCRIPTION.md`, through `metrics.Checks` and the
+`metrics.py` helpers below, then exits nonzero on any `FAIL`:
+
+```sh
+python3 scenarios/reviews/s01_driver_supply_elasticity.py --check
+python3 scenarios/reviews/s08_regulatory_price_cap.py --check --log logs/simulation-.../simulation.log
+```
+
+A `NOT-EVALUABLE` line is not a failure; it names the reason and the plan
+phase that will make the check answerable, per
+[the scenario reviews' own README](scenario-reviews/README.md).
 
 Generated person IDs are `rider-n`/`driver-n` with cars `car-driver-n`; trip
 IDs are `trip-n` in arrival order. They depend only on the population and
@@ -185,6 +228,9 @@ Compute metrics explicitly after execution:
 python3 metrics.py logs/simulation-<run-id>/simulation.log
 python3 metrics.py logs/simulation-<run-id>/simulation.log --interval-minutes 15
 python3 metrics.py logs/simulation-<run-id>/simulation.log --market-share-days 7
+python3 metrics.py logs/simulation-<run-id>/simulation.log --windows 24,96
+python3 metrics.py logs/simulation-<run-id>/simulation.log --platform-detail
+python3 metrics.py logs/simulation-<run-id>/simulation.log --first-choice-days 1
 ```
 
 These commands print JSON to stdout and leave the log unchanged. No HTML, CSV,
@@ -192,7 +238,28 @@ configuration, event-export, or summary files are created automatically. The
 first command calculates a whole-run summary; the second adds interval rows
 (5, 15, 30 or 60 minutes). The third adds per-platform completed-ride counts and
 shares in seven-day periods; use `--market-share-days 1` for daily shares. Periods
-are relative to run start, and the last can be shorter. The Python API is:
+are relative to run start, and the last can be shorter.
+
+Three more flags are opt-in and additive; with none of them,
+`calculate_metrics(path)` is byte-identical to before they existed. `--windows
+H1,H2,...` (comma-separated, strictly increasing hours after run start) splits
+money and the funnel into consecutive windows plus a `cumulative` running
+total in the same shape, so "money by t=24h and by t=96h" reads from one
+result (`window_rows`). `--platform-detail` adds `platform_detail`: per-
+platform money (`money_by_platform`), funnel (`platform_funnel`), cancellations
+by party (`cancellations_by_party`), driver km (`driver_distance`), ETA-drift
+cancellations (`eta_drift`), the base/bonus/discount settlement split
+(`settlement_breakdown`, with an always-empty `transfers` placeholder for
+phase 3's `Transfer` record) and order/money conservation identities
+(`conservation`). `--first-choice-days N` adds `first_choice_periods`: each
+period's first-choice query share (the platform of a rider's earliest quote
+per intent) against the installed base at that period's start; a rider can
+have several apps installed, so installed shares can sum past 100% within a
+period. Driver km splits a service's legs by kind: `pickup` is empty km,
+`transport` is loaded km (`boarding` legs have zero length); a leg is
+attributed whole to the run segment containing its own `started_at`, so a
+continuous run and a restored continuation agree. Undefined ratios stay
+`null` throughout, as elsewhere in this file. The Python API is:
 
 ```python
 from metrics import calculate_metrics

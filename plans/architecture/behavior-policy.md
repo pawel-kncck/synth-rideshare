@@ -127,6 +127,26 @@ acceptance as a confirmed assignment.
 `"cancel_queued"` additionally requests cancellation of queued orders. The
 engine remains responsible for service promotion, occupancy and final shift exit.
 
+Two or more platforms' offers to the same multihoming driver are never
+compared jointly: each `offer_received` independently schedules its own
+`policy.driver.respond` after `response_seconds`, and each is evaluated on
+its own terms whenever its event fires, in the scheduler's own (FIFO)
+processing order. There is no cross-platform tie-break and no lookahead, so
+whichever offer happens to reach its response instant first is answered
+first, regardless of payout, even when a driver would clearly prefer the
+other on reflection (`scenarios/reviews/s01_driver_supply_elasticity.py`'s
+check 2 demonstrates and documents this). "Accepting" (`_driver_accepting`,
+used to build every platform's candidate list) means on shift, no exit
+requested, the app open, and the assigned car registered and the platform
+launched -- not physically idle: a driver mid-ride is still `accepting` on
+every app with a free commitment slot. There is no repositioning (a driver
+never travels without an active or queued commitment) and no memory of past
+rejections, cancellations, or failed pickups carried into future decisions;
+`pickup_eta_revised` notifications are emitted (`revise_pickup_eta`,
+[marketplace-engine.md](marketplace-engine.md)) but `rider_search@1` does
+not consume them, so a rider's cancellation decision never reacts to a
+revised (only the original) ETA.
+
 Personal diagnostics retain phase-specific `opportunity_exposure`,
 `personal_offer`, `opportunity_wait_censored`, `commitment_wait`,
 `back_to_back_ready`, and `post_dropoff_offer_wait`. Only idle or busy-with-one-slot
