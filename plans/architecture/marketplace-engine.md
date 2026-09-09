@@ -49,12 +49,13 @@ occupancy legality does not change with them.
 | `Car` | Registrations, the controlling driver, and one `Motion` (origin, destination, start, arrival) resolving position at any time. |
 | `Shift` | A driver's physical presence: start, exit request, and actual end. |
 | `TripIntent` | One rider's desired trip across platform attempts: quotes, orders, once-only conversion time, terminal outcome, and the originating scenario session id (`source_id`, optional). |
-| `Quote` | A platform's frozen `FareTerms` (gross, discount, in minor units), estimated distance/duration, and its pickup ETA estimate or `None`. |
+| `Quote` | A platform's frozen `FareTerms` (gross, discount, in minor units), estimated distance/duration, its pickup ETA estimate or `None`, and (phase 4) `commission_fraction` (binds the offer-time commission when not `None`) and `driver_surcharge_minor` (a commission-exempt flat share of a surcharge already folded into `gross_minor`) -- both default-off and appended last, restored with `.get` tolerance. |
 | `Order` | Owning platform, intent, bound fare terms, `open`/`assigned`/`completed`/`canceled` state, `Assignment`, offer ids, service id, timeline, cancellation, settlements. |
 | `Offer` | One proposal to one driver: frozen `PayoutTerms`, displayed ETA, deadline, and exactly one disposition. |
 | `Service` | Actual pickup, boarding, and transport legs for one order, with arrival, boarding, and end times and the actual end position. |
 | `Settlement` | Rider payment, driver payout, the platform contribution residual, a reason (`completed_ride` or `cancellation_fee`), and `bonus_minor` (the accepted offer's bonus on `completed_ride`, `0` on `cancellation_fee`, so the base/bonus split survives without joining the assignment). |
 | `Transfer` | Money moved outside a ride: signed `amount_minor` (positive credits the person), `reason` (one of `TRANSFER_REASONS`), `role`/`person_id`, `platform_id` (funding platform, or `None`), `counterparty` (`platform` debits that platform by the same amount; `external` -- lease, operating cost -- has no platform side), and optional `order_id`/`program_id`. |
+| `Regulation` (phase 4) | A market-wide price/commission cap: `at` (imposed time) and optional `max_base_fare_minor`, `max_per_km_minor`, `max_commission_fraction`. Records accumulate in `MarketplaceEngine.regulations`; the greatest id is the one in force (`engine.regulation`), so restore needs only the table, no cached pointer. Engine-enforced and visible to every platform equally -- no notification (a platform's compliance is its own scheduled `policy_change`; the audit trail is `command_result: regulation_rejected`). |
 
 Records refer to each other by id, never by object, so the whole market
 serializes: `snapshot()` and `MarketplaceEngine.restore(snapshot, registry)`
@@ -128,10 +129,29 @@ being delivered; they always observe a completed transition.
 | `respond_to_offer(offer, accept)` | Returns the disposition, or `stale` when already resolved. |
 | `cancel_order(order, by, reason, rider_fee_minor=, driver_compensation_minor=, driver_penalty_minor=)` | Ends an order before boarding, freeing only that commitment. A nonzero `driver_penalty_minor` is only legal for `by="driver"`; when nonzero it posts a `driver_penalty` `Transfer` between the existing driver `order_canceled` notification and releasing the commitment. |
 | `post_transfer(reason, role, person, amount_minor, platform_id=, counterparty=, order_id=, program_id=)` | Posts a `Transfer` outside a ride: `counterparty="platform"` requires and debits `platform_id`; `"external"` forbids it. Notifies the credited person and, for a platform counterparty, the funding platform; never the account posting itself. |
+| `impose_regulation(max_base_fare_minor=, max_per_km_minor=, max_commission_fraction=)` (phase 4) | Records a new `Regulation` effective immediately (`at=now`), superseding any prior one. Requires at least one cap; the two fare caps are jointly set or jointly absent. No notification. |
 
 Runtime legality is mandatory even for a compiled scenario: acceptance
 re-checks everything at execution time because an offer may expire, an order
 may be assigned, or a slot may fill between policy evaluation and application.
+
+### Regulation (phase 4)
+
+`RegulationRejected` is a `CommandRejected` subclass, so every existing
+`except CommandRejected` still catches it -- a caller that wants to
+distinguish a regulatory rejection (to log `command_result:
+regulation_rejected` instead of crashing or reporting a generic
+`offer_unavailable`) catches `RegulationRejected` specifically, before any
+broader `CommandRejected` handler. `issue_quote` checks the in-force
+`engine.regulation`'s fare cap, when set, against `gross_minor`:
+`cap = round_half_up(max_base_fare_minor + max_per_km_minor * distance_km)`,
+rounded *up* deliberately, so a compliant platform whose own rounding lands
+one cent over an unrounded cap is never wrongly rejected. `create_offer`
+checks the commission cap, when set, against `payout_minor` (the base
+payout, never `driver_payout_minor` -- a bonus is not commission relief):
+`floor = round_half_up((1 - max_commission_fraction) * order.fare.gross_minor)`;
+`payout_minor < floor` is rejected. Both checks run after every other
+validation and before the transition, so a rejected command changes nothing.
 
 ## Offers and atomic acceptance
 
@@ -297,6 +317,17 @@ scenarios whenever the engine changed:
   byte-for-byte (`scripts/check_scenario_readiness.py`), including a
   1000+-order scenario-review run compared field-by-field against pristine
   `origin/main`.
+- (Phase 4) An unmodified platform's quote/offer exceeding an imposed
+  regulation's caps is rejected with `RegulationRejected` and changes
+  nothing; a platform whose parameters comply is unaffected. `SNAPSHOT_SCHEMA_VERSION`
+  stays 2: `regulations` joins `_TABLES` exactly like phase 3's `transfers`
+  did (`.get(name, [])` at restore, so a pre-phase-4 snapshot restores with
+  an empty table and a fresh `regulation` sequence), and `Quote`'s two new
+  fields restore through `_quote`'s existing `.get`-tolerant factory. A
+  snapshot taken mid-run with a pending `policy.observe_window` scheduler
+  event (see marketplace-policy.md) restores and continues to identical
+  records once `policy_runtime.PolicyRuntime` (which owns that handler) is
+  constructed before `Scheduler.restore`.
 
 Measure physical active time from service intervals, never from overlapping
 accepted-order timelines; queued waiting is a separate quantity.

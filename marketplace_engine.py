@@ -44,6 +44,16 @@ class CommandRejected(ValueError):
     """A command violated access, lifecycle, or value rules. Nothing changed."""
 
 
+class RegulationRejected(CommandRejected):
+    """A command violated the in-force Regulation's cap. Nothing changed.
+
+    A subclass of CommandRejected, so nothing that catches the broad
+    exception changes behavior; the runtime catches exactly this one to
+    report command_result: regulation_rejected instead of the generic
+    offer_unavailable/crash path (plans/architecture/marketplace-engine.md).
+    """
+
+
 # ----------------------------------------------------------------------
 # Values
 # ----------------------------------------------------------------------
@@ -190,6 +200,25 @@ class Platform:
     starting_cash_minor: Optional[int] = None  # seeds the platform's cash account; None = not tracked
 
 
+@dataclass(frozen=True)
+class Regulation:
+    """A market-wide price/commission cap, effective from `at` until superseded.
+
+    Enforced by the engine (issue_quote/create_offer) and visible to every
+    platform equally; a platform's compliance is its own scheduled
+    policy_change (plan section 5.2). Records accumulate in
+    MarketplaceEngine.regulations, each with a fresh id and at = now, so the
+    record with the greatest id is always the one in force (see the
+    `regulation` property) -- restore needs no cached "current" pointer.
+    """
+
+    id: int
+    at: float
+    max_base_fare_minor: Optional[int] = None
+    max_per_km_minor: Optional[int] = None
+    max_commission_fraction: Optional[float] = None
+
+
 @dataclass
 class Car:
     id: Any
@@ -271,6 +300,8 @@ class Quote:
     policy_version: str
     selected_rule: str
     campaign_id: Optional[str] = None
+    commission_fraction: Optional[float] = None  # binds the offer-time commission when not None
+    driver_surcharge_minor: int = 0  # commission-exempt flat share of a surcharge folded into gross_minor
 
     @property
     def drivers_available(self):
@@ -672,9 +703,11 @@ class MarketplaceEngine:
         self.services = {}
         self.settlements = {}
         self.transfers = {}
+        self.regulations = {}
         self._sequences = {
             name: itertools.count(1)
-            for name in ("shift", "intent", "quote", "order", "offer", "service", "settlement", "transfer")
+            for name in ("shift", "intent", "quote", "order", "offer", "service", "settlement", "transfer",
+                        "regulation")
         }
         self.accounts = {}  # (role, id) -> Account; derived, never decoded from a snapshot (see restore())
         self._pending_by_order = {}  # order id -> set of pending offer ids
@@ -905,6 +938,41 @@ class MarketplaceEngine:
         )
 
     # ----------------------------------------------------------------------
+    # Regulation
+    # ----------------------------------------------------------------------
+
+    @property
+    def regulation(self):
+        """The Regulation currently in force, or None. Nothing is cached: restore needs only the table."""
+        return self.regulations[max(self.regulations)] if self.regulations else None
+
+    def impose_regulation(self, max_base_fare_minor=None, max_per_km_minor=None, max_commission_fraction=None):
+        """A market-wide price/commission cap, effective immediately and until superseded.
+
+        No notification: regulation is engine-enforced and public by
+        construction (every platform's issue_quote/create_offer is bound by
+        it equally); a platform's compliance is its own scheduled
+        policy_change, audited through command_result: regulation_rejected
+        rather than a disclosed intervention (plan section 5.2).
+        """
+        if max_base_fare_minor is None and max_per_km_minor is None and max_commission_fraction is None:
+            raise CommandRejected("A regulation needs at least one cap")
+        if (max_base_fare_minor is None) != (max_per_km_minor is None):
+            raise CommandRejected("max_base_fare_minor and max_per_km_minor must be set together")
+        if max_base_fare_minor is not None:
+            minor_units(max_base_fare_minor, "max_base_fare_minor")
+            minor_units(max_per_km_minor, "max_per_km_minor")
+        if max_commission_fraction is not None:
+            finite(max_commission_fraction, "max_commission_fraction", minimum=0)
+            if max_commission_fraction > 1:
+                raise CommandRejected("max_commission_fraction must be at most 1")
+        with self._transition():
+            record = Regulation(self._next_id("regulation"), self.now, max_base_fare_minor,
+                                max_per_km_minor, max_commission_fraction)
+            self.regulations[record.id] = record
+        return record
+
+    # ----------------------------------------------------------------------
     # Trip intents, quotes, and orders
     # ----------------------------------------------------------------------
 
@@ -948,8 +1016,17 @@ class MarketplaceEngine:
 
     def issue_quote(self, platform_id, intent_id, gross_minor, discount_minor=0, *,
                     distance_km, duration_seconds, eta_seconds, expires_at,
-                    policy_version='direct-v1', selected_rule='default', campaign_id=None):
-        """A platform's frozen price and supply estimate for a rider's request."""
+                    policy_version='direct-v1', selected_rule='default', campaign_id=None,
+                    commission_fraction=None, driver_surcharge_minor=0):
+        """A platform's frozen price and supply estimate for a rider's request.
+
+        commission_fraction, when not None, binds the offer-time commission
+        to this quote (MarketplaceParameters.commission_binding='quote');
+        driver_surcharge_minor is the flat, commission-exempt share of a
+        surcharge already folded into gross_minor, added back to the driver
+        payout at offer time (see dispatch/create_offer and
+        plans/architecture/marketplace-policy.md).
+        """
         platform = self._platform(platform_id)
         intent = self._intent(intent_id)
         rider = self.riders[intent.rider_id]
@@ -960,16 +1037,30 @@ class MarketplaceEngine:
         finite(distance_km, "distance_km", minimum=0)
         finite(duration_seconds, "duration_seconds", minimum=0)
         finite(eta_seconds, "eta_seconds", minimum=0, allow_none=True)
+        minor_units(driver_surcharge_minor, "driver_surcharge_minor")
+        if commission_fraction is not None:
+            finite(commission_fraction, "commission_fraction", minimum=0)
+            if commission_fraction > 1:
+                raise CommandRejected("commission_fraction must be at most 1")
         if not platform.launched:
             raise CommandRejected(f"Platform {platform_id!r} has not launched")
         if platform_id not in rider.open_apps:
             raise CommandRejected(f"Rider {rider.id!r} does not have {platform_id!r} open")
         if not intent.live:
             raise CommandRejected(f"Trip intent {intent_id} has ended")
+        reg = self.regulation
+        if reg is not None and reg.max_base_fare_minor is not None:
+            cap_minor = int((Decimal(reg.max_base_fare_minor)
+                             + Decimal(reg.max_per_km_minor) * Decimal(str(distance_km))
+                             ).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+            if gross_minor > cap_minor:
+                raise RegulationRejected(
+                    f"gross_minor {gross_minor} exceeds the in-force regulation cap {cap_minor} "
+                    f"for {distance_km:g} km")
         with self._transition():
             quote = Quote(self._next_id("quote"), platform_id, intent_id, rider.id, self.now,
                           fare, distance_km, duration_seconds, eta_seconds, expires_at,
-                          policy_version, selected_rule, campaign_id)
+                          policy_version, selected_rule, campaign_id, commission_fraction, driver_surcharge_minor)
             self.quotes[quote.id] = quote
             intent.quote_ids.append(quote.id)
             self._notify("rider", rider.id, "quote_received", quote_id=quote.id,
@@ -1036,6 +1127,15 @@ class MarketplaceEngine:
         for offer_id in self._pending_by_order.get(order_id, ()):
             if self.offers[offer_id].driver_id == driver_id:
                 raise CommandRejected(f"Driver {driver_id!r} already has a pending offer for order {order_id}")
+        reg = self.regulation
+        if reg is not None and reg.max_commission_fraction is not None:
+            floor_minor = int((Decimal(order.fare.gross_minor)
+                               * (Decimal(1) - Decimal(str(reg.max_commission_fraction)))
+                               ).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+            if payout.payout_minor < floor_minor:
+                raise RegulationRejected(
+                    f"payout_minor {payout.payout_minor} is below the in-force regulation floor {floor_minor} "
+                    f"(commission cap {reg.max_commission_fraction:g})")
         with self._transition():
             offer = Offer(self._next_id("offer"), platform_id, order_id, driver_id, self.now,
                           expires_at, payout, eta_seconds, policy_version=policy_version,
@@ -1586,9 +1686,12 @@ def _intent(item):
 
 
 def _quote(item):
+    # .get, not [...]: a pre-phase-4 snapshot has neither key -- same tolerance as
+    # TripIntent.source_id / Platform.starting_cash_minor above.
     return Quote(item["id"], item["platform_id"], item["intent_id"], item["rider_id"], item["at"],
                  FareTerms(**item["fare"]), item["distance_km"], item["duration_seconds"], item["eta_seconds"],
-                 item["expires_at"], item["policy_version"], item["selected_rule"], item["campaign_id"])
+                 item["expires_at"], item["policy_version"], item["selected_rule"], item["campaign_id"],
+                 item.get("commission_fraction"), item.get("driver_surcharge_minor", 0))
 
 
 def _order(item):
@@ -1624,8 +1727,12 @@ def _transfer(item):
     return Transfer(**item)
 
 
+def _regulation(item):
+    return Regulation(**item)
+
+
 _TABLES = {
     "platforms": _platform, "cars": _car, "drivers": _driver, "riders": _rider, "shifts": _shift,
     "intents": _intent, "quotes": _quote, "orders": _order, "offers": _offer, "services": _service,
-    "settlements": _settlement, "transfers": _transfer,
+    "settlements": _settlement, "transfers": _transfer, "regulations": _regulation,
 }

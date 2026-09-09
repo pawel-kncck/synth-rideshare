@@ -14,7 +14,8 @@ by dotted path (maps merge by schema, lists are replaced), `add(path, item)`
 and `remove(path, id)` edit keyed collections and ID tables, and `renamed`
 labels the variant. Typed builders (`campaign`, `rule`, `peak`, `segment`,
 `person`, `shift`, `trip`, `launch`, `policy_change`, `preference_change`,
-`platform_policy`) return complete items. Times are authored in hours after
+`platform_policy`, and, since phase 4, `program` and `regulation`) return
+complete items. Times are authored in hours after
 the calendar origin and normalized to seconds; money stays in declared minor units.
 
 `compile_scenario(scenario)` returns an immutable `Plan`: the canonical resolved
@@ -91,8 +92,13 @@ one `with_changes`, instead of first removing a preset's existing named
 segments. `rule()` validates `when` against `marketplace_policy.VISIBLE_FIELDS`
 at authoring time (`ConditionalRule.__post_init__` enforces the same
 condition again at `compile_scenario` time); the visible-field set is read
-from `marketplace_policy`, not duplicated, so it grows automatically when a
-later phase adds zone or window keys to it.
+from `marketplace_policy`, not duplicated, so it already includes phase 4's
+`origin_zone`/`destination_zone` and grows automatically if a later phase
+adds more. `rule()` also accepts an optional `start_hours`/`end_hours`
+window (both or neither; converted to seconds by `_compile_policy` exactly
+like a campaign's), and `program(id, *, floor_minor, window_hours, ...)`
+builds one `hourly_guarantee` program entry the same way `campaign()` does
+(see "Interventions and effective time" for `regulation()`).
 
 Supported activity generators are `rotation`/`explicit`/`registered`/`none`
 shifts and `weekly`/`explicit`/`registered`/`none` trips; the only conflict
@@ -109,8 +115,21 @@ policies, unit conversion of money, JSON/YAML front ends beyond
 mirroring `platform()`). It is required (`"zones": {}` is the off state every
 preset ships) but, like `map_km`, it never reaches `World` or
 `marketplace_engine.py` -- the engine still does not fence or clip a
-coordinate, so declaring a zone changes only what the *generators* below can
-reference, never what a coordinate means at runtime. `compile_scenario`
+coordinate, so declaring a zone changes only what the *generators* below, and
+(since phase 4) the *policy* layer, can reference, never what a coordinate
+means at runtime. Phase 4 gives `world.zones` two more consumers, both inside
+`marketplace_policy.py`/`policy_runtime.py`, never the engine: a
+`MarketplaceParameters.service_area` authored as a zone id string is resolved
+by `_compile_policy` to that zone's box (an unknown id is a compile error
+naming the declared ids; every *compiled* policy therefore holds a box or
+`None`, never an unresolved string); and a rider/order's pickup and
+destination are labelled `origin_zone`/`destination_zone`
+(`PolicyRuntime.zone_of`: the first declared id, sorted, whose closed box
+contains the point, else `None`) and merged into the *rider-side* `visible`
+dict a `rule()`'s `when` can match -- never into a driver's own `visible`,
+so a zone-conditioned rule can price or gate a ride by its geography but
+never select a driver-side parameter by it (see marketplace-policy.md's
+"Contract and segment resolution"). `compile_scenario`
 (`_check_zones`) rejects a box whose `max` is not strictly greater than `min`
 on both axes, warns when a box extends beyond `map_km` (a sampled point could
 then fall outside the sampling extent), and, when `world.sampling` is `grid`,
@@ -424,6 +443,35 @@ Interventions specify simulated time, target, operation, and policy/cohort
 identity. Validate windows and conflicting explicit writes to the same property
 at the same time. Use half-open tariff/campaign windows, with effective policy
 lookup at the decision time rather than depending on event insertion order.
+`INTERVENTION_ORDER` fixes same-time application order: `launch` (0), then
+(phase 4) `regulation` (1), then `policy` (2), then `preference` (3) -- a
+regulation always takes effect before any same-instant policy compliance
+update, matching plan section 5.2's "regulation first, compliance follows".
+
+`regulation(id, *, at_hours, max_base_fare_minor=None, max_per_km_minor=None,
+max_commission_fraction=None)` (phase 4) schedules a market-wide
+`marketplace_engine.Regulation` (see marketplace-engine.md): `compile_scenario`
+requires at least one cap and the two fare caps jointly set or jointly
+absent; its conflict key is `(at_seconds, "regulation")` (there is only one
+regulation state, not one per platform, so two regulation interventions at
+the same instant always conflict regardless of their caps). It carries no
+platform and posts no notification -- enforcement and reporting are
+`marketplace_engine.py`'s (the caps) and `PolicyRuntime`'s
+(`command_result: regulation_rejected`), never a disclosed intervention.
+
+A `policy_change` (`policy` kind) whose `platform` is the literal string
+`"*"` expands, after every intervention is otherwise resolved (so a same-time
+`launch` intervention is already reflected), to one entry per platform
+already launched by that instant (`launched_at[pid] is not None and
+launched_at[pid] <= at`) -- each expansion merges against *that platform's
+own* current policy, not a shared template, with id `f"{id}-{pid}"`;
+selecting no platform is a compile error. A `policy` intervention, wildcard
+or not, may not change `guarantee_window_seconds`: that cadence is scheduled
+once, from the platform's own launch-time policy, in `Simulation.__init__`
+(`PolicyRuntime.schedule_program_windows`, never from `restore`, where the
+pending window-close event is already in the scheduler snapshot), so a
+later change would silently desynchronize the schedule from the parameter --
+`compile_scenario` rejects it outright instead.
 
 At a learning checkpoint, apply due explicit interventions first, take a common
 population snapshot, compute behavioral updates, then apply them together. This

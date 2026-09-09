@@ -35,7 +35,7 @@ SOURCE_FILES = ('main.py', 'scenario.py', 'marketplace_engine.py', 'event_engine
 ROLES = ('rider', 'driver')
 TRAITS = {'rider': RiderTraits, 'driver': DriverTraits, 'evolution': EvolutionTraits}
 DISTRIBUTIONS = ('uniform', 'normal', 'choice')
-INTERVENTION_ORDER = {'launch': 0, 'policy': 1, 'preference': 2}
+INTERVENTION_ORDER = {'launch': 0, 'regulation': 1, 'policy': 2, 'preference': 3}
 
 
 class ScenarioError(ValueError):
@@ -597,10 +597,19 @@ CAMPAIGN = Map({
     'discount_cap_minor': Scalar('integer', minimum=0, nullable=True), 'bonus_minor': Scalar('integer', minimum=0),
     'segment': Scalar('string', nullable=True), 'new_user_only': Scalar('boolean'),
     'awareness': Scalar('string', choices=('announced', 'in_app')),
+    'budget_minor': Scalar('integer', minimum=0, nullable=True),
+    'max_completed_rides': Scalar('integer', minimum=1, nullable=True),
 })
 RULE = Map({'id': Scalar('string'), 'priority': Scalar('integer'), 'when': Table(Scalar('value')),
-            'parameters': Params(MarketplaceParameters, partial=True)})
-POLICY_EXTRA = {'version': Scalar('string'), 'rules': Keyed(RULE), 'campaigns': Keyed(CAMPAIGN), 'fallback': Scalar('string')}
+            'parameters': Params(MarketplaceParameters, partial=True),
+            'start_hours': Scalar('number', minimum=0, nullable=True),
+            'end_hours': Scalar('number', positive=True, nullable=True)})
+PROGRAM = Map({'id': Scalar('string'), 'kind': Scalar('string', choices=('hourly_guarantee',)),
+              'floor_minor': Scalar('integer', minimum=0), 'window_hours': POSITIVE_HOURS,
+              'min_acceptance_rate': Scalar('number', minimum=0, maximum=1),
+              'min_online_hours': Scalar('number', minimum=0), 'zero_dispatch_qualifies': Scalar('boolean')})
+POLICY_EXTRA = {'version': Scalar('string'), 'rules': Keyed(RULE), 'campaigns': Keyed(CAMPAIGN),
+                'fallback': Scalar('string'), 'programs': Keyed(PROGRAM)}
 PLATFORM = Map({
     'launched': Scalar('boolean'),
     'policy': Implementation('marketplace', POLICY_EXTRA),
@@ -653,6 +662,10 @@ INTERVENTION = Choice('kind', {
                    'policy': Implementation('marketplace', POLICY_EXTRA, partial=True)}),
     'preference': Map({'id': Scalar('string'), 'at_hours': NONNEGATIVE_HOURS, 'role': Scalar('string', choices=ROLES),
                        'segment': Scalar('string', nullable=True), 'people': APPS, 'preferred_app': Scalar('string')}),
+    'regulation': Map({'id': Scalar('string'), 'at_hours': NONNEGATIVE_HOURS,
+                       'max_base_fare_minor': Scalar('integer', minimum=0, nullable=True),
+                       'max_per_km_minor': Scalar('integer', minimum=0, nullable=True),
+                       'max_commission_fraction': Scalar('number', minimum=0, maximum=1, nullable=True)}),
 })
 SCENARIO = Map({
     'name': Scalar('string'),
@@ -698,24 +711,30 @@ def platform_policy(*, version='modern-v1', parameters=None, rules=(), campaigns
 
 
 def campaign(id, *, start_hours, end_hours, discount_minor=0, discount_fraction=0, discount_cap_minor=None,
-             bonus_minor=0, segment=None, new_user_only=False, awareness='announced'):
+             bonus_minor=0, segment=None, new_user_only=False, awareness='announced', budget_minor=None,
+             max_completed_rides=None):
     return _build(CAMPAIGN, {'id': id, 'start_hours': start_hours, 'end_hours': end_hours, 'discount_minor': discount_minor,
                              'discount_fraction': discount_fraction, 'discount_cap_minor': discount_cap_minor,
                              'bonus_minor': bonus_minor, 'segment': segment, 'new_user_only': new_user_only,
-                             'awareness': awareness}, f'campaign {id}')
+                             'awareness': awareness, 'budget_minor': budget_minor,
+                             'max_completed_rides': max_completed_rides}, f'campaign {id}')
 
 
-def rule(id, *, priority, when, parameters):
+def rule(id, *, priority, when, parameters, start_hours=None, end_hours=None):
     """A conditional policy override, validated against today's VISIBLE_FIELDS at authoring time.
 
-    `ConditionalRule.__post_init__` enforces the same two conditions at
+    `ConditionalRule.__post_init__` enforces the same conditions at
     `compile_scenario` time; checking them here surfaces the offending
     field names immediately instead of after a full scenario resolves. The
-    visible-field set is `marketplace_policy.VISIBLE_FIELDS`; plan section
-    4.H adds zone and window keys to it in a later phase, so `rule()` reads
-    the set rather than duplicating it -- today it is exactly VISIBLE_FIELDS.
+    visible-field set is `marketplace_policy.VISIBLE_FIELDS`, which phase 4
+    extended with `origin_zone`/`destination_zone`; `rule()` reads the set
+    by reference rather than duplicating it, so it always tracks that set.
+    `start_hours`/`end_hours` (both or neither) restrict the rule to a
+    half-open `[start_hours, end_hours)` window, converted to seconds by
+    `_compile_policy` exactly like a campaign's window.
     """
-    checked = _build(RULE, {'id': id, 'priority': priority, 'when': dict(when), 'parameters': dict(parameters)}, f'rule {id}')
+    checked = _build(RULE, {'id': id, 'priority': priority, 'when': dict(when), 'parameters': dict(parameters),
+                            'start_hours': start_hours, 'end_hours': end_hours}, f'rule {id}')
     unknown = sorted(set(checked['when']) - VISIBLE_FIELDS)
     if not checked['when'] or unknown:
         raise ScenarioError(f'rule {id}.when: conditions must use declared platform-visible fields '
@@ -723,7 +742,28 @@ def rule(id, *, priority, when, parameters):
     unknown = sorted(set(checked['parameters']) - {f.name for f in fields(MarketplaceParameters)})
     if unknown:
         raise ScenarioError(f'rule {id}.parameters: unknown policy parameter(s) {unknown}')
+    if (start_hours is None) != (end_hours is None):
+        raise ScenarioError(f'rule {id}: start_hours and end_hours must be given together')
     return checked
+
+
+def program(id, *, floor_minor, window_hours, min_acceptance_rate=0, min_online_hours=0,
+           zero_dispatch_qualifies=True, kind='hourly_guarantee'):
+    """One `hourly_guarantee` program: at window close, a qualifying driver is topped up to
+    `floor_minor` minus their own completed payout in the window. `window_hours` must equal the
+    platform's own `guarantee_window_seconds` (in hours) -- `PlatformPolicy.__post_init__` enforces it."""
+    return _build(PROGRAM, {'id': id, 'kind': kind, 'floor_minor': floor_minor, 'window_hours': window_hours,
+                            'min_acceptance_rate': min_acceptance_rate, 'min_online_hours': min_online_hours,
+                            'zero_dispatch_qualifies': zero_dispatch_qualifies}, f'program {id}')
+
+
+def regulation(id, *, at_hours, max_base_fare_minor=None, max_per_km_minor=None, max_commission_fraction=None):
+    """A market-wide regulation intervention: engine-enforced and visible to every platform equally.
+    `compile_scenario` requires at least one cap, with `max_base_fare_minor`/`max_per_km_minor` jointly
+    set or absent."""
+    return _build(INTERVENTION.options['regulation'], {'id': id, 'kind': 'regulation', 'at_hours': at_hours,
+        'max_base_fare_minor': max_base_fare_minor, 'max_per_km_minor': max_per_km_minor,
+        'max_commission_fraction': max_commission_fraction}, f'regulation {id}')
 
 
 def peak(id, *, weekdays, start_hour, end_hour, multiplier):
@@ -819,6 +859,8 @@ MARKETPLACE_DEFAULTS_V1 = {
     'retry_drivers': False, 'retry_seconds': 1, 'order_patience_seconds': 60, 'offer_seconds': 10, 'quote_seconds': 30,
     'rider_cancellation_fee_minor': 0, 'driver_cancellation_compensation_minor': 0,
     'driver_cancellation_penalty_minor': 0,
+    'surcharge_minor': 0, 'surcharge_driver_share': 0, 'commission_binding': 'offer',
+    'driver_lockout_seconds': 0, 'guarantee_window_seconds': 0, 'announce_terms': False, 'service_area': None,
 }
 ALL_APPS = ['rebu', 'blot', 'flyt']
 
@@ -826,7 +868,8 @@ ALL_APPS = ['rebu', 'blot', 'flyt']
 def _platform_v1():
     return {'launched': True, 'controller': None, 'starting_cash_minor': None,
             'policy': {'implementation': 'marketplace@1', 'version': 'modern-v1',
-                       'parameters': dict(MARKETPLACE_DEFAULTS_V1), 'rules': [], 'campaigns': [], 'fallback': 'default'}}
+                       'parameters': dict(MARKETPLACE_DEFAULTS_V1), 'rules': [], 'campaigns': [], 'programs': [],
+                       'fallback': 'default'}}
 
 
 def _segments_v1(role):
@@ -923,7 +966,7 @@ def preset_definition(identifier):
     return definition
 
 
-def platform(id, *, launched=True, version='modern-v1', rules=(), campaigns=(), fallback='default',
+def platform(id, *, launched=True, version='modern-v1', rules=(), campaigns=(), programs=(), fallback='default',
             controller=None, starting_cash_minor=None, **parameters):
     """One complete platform entry keyed by its ID: ``{id: <PLATFORM entry>}``.
 
@@ -953,7 +996,8 @@ def platform(id, *, launched=True, version='modern-v1', rules=(), campaigns=(), 
     entry = {'launched': launched, 'controller': controller, 'starting_cash_minor': starting_cash_minor,
              'policy': {'implementation': BUILTIN_IMPLEMENTATIONS['marketplace'], 'version': version,
                         'parameters': {**MARKETPLACE_DEFAULTS_V1, **parameters},
-                        'rules': list(rules), 'campaigns': list(campaigns), 'fallback': fallback}}
+                        'rules': list(rules), 'campaigns': list(campaigns), 'programs': list(programs),
+                        'fallback': fallback}}
     checked = PLATFORM.check(entry, f'platform {id}', diag, complete=True)
     diag.raise_errors()
     return {id: checked}
@@ -1248,7 +1292,7 @@ def compile_scenario(scenario):
     launched_at = {}
     for pid, item in resolved['platforms'].items():
         launched_at[pid] = 0 if item['launched'] else None
-        policy = _compile_policy(item['policy'], f'platforms.{pid}.policy', diag)
+        policy = _compile_policy(item['policy'], f'platforms.{pid}.policy', diag, zones=world_def['zones'])
         controller = None
         if item['controller'] is not None:
             controller = (item['controller']['interval_hours'] * HOUR, item['controller']['until_hours'] * HOUR)
@@ -1268,13 +1312,34 @@ def compile_scenario(scenario):
         except (TypeError, ValueError) as error:
             diag.error(f'behavior.{family}.parameters', str(error))
     # Interventions: normalize times, order launches first, and detect conflicting writes.
+    def _apply_policy_change(pid, policy_change, path):
+        """Merge one policy intervention against platform pid's base policy, compile it, and check
+        it does not try to change guarantee_window_seconds (the platform's single window-close
+        cadence, fixed at launch -- ambiguity resolved in plans/scenario-readiness-plan.md)."""
+        base = resolved['platforms'][pid]['policy']
+        if policy_change.get('implementation', base['implementation']) != base['implementation']:
+            diag.error(f'{path}.policy.implementation', 'an intervention selects a policy version, not a different implementation')
+        merged = Implementation('marketplace', POLICY_EXTRA).merge(base, policy_change)
+        compiled = _compile_policy(merged, f'{path}.policy', diag, zones=world_def['zones'])
+        if (compiled is not None
+                and compiled.parameters.guarantee_window_seconds != platforms[pid].policy.parameters.guarantee_window_seconds):
+            diag.error(f'{path}.policy.parameters.guarantee_window_seconds',
+                      'a policy intervention may not change guarantee_window_seconds; it is fixed at launch')
+        if merged.get('version') == base['version'] and merged != base:
+            diag.warn(f'{path}.policy.version', 'changed settings should carry a new policy version label')
+        return compiled
+
     interventions = []
+    wildcard_policies = []  # (item, at_seconds, path); expanded once launched_at is fully known
     for item in resolved['interventions']:
         at = item['at_hours'] * HOUR
         path = f"interventions.{item['id']}"
         entry = {'id': item['id'], 'kind': item['kind'], 'at_seconds': at}
         if at > horizon:
             diag.warn(path, 'scheduled after the horizon; it will never apply')
+        if item['kind'] == 'policy' and item['platform'] == '*':
+            wildcard_policies.append((item, at, path))
+            continue
         if item['kind'] in ('launch', 'policy'):
             pid = item['platform']
             entry['platform'] = pid
@@ -1286,24 +1351,41 @@ def compile_scenario(scenario):
                 else:
                     launched_at[pid] = at
             else:
-                base = resolved['platforms'][pid]['policy']
-                if item['policy'].get('implementation', base['implementation']) != base['implementation']:
-                    diag.error(f'{path}.policy.implementation', 'an intervention selects a policy version, not a different implementation')
-                merged = Implementation('marketplace', POLICY_EXTRA).merge(base, item['policy'])
-                entry['policy'] = plain(_compile_policy(merged, f'{path}.policy', diag))
-                if merged.get('version') == base['version'] and merged != base:
-                    diag.warn(f'{path}.policy.version', 'changed settings should carry a new policy version label')
+                entry['policy'] = plain(_apply_policy_change(pid, item['policy'], path))
+        elif item['kind'] == 'regulation':
+            caps = {key: item[key] for key in ('max_base_fare_minor', 'max_per_km_minor', 'max_commission_fraction')}
+            entry.update(caps)
+            if all(v is None for v in caps.values()):
+                diag.error(path, 'a regulation needs at least one cap')
+            if (caps['max_base_fare_minor'] is None) != (caps['max_per_km_minor'] is None):
+                diag.error(path, 'max_base_fare_minor and max_per_km_minor must be set together')
         else:
             entry.update({'role': item['role'], 'segment': item['segment'], 'people': list(item['people']),
                           'preferred_app': item['preferred_app']})
             if (item['segment'] is None) == (not item['people']):
                 diag.error(path, 'a preference change targets either one segment or an explicit people list')
         interventions.append(entry)
+    # policy(platform="*") expands to the platforms launched by this time -- launched_at now
+    # reflects every 'launch' intervention regardless of authored order, since the loop above ran
+    # to completion (mirrors the preference-validity pass below, which also runs only afterward).
+    for item, at, path in wildcard_policies:
+        selected = sorted(pid for pid in platforms if launched_at[pid] is not None and launched_at[pid] <= at)
+        if not selected:
+            diag.error(path, 'platform "*" selects no platform: none is launched by this time')
+        for pid in selected:
+            sub_path = f"interventions.{item['id']}-{pid}"
+            compiled = _apply_policy_change(pid, item['policy'], sub_path)
+            interventions.append({'id': f"{item['id']}-{pid}", 'kind': 'policy', 'at_seconds': at,
+                                  'platform': pid, 'policy': plain(compiled)})
     interventions.sort(key=lambda e: (e['at_seconds'], INTERVENTION_ORDER[e['kind']], e['id']))
     seen = {}
     for entry in interventions:
-        target = ((entry['at_seconds'], entry['kind'], entry['platform']) if entry['kind'] != 'preference'
-                  else (entry['at_seconds'], 'preference', entry['role'], entry['segment'], tuple(entry['people'])))
+        if entry['kind'] == 'preference':
+            target = (entry['at_seconds'], 'preference', entry['role'], entry['segment'], tuple(entry['people']))
+        elif entry['kind'] == 'regulation':
+            target = (entry['at_seconds'], 'regulation')
+        else:
+            target = (entry['at_seconds'], entry['kind'], entry['platform'])
         if target in seen:
             diag.error(f"interventions.{entry['id']}", f"conflicts with {seen[target]!r}: same target and time")
         seen[target] = entry['id']
@@ -1471,13 +1553,50 @@ def implementation_fingerprint(implementations, generators=None):
                         'compiler': COMPILER_VERSION})
 
 
-def _compile_policy(definition, path, diag):
+def _resolve_service_area(parameters, zones, path, diag):
+    """Resolve a string `service_area` in `parameters` against `zones` into a box, in place -- the
+    one place a zone id becomes a box before it reaches `MarketplaceParameters` (plan section 4.C;
+    scenario-definition.md). Shared by a policy's base parameters and every rule's parameters, since
+    a rule can override service_area like any other MarketplaceParameters field; an unresolved string
+    reaching MarketplaceParameters would later crash marketplace_policy.inside() at decision time."""
+    area = parameters.get('service_area')
+    if isinstance(area, str):
+        zones = zones or {}
+        if area not in zones:
+            diag.error(f'{path}.service_area', f'unknown zone {area!r}; declared: {sorted(zones)}')
+        else:
+            box = zones[area]
+            parameters['service_area'] = [list(box['min']), list(box['max'])]
+
+
+def _compile_policy(definition, path, diag, zones=None):
+    """Normalize hours to seconds (campaign/rule windows, program window/online hours) and resolve
+    a string `service_area` against the world's declared zones -- the one place a zone id becomes a
+    box before it reaches `MarketplaceParameters` (plan section 4.C; scenario-definition.md). Applied
+    via `_resolve_service_area` to the base parameters and to every rule's parameters alike;
+    `_apply_policy_change` routes interventions through this same function, so intervention rules
+    get the same treatment."""
     campaigns = []
     for item in definition['campaigns']:
         campaigns.append({key: value for key, value in item.items() if key not in ('start_hours', 'end_hours')}
                          | {'start': item['start_hours'] * HOUR, 'end': item['end_hours'] * HOUR})
+    rules = []
+    for item in definition['rules']:
+        entry = {key: value for key, value in item.items() if key not in ('start_hours', 'end_hours')}
+        if item.get('start_hours') is not None:
+            entry['start'], entry['end'] = item['start_hours'] * HOUR, item['end_hours'] * HOUR
+        entry['parameters'] = dict(entry.get('parameters') or {})
+        _resolve_service_area(entry['parameters'], zones, f'{path}.rules.{item["id"]}.parameters', diag)
+        rules.append(entry)
+    programs = []
+    for item in definition.get('programs', ()):
+        programs.append({key: value for key, value in item.items() if key not in ('window_hours', 'min_online_hours')}
+                        | {'window_seconds': item['window_hours'] * HOUR,
+                           'min_online_seconds': item['min_online_hours'] * HOUR})
+    parameters = dict(definition['parameters'])
+    _resolve_service_area(parameters, zones, f'{path}.parameters', diag)
     try:
-        return PlatformPolicy.compile(overrides=definition['parameters'], rules=definition['rules'], campaigns=campaigns,
+        return PlatformPolicy.compile(overrides=parameters, rules=rules, campaigns=campaigns, programs=programs,
                                       version=definition['version'], fallback=definition['fallback'])
     except (TypeError, ValueError) as error:
         diag.error(path, str(error))
