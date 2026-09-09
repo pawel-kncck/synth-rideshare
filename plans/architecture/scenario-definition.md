@@ -202,8 +202,15 @@ population) so swapping a generator cannot silently reuse another's stream:
   same partial `segment_fields(role, explicit=True)` schema an explicit
   person uses, merged with its named `segment` (if any) through the same
   `_merge_person` an explicit person goes through, and validated with the
-  same `_check_access` -- so a generated person has the identical shape and
-  downstream validation as a segment-allocated or explicit one.
+  same `_check_access` and `_check_segment_activity` -- so a generated
+  person has the identical shape and downstream validation, geometry
+  included, as a segment-allocated or explicit one. A registered population
+  generator only replaces segment *allocation*; `population.<role>s.people`
+  (compile-time explicit people) still layer on top of its output exactly as
+  they layer on top of segment allocation -- `plan.person_ids` already folds
+  their ids into the union regardless of generator kind, so realization must
+  too, or a compile-time-valid identity (an explicit activity reference, a
+  preference intervention target) would never be realized at `prepare()`.
 
 The manifest records identity and provenance for whichever generators are
 `registered`: `manifest()['generators']` (and `Plan.generators`) is
@@ -236,9 +243,16 @@ pre-PR-4 imperative style, restored on top of a compiled plan). Omitted
 `_realize_activity`; supplied ones are `person()`-shaped declarations (each
 needing a `role` key) or trip/shift dicts, validated through the identical
 paths a registered generator's output takes (`_merge_person`/`_check_access`/
-`_realize_person` for people; `_check_session`, the sort, and
-`_check_realized_conflicts` for sessions) so a fixture's inputs have the
-same shape and the same static guarantees as a fully authored definition's.
+`_check_segment_activity`/`_realize_person` for people; `_check_session`, the
+sort, and `_check_realized_conflicts` for sessions) so a fixture's inputs
+have the same shape and the same static guarantees as a fully authored
+definition's -- a supplied person's `activity` is checked exactly like a
+segment's or an explicit person's, and, since such a person is in neither
+`plan.explicit_people` nor `plan.segments` for `_realize_activity`'s geometry
+index to find by id or by segment, its merged `activity` is threaded through
+the same `registered_activity` overlay a registered population generator's
+output uses, so a validated declaration is also the one honored at
+realization.
 There is no new `Inputs` field -- `to_dict()` and every snapshot's `inputs`
 blob keep their shape -- and no opt-out flag on `reuse_for`: preparing any
 *other* plan from these inputs' seed produces that plan's own generated

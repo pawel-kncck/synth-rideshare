@@ -1746,8 +1746,11 @@ class Inputs:
 
         `people` (default: the plan's own population) is a list of `person()`-shaped declarations, each
         needing a `role` key; realized through the same schema-check -> `_merge_person` -> `_check_access`
-        -> `_realize_person` path as an explicit or registered-generator person, so it has the identical
-        shape and validation. `sessions` (default: the plan's own generated activity) is a list of
+        -> `_check_segment_activity` -> `_realize_person` path as an explicit or registered-generator
+        person, so it has the identical shape and validation, geometry (`activity`) included: a person's
+        merged `activity` is honored at realization exactly like a segment's or a registered population
+        generator's, through the same `registered_activity` overlay `prepare_inputs` threads through
+        `_realize_activity`. `sessions` (default: the plan's own generated activity) is a list of
         trip/shift dicts, each checked with `_check_session` against `people` (not `plan.person_ids`,
         when `people` was supplied) then sorted and checked with `_check_realized_conflicts`, exactly
         like a registered generator's output.
@@ -1760,12 +1763,11 @@ class Inputs:
         """
         if isinstance(seed, bool) or not isinstance(seed, int):
             raise ScenarioError('seed: must be an integer')
+        registered_activity = {}
         if people is None:
-            registered_activity = {}
             realized_people = tuple(_realize_population(plan, seed, registered_activity))
         else:
-            realized_people = tuple(_realize_explicit_people(plan, seed, people))
-            registered_activity = None
+            realized_people = tuple(_realize_explicit_people(plan, seed, people, registered_activity))
         if sessions is None:
             realized_sessions = tuple(_realize_activity(plan, seed, realized_people, registered_activity))
         else:
@@ -1826,16 +1828,25 @@ def _realize_population(plan, seed, registered_activity=None):
     """`registered_activity`, when given, is filled with `{person_id: activity}` for every
     registered-population-generated person with a nonempty merged activity -- the only source that
     knows it, since such a person is never in `plan.explicit_people` and may declare no segment at all.
+
+    `population.<role>s.people` (compile-time explicit people) are appended after either source of
+    generated members, exactly like the segments branch already did -- a registered population
+    generator only replaces segment *allocation*, not the separate explicit-people list, and
+    `compile_scenario` already folds their ids into `plan.person_ids` regardless of generator kind
+    (duplicate-id checks, preference interventions and `_run_registered`'s `known_ids` all validate
+    against the union), so silently dropping them here would let compile-time checks pass for an
+    identity `prepare()` never realizes.
     """
     resolved = plan.resolved
     for role in ROLES:
         section = resolved['population'][f'{role}s']
         if section['generator']['kind'] == 'registered':
-            members = _realize_registered_population(role, section, plan, seed)
+            generated = _realize_registered_population(role, section, plan, seed)
             if registered_activity is not None:
-                for member in members:
+                for member in generated:
                     if member['activity']:
                         registered_activity[member['id']] = member['activity']
+            members = generated + list(plan.explicit_people[role])
         else:
             rng = random.Random(derive_seed(seed, ['population', role]))
             weights = {sid: item['weight'] for sid, item in plan.segments[role].items()}
@@ -1888,8 +1899,9 @@ def _realize_registered_population(role, section, plan, seed):
 
     Each declaration is checked with the same partial `segment_fields(role, explicit=True)` schema an
     explicit person uses, merged with its named segment (if any) through `_merge_person`, and validated
-    with the same `_check_access` -- so a generated person has the identical shape and validation as a
-    segment-allocated or explicit one, ready for `_realize_person`.
+    with the same `_check_access` and `_check_segment_activity` -- so a generated person has the
+    identical shape and validation (geometry included) as a segment-allocated or explicit one, ready
+    for `_realize_person`.
     """
     identifier = section['generator']['implementation']
     implementation = generator_class('population', identifier)
@@ -1923,6 +1935,8 @@ def _realize_registered_population(role, section, plan, seed):
         for key in missing_keys:
             diag.error(f'{path}.{key}', 'required for a generated person without a segment')
         access = _check_access(role, merged, path, plan.platforms, launched_at, plan.behavior, diag, sampled=False)
+        _check_segment_activity(merged['activity'], f'{path}.activity', plan.resolved['world']['zones'], plan.resolved['world'],
+                                plan.resolved['activity']['trips']['generator'], plan.resolved['activity']['shifts']['generator'], diag)
         diag.raise_errors()
         members.append({**access, 'id': person_id, 'segment': segment_id, 'initial_scores': merged['initial_scores'],
                         'activity': merged['activity'], 'traits': {role: merged[role], 'evolution': merged['evolution']}})
@@ -1939,16 +1953,25 @@ def load_profile(values):
     return _profile(values)
 
 
-def _realize_explicit_people(plan, seed, people):
+def _realize_explicit_people(plan, seed, people, registered_activity=None):
     """`Inputs.explicit(people=...)`: realize a list of `person()`-shaped declarations, each needing a
     `role` key (checked before the per-role schema, since it selects which schema and segment table
-    apply), through exactly the same schema-check -> `_merge_person` -> `_check_access` -> `_realize_person`
-    path as an explicit or registered-generator person. Ids must be unique within their role (matching
-    `plan.person_ids`' own per-role uniqueness -- a rider and a driver may share an id).
+    apply), through exactly the same schema-check -> `_merge_person` -> `_check_access` ->
+    `_check_segment_activity` -> `_realize_person` path as an explicit or registered-generator person.
+    Ids must be unique within their role (matching `plan.person_ids`' own per-role uniqueness -- a
+    rider and a driver may share an id).
+
+    `registered_activity`, when given, is filled with `{person_id: activity}` for every supplied person
+    with a nonempty merged activity -- the same out-of-band channel `_realize_population` fills for a
+    registered population generator's people. A supplied person here is never in `plan.explicit_people`
+    or `plan.segments` (it exists only in this call's `people` list), so `_activity_index` cannot recover
+    its geometry by id or by segment; without this, `Inputs.explicit`'s caller-supplied `activity` would
+    be validated but then silently ignored at realization, exactly like an unvalidated one would be.
     """
     role_field = Scalar('string', choices=ROLES)
     schemas = {role: Map(segment_fields(role, explicit=True), partial=True) for role in ROLES}
     launched_at = _launch_times(plan)
+    world_def, activity_def = plan.resolved['world'], plan.resolved['activity']
     seen = {role: set() for role in ROLES}
     for index, item in enumerate(people):
         label = f'people[{index}]'
@@ -1975,8 +1998,12 @@ def _realize_explicit_people(plan, seed, people):
         for key in missing:
             diag.error(f'{label}.{key}', 'required for an explicit person without a segment')
         access = _check_access(role, merged, label, plan.platforms, launched_at, plan.behavior, diag, sampled=False)
+        _check_segment_activity(merged['activity'], f'{label}.activity', world_def['zones'], world_def,
+                                activity_def['trips']['generator'], activity_def['shifts']['generator'], diag)
         diag.raise_errors()
         seen[role].add(identity)
+        if registered_activity is not None and merged['activity']:
+            registered_activity[identity] = merged['activity']
         member = {**access, 'id': identity, 'segment': segment_id, 'initial_scores': merged['initial_scores'],
                  'activity': merged['activity'], 'traits': {role: merged[role], 'evolution': merged['evolution']}}
         yield _realize_person(plan, role, member, seed)
