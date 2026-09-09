@@ -149,6 +149,41 @@ ownership at arbitrary window starts. Keep calculations in `metrics.py`; future
 exports or visualizations must consume its results instead of reimplementing
 metric formulas.
 
+### Phase-1 metric families (`metrics.py`)
+
+These offline, opt-in families (`--windows`/`--platform-detail`/
+`--first-choice-days`) define the semantics any later exporter or report must
+reuse rather than recompute:
+
+- **Window boundaries** are hour offsets from the run's own start (not
+  calendar hours), producing consecutive half-open windows plus a final
+  inclusive one, matching `aggregate_intervals`'s own boundary rule; each
+  window also carries a `cumulative` total in the same shape, from run start
+  through that window's right edge.
+- **Leg-start km attribution**: a service leg (`pickup` = empty km,
+  `transport` = loaded km) is attributed whole to the run segment containing
+  its own `started_at`. This is the rule that makes a continuous run and a
+  restored continuation agree byte-for-byte on driver distance -- a leg is
+  never split across a snapshot boundary.
+- **First choice** is the platform of a rider's *earliest* quote (ordered by
+  `(at, id)`) among intents created in the run; drivers never query, so this
+  is rider-side only.
+- **Installed base** at a period's start is the initial snapshot's
+  `engine.riders[*].apps`, replayed forward with every `app_installed`
+  observation (role `rider`) at or before that instant. Riders multi-home, so
+  installed shares can sum past 100% within a period; that is expected, not a
+  bug to normalize away.
+- **ETA drift** on a canceled order is `timeline.canceled - (p0.at +
+  p0.eta_seconds)`, where `p0` is the order's first (quote-time)
+  `eta_predictions` entry; it is `null` when the platform had no supply at
+  quote time. A positive drift means the platform ran later than first
+  promised.
+- **Transfers**: `settlement_breakdown`'s `transfers` block is always
+  `{"count": 0, "by_reason": {}, "party_delta_minor": 0}` today -- a
+  documented placeholder for the `Transfer` record phase 3 (section 4.A of
+  the [readiness plan](../scenario-readiness-plan.md)) adds and populates,
+  not a claim that a transfer mechanism exists yet.
+
 ## Comparison and interpretation
 
 For each metric, retain raw numerator/denominator or event data and the value

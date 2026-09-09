@@ -48,6 +48,42 @@ checkpoints). Both are labeled `calibration: synthetic` and write every default
 out under their version. A `scenario.ScenarioError` reports every independent
 configuration error together, each naming its path.
 
+A top-level `notes` table (`{id: text string}`, e.g. `{"assumption": "...",
+"approximation": "...", "source": "..."}`) holds free-form authoring notes,
+set with `.with_changes({"notes": {...}})` like any other `Table` (a merge,
+so a script can add keys without restating existing ones). It is part of the
+resolved definition -- hence of `fingerprints['definition']` and of
+`manifest()['resolved']['notes']`, and surfaced again directly at
+`manifest()['notes']` and the `Plan.notes` property for grepping -- but it is
+deliberately **not** part of `controls` (`compile_scenario` builds `controls`
+from `world`/`population`/`activity` only), so two variants that differ only
+in their notes still share prepared inputs through `Inputs.reuse_for`. A
+required key means a JSON definition or saved manifest from before this field
+existed fails `Scenario.load` with `notes: missing required setting`; add
+`"notes": {}` to migrate it. That failure is accepted, not patched with a
+silent default -- a hidden default would break the "complete definition"
+invariant and provenance the rest of this document describes.
+
+`PRESETS['market-blank@1']` is `_base_v1` with empty `platforms` and empty
+`population.<role>.segments`: world, behavior defaults, `activity` generators
+set to `none`, evolution off. `compile_scenario` on it alone fails with
+`platforms: at least one platform is required`, which is the intended
+authoring-time signal that a script must add its own market.
+`platform(id, **parameters)` builds one complete `{id: <PLATFORM entry>}`
+table entry over `MARKETPLACE_DEFAULTS_V1` (rejecting an unknown parameter
+name with its exact path, at authoring time, before `compile_scenario` would);
+`two_platform(first, second, ...)` composes two `platform()` calls and one
+`both-apps` population segment per role into a ready `Scenario` on
+`market-blank@1`. Because `platforms` and `population.<role>.segments` are
+`Table`s (merge by ID into whatever the base already has), starting from
+`market-blank@1` is what lets a script hand these builders a whole market in
+one `with_changes`, instead of first removing a preset's existing named
+segments. `rule()` validates `when` against `marketplace_policy.VISIBLE_FIELDS`
+at authoring time (`ConditionalRule.__post_init__` enforces the same
+condition again at `compile_scenario` time); the visible-field set is read
+from `marketplace_policy`, not duplicated, so it grows automatically when a
+later phase adds zone or window keys to it.
+
 Supported activity generators are `rotation`/`explicit`/`none` shifts and
 `weekly`/`explicit`/`none` trips; the only conflict policy is `fail`. Static
 checks reject crews whose shifts overlap, overlapping explicit shift windows and
@@ -138,6 +174,24 @@ change or a model replacement is visible alongside numeric overrides.
 Support explicit people/cars for small deterministic scenarios and seeded
 generators for scale. Person IDs and exogenous intent IDs must be stable across
 paired variants; do not derive them from later order creation sequence.
+
+`world.map_km` is a sampling extent for the generators (`_sample_point`'s grid
+or continuous draw), not a physical fence: the engine never rejects or clips a
+coordinate outside it, so an explicit trip or shift can name a point beyond
+`map_km` on purpose. `population.<role>.segments`/`people` never carry trip
+geometry -- origins and destinations come only from `activity.trips`, so a
+segment shapes who travels and on what terms, never where. Replacing
+`platforms.<id>` (a full `Table` entry, via `with_changes` or `platform()`)
+requires every policy parameter, the same as any other complete preset value;
+a `policy_change` intervention instead **merges** onto the platform's current
+policy, so it can move just the fields it names. A custom (non-`@1`) rider,
+driver or evolution policy implementation must still accept exactly the
+shipped `RiderTraits`/`DriverTraits`/`EvolutionTraits` dataclasses: `scenario.py`'s
+`TRAITS` mapping that binds segment/person trait dicts is fixed to those three
+schemas regardless of which implementation a scenario selects, so a custom
+policy cannot introduce its own trait fields through population segments yet
+(deriving `TRAITS` from each implementation's own declaration is future work,
+plan section 4.D/4.E).
 
 Validate all seven nonempty rider/driver app combinations, conditional preferred
 apps, car registration sets, and one-car-per-driver initial bindings. People and
