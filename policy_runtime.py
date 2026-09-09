@@ -774,7 +774,9 @@ class PolicyRuntime:
         `@1` path, so main's call sequence is exactly today's. Otherwise the policy proposes an
         `Extend`; this is the sole place that clamps it to the remaining `max_extension_seconds`
         and persists `extension_used_seconds`, so a policy that ignores its own cap can never
-        exceed it."""
+        exceed it. The persisted budget is scoped to `shift.id`: it is read back only when the
+        stored `shift_id` matches the shift currently ending, so a later shift for the same driver
+        starts with a fresh budget instead of inheriting an earlier shift's leftover usage."""
         if 'shift_end' not in self.bindings['driver'].declaration.hooks:
             return 0
         driver = self.engine.drivers[driver_id]
@@ -786,7 +788,11 @@ class PolicyRuntime:
                if settlement.driver_id == driver_id and settlement.at >= window_start)
             + sum(transfer.amount_minor for transfer in self.engine.transfers.values()
                  if transfer.role == 'driver' and transfer.person_id == driver_id and transfer.at >= window_start))
-        used = s.get('shift_extension', {}).get('used_seconds', 0)
+        extension_state = s.get('shift_extension', {})
+        # AST-210 review fix: the budget is per-shift, not per-driver-forever. A prior shift's
+        # leftover state (keyed by its own shift.id) must not bleed into this one, or only the
+        # first shift a driver ever works could extend -- exactly the bug this scoping closes.
+        used = extension_state.get('used_seconds', 0) if extension_state.get('shift_id') == shift.id else 0
         context = self.driver_context(driver_id, shift_net_minor=shift_net_minor, extension_used_seconds=used)
         decision = self.bindings['driver'](t).shift_end(context, freeze(s.get('shift_end', {})),
                     RandomValues(self.seed, ('shift_end', driver_id, shift.id, used)))
@@ -797,7 +803,7 @@ class PolicyRuntime:
             granted = min(a.seconds, t.max_extension_seconds - used)
             if granted <= 0:
                 return 0
-            s['shift_extension'] = {'used_seconds': used + granted}
+            s['shift_extension'] = {'shift_id': shift.id, 'used_seconds': used + granted}
             self.observations.append({'type': 'shift_extended', 'at_seconds': self.now, 'driver_id': driver_id,
                                       'seconds': granted, 'total_seconds': used + granted})
             return granted

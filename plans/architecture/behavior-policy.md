@@ -320,7 +320,7 @@ New `DriverTraitsV2` fields, all default-off:
 | `reposition_horizon_km` | `10` | the deadhead discount's scale (below) |
 | `shift_end_rule` | `'end'` | `'extend_to_target'` may propose extending the shift |
 | `daily_net_target_minor` | `0` | extend while this shift's own net payout is below it |
-| `max_extension_seconds` | `0` | the runtime-enforced cap on total extension across the whole shift |
+| `max_extension_seconds` | `0` | the runtime-enforced cap on total extension within one shift (resets for the driver's next shift) |
 | `extension_step_seconds` | `1800` | the size of each proposed extension slice |
 
 **`idle(context, memory, random)`** fires at two points, both generation-
@@ -374,24 +374,32 @@ hook, so `@1`'s call sequence (`engine.end_shift` right away) is exactly
 today's. Otherwise it computes `context.shift_net_minor` -- driver payouts
 from `completed_ride`/`cancellation_fee` settlements, plus every transfer
 credited or debited to this driver, both restricted to `at >= Shift.started_at`
--- and `context.extension_used_seconds` (persisted across calls in this
-shift's own state). `shift_end_rule != 'extend_to_target'`, an exhausted or
+-- and `context.extension_used_seconds`, the extension budget already spent
+**within this shift**. `shift_end_rule != 'extend_to_target'`, an exhausted or
 zero `max_extension_seconds`, a net payout already at or above
 `daily_net_target_minor`, or an already-exhausted cap all force `Stop`;
 otherwise the policy proposes `Extend(min(extension_step_seconds,
 max_extension_seconds - extension_used_seconds))`. The runtime, not the
 policy, is the sole enforcer of the cap: `PolicyRuntime.shift_end` clamps
-the granted extension to `max_extension_seconds - used`, persists the new
-`used_seconds`, and appends a `shift_extended` observation; a policy that
-proposes more than its own remaining budget can never exceed it, and
-`main._on_shift_end` simply reschedules `shift.end` by whatever positive
-number of seconds came back, or ends the shift now when it is `0`. An
-authored shift that would overlap the *next* scheduled shift for the same
-driver is still a run failure exactly as before extension existed:
-`main._on_shift_start` tests `deactivated_at is not None` explicitly rather
-than wrapping `engine.start_shift` in a broad `except CommandRejected`, so
-the pre-existing "driver is already on shift" `CommandRejected` still
-propagates as a `HandlerFailure`.
+the granted extension to `max_extension_seconds - used`, and persists the new
+`used_seconds` together with the ending shift's own `id` in the driver's
+state (`s['shift_extension'] = {'shift_id', 'used_seconds'}`); it appends a
+`shift_extended` observation. On the *next* call -- whether a later
+extension of the same shift or a wholly different, later shift for the same
+driver -- the stored `used_seconds` is read back only when the stored
+`shift_id` still matches the shift now ending; otherwise `used` starts over
+at `0`. This is what makes the cap a **per-shift** budget: a driver who
+worked yesterday's shift down to `max_extension_seconds` starts today's
+shift with a full, untouched extension budget, exactly as `daily_net_target_minor`'s
+name implies. A policy that proposes more than its own remaining budget can
+never exceed it, and `main._on_shift_end` simply reschedules `shift.end` by
+whatever positive number of seconds came back, or ends the shift now when
+it is `0`. An authored shift that would overlap the *next* scheduled shift
+for the same driver is still a run failure exactly as before extension
+existed: `main._on_shift_start` tests `deactivated_at is not None`
+explicitly rather than wrapping `engine.start_shift` in a broad `except
+CommandRejected`, so the pre-existing "driver is already on shift"
+`CommandRejected` still propagates as a `HandlerFailure`.
 
 **`RiderTraitsV2`** (subclasses `RiderTraits`):
 

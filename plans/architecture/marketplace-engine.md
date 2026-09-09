@@ -557,7 +557,13 @@ scenarios whenever the engine changed:
   by `extension_step_seconds`, then stops exactly at `max_extension_seconds`
   -- `Shift.ended_at` lands exactly at the authored duration plus the cap,
   never beyond it -- while a control with the target already met (`0`) ends
-  the shift on schedule with no `Extend` decision recorded at all.
+  the shift on schedule with no `Extend` decision recorded at all. A second,
+  later shift for the same driver repeats the same extend-twice-then-cap
+  pattern independently of the first: its own `shift_extended` observations
+  start their `total_seconds` back at `extension_step_seconds` rather than
+  continuing the first shift's tally, which is the fixture's regression
+  check on `PolicyRuntime.shift_end` scoping `used_seconds` to the ending
+  shift's own id (behavior-policy.md, "shift_end").
   `scenarios/fixture_p6_dividend.py`: at a dividend's first period close, the
   excess of tracked cash over `reserve_minor` is paid entirely to the driver
   meeting `min_completed_rides` in that period and withheld from one that
