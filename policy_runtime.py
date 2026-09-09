@@ -7,8 +7,8 @@ import math
 from dataclasses import asdict
 
 from behavior_policy import (DriverPolicy, DriverPolicyV2, Download, EvolutionPolicy, EvolutionPolicyV2,
-                             ExpandApps, OpenApp, OrderQuote, Respond, RiderPolicy, RiderPolicyV2,
-                             SwitchPreferred, personal_pickup_eta, rider_reward, driver_reward)
+                             ExpandApps, Extend, OpenApp, OrderQuote, Reposition, Respond, RiderPolicy,
+                             RiderPolicyV2, SwitchPreferred, personal_pickup_eta, rider_reward, driver_reward)
 from marketplace_policy import (EtaProposal, MarketplacePolicy, OfferProposal, PlatformPolicy,
                                 QuoteProposal)
 from marketplace_engine import MAX_COMMITMENTS, CommandRejected, RegulationRejected
@@ -113,9 +113,11 @@ class PolicyRuntime:
             ('policy.rider.progress', self._rider_progress), ('policy.rider.deadline', self._rider_deadline),
             ('policy.dispatch', self._dispatch),
             ('policy.driver.expand', self._driver_expand), ('policy.driver.respond', self._driver_respond),
-            ('policy.driver.progress', self._driver_progress), ('policy.checkpoint', self._checkpoint),
+            ('policy.driver.progress', self._driver_progress), ('policy.driver.idle', self._driver_idle),
+            ('policy.checkpoint', self._checkpoint),
             ('policy.intervention', self._intervene), ('policy.controller', self._controller),
             ('policy.observe_window', self._observe_window), ('policy.revise', self._revise_tick),
+            ('policy.ledger.lease', self._ledger_lease), ('policy.ledger.dividend', self._ledger_dividend),
         ):
             registry.register(kind, handler)
         engine.add_listener(self.on_notification)
@@ -146,6 +148,14 @@ class PolicyRuntime:
             if box['min'][0] <= point[0] <= box['max'][0] and box['min'][1] <= point[1] <= box['max'][1]:
                 return zid
         return None
+
+    def zone_boxes(self):
+        """{zid: {'min', 'max', 'centroid'}} from self.zones ({} with no zones configured) --
+        AST-210's idle hook input, so a driver's reposition destination is always a real zone
+        centroid, never a value the runtime invents past what the scenario declared."""
+        return {zid: {'min': tuple(box['min']), 'max': tuple(box['max']),
+                      'centroid': ((box['min'][0] + box['max'][0]) / 2, (box['min'][1] + box['max'][1]) / 2)}
+                for zid, box in self.zones.items()}
 
     def state(self, role, person_id):
         return self.people[self.key(role, person_id)]
@@ -549,6 +559,13 @@ class PolicyRuntime:
         if p in person.open_apps:
             self.quote(p, self.engine.platform_view(p).rider_request(person.id))
         else:
+            if p not in self.usable_apps('rider', person.id):
+                # AST-210 robustness: a policy.rider.open event scheduled before a platform shut
+                # down would otherwise call open_app on an unlaunched platform and crash the run.
+                # usable_apps can only ever grow before phase 6 (no installs/accounts/launches are
+                # ever revoked), so this branch is unreachable pre-phase-6 and changes no @1 trace.
+                self.queue_rider(intent.id, t.retry_seconds)
+                return
             self.engine.open_app('rider', person.id, p)
 
     def _rider_deadline(self, event):
@@ -620,7 +637,21 @@ class PolicyRuntime:
         finally:
             self._pausing = False
 
+    def queue_idle(self, driver_id, delay=None):
+        """Queue the driver idle hook (AST-210): a no-op unless the bound driver policy declares
+        an `idle` hook -- the default-off switch, so `@1` (and a default-trait `@2`) never gains
+        this scheduled event. Generation-guarded like every other driver hook."""
+        if 'idle' not in self.bindings['driver'].declaration.hooks:
+            return
+        s, t = self.state('driver', driver_id), self.profile('driver', driver_id).driver
+        self.schedule(t.no_offer_seconds if delay is None else delay, 'policy.driver.idle',
+                      driver_id=driver_id, generation=s['generation'])
+
     def queue_expansion(self, driver_id, delay=None):
+        # Queued first, before this function's own early returns, so a driver with no unopened
+        # apps left (which would make queue_expansion itself return early below) still gets the
+        # idle hook at the same no-offer threshold.
+        self.queue_idle(driver_id)
         s, t = self.state('driver', driver_id), self.profile('driver', driver_id).driver
         if s['phase'] not in ('idle', 'busy') or (s['phase'] == 'busy' and not t.expand_while_busy):
             return
@@ -658,6 +689,34 @@ class PolicyRuntime:
             self.queue_expansion(driver_id, t.further_opening_seconds)
         elif not isinstance(a, Stop):
             raise ValueError('Unsupported expansion action')
+
+    def _driver_idle(self, event):
+        """AST-210: fires after an unqueued drop-off and at the no-offer threshold (queue_idle).
+        The precondition re-check covers ordinary races (a commitment, exit request, or
+        deactivation landed first) with a silent return, not a bug. Arrival at a reposition
+        destination does not queue another idle event and does not bump generation
+        (marketplace_engine.reposition/_end_relocation touch no PolicyRuntime state), so a driver
+        cannot oscillate between two zones inside one idle spell."""
+        driver_id = event.payload['driver_id']
+        s = self.state('driver', driver_id)
+        if event.payload['generation'] != s['generation'] or 'idle' not in self.bindings['driver'].declaration.hooks:
+            return
+        driver, view = self.engine.drivers[driver_id], self.engine.driver_view(driver_id)
+        if (driver.shift_id is None or driver.commitments or driver.service_id is not None
+                or driver.relocation_id is not None or view.exit_requested or driver.deactivated_at is not None):
+            return
+        t = self.profile('driver', driver_id).driver
+        context = self.driver_context(driver_id, zones=self.zone_boxes(), current_zone=self.zone_of(view.position),
+                                      zone_scores=s['evolution'].get('zone_scores', {}))
+        decision = self.bindings['driver'](t).idle(context, freeze(s.get('idle', {})),
+                                                    RandomValues(self.seed, ('idle', driver_id, s['generation'])))
+        self.record('driver', driver_id, 'idle', decision)
+        s['idle'] = decision.memory
+        a = decision.action
+        if isinstance(a, Reposition):
+            self.engine.reposition(driver_id, tuple(a.destination))
+        elif not isinstance(a, Stop):
+            raise ValueError('Unsupported idle action')
 
     def private_eta(self, driver_id, pickup):
         """Personal estimate may use the driver's own service across apps."""
@@ -707,6 +766,44 @@ class PolicyRuntime:
             # Bounded by the order reaching boarding or a terminal state (both re-checked here and
             # at this handler's own top-of-function guard next time), so no generation guard is needed.
             self.schedule(t.cancel_check_seconds, 'policy.driver.progress', order_id=order.id)
+
+    def shift_end(self, driver_id):
+        """AST-210: called from main._on_shift_end at the shift's own scheduled end. Returns the
+        number of seconds to extend by, or 0 to end now. `0` immediately (no decision recorded, no
+        state key written) when the bound driver policy does not declare a `shift_end` hook -- the
+        `@1` path, so main's call sequence is exactly today's. Otherwise the policy proposes an
+        `Extend`; this is the sole place that clamps it to the remaining `max_extension_seconds`
+        and persists `extension_used_seconds`, so a policy that ignores its own cap can never
+        exceed it."""
+        if 'shift_end' not in self.bindings['driver'].declaration.hooks:
+            return 0
+        driver = self.engine.drivers[driver_id]
+        shift = self.engine.shifts[driver.shift_id]
+        s, t = self.state('driver', driver_id), self.profile('driver', driver_id).driver
+        window_start = shift.started_at
+        shift_net_minor = (
+            sum(settlement.driver_payout_minor for settlement in self.engine.settlements.values()
+               if settlement.driver_id == driver_id and settlement.at >= window_start)
+            + sum(transfer.amount_minor for transfer in self.engine.transfers.values()
+                 if transfer.role == 'driver' and transfer.person_id == driver_id and transfer.at >= window_start))
+        used = s.get('shift_extension', {}).get('used_seconds', 0)
+        context = self.driver_context(driver_id, shift_net_minor=shift_net_minor, extension_used_seconds=used)
+        decision = self.bindings['driver'](t).shift_end(context, freeze(s.get('shift_end', {})),
+                    RandomValues(self.seed, ('shift_end', driver_id, shift.id, used)))
+        self.record('driver', driver_id, 'shift_end', decision)
+        s['shift_end'] = decision.memory
+        a = decision.action
+        if isinstance(a, Extend):
+            granted = min(a.seconds, t.max_extension_seconds - used)
+            if granted <= 0:
+                return 0
+            s['shift_extension'] = {'used_seconds': used + granted}
+            self.observations.append({'type': 'shift_extended', 'at_seconds': self.now, 'driver_id': driver_id,
+                                      'seconds': granted, 'total_seconds': used + granted})
+            return granted
+        if isinstance(a, Stop):
+            return 0
+        raise ValueError('Unsupported shift_end action')
 
     def on_notification(self, n):
         e, d, kind, person_id = self.engine, n.data, n.kind, n.audience_id
@@ -837,8 +934,16 @@ class PolicyRuntime:
                     duration = service.ended_at - service.started_at
                     reward = driver_reward(t, d['driver_payout_minor'], duration)
                     self.add_reward('driver', person_id, order.platform_id, reward, 'completed', order.id)
+                    # AST-210 zone learning: a completed ride's payout per km, by pickup zone. Gated
+                    # on both self.zones and zone_learning_rate so no @1/zone_learning_rate=0
+                    # driver's state dict ever gains a 'zone_outcomes' key.
+                    if self.zones and getattr(self.profile('driver', person_id).evolution, 'zone_learning_rate', 0) > 0:
+                        km = math.fsum(math.dist(leg.origin, leg.destination) for leg in service.legs)
+                        s.setdefault('zone_outcomes', []).append(
+                            {'zone': self.zone_of(order.pickup), 'payout_minor': d['driver_payout_minor'], 'km': km})
                     if not e.drivers[person_id].commitments:
                         s['post_dropoff_since'] = self.now
+                        self.queue_idle(person_id, 0)
                     else:
                         self.observations.append({'type': 'back_to_back_ready', 'at_seconds': self.now, 'driver_id': person_id})
                 else:
@@ -859,6 +964,9 @@ class PolicyRuntime:
             elif kind == 'shift_ended' and s.get('post_dropoff_since') is not None:
                 self.observations.append({'type': 'post_dropoff_offer_wait', 'driver_id': person_id,
                     'start_seconds': s.pop('post_dropoff_since'), 'end_seconds': self.now, 'censored': True})
+            elif kind == 'driver_deactivated':
+                self.observations.append({'type': 'driver_deactivated', 'at_seconds': self.now,
+                    'driver_id': person_id, 'reason': d['reason']})
 
     def add_reward(self, role, person_id, platform_id, reward, outcome, order_id):
         obs = {'platform_id': platform_id, 'reward': max(-2, min(2, reward)), 'outcome': outcome,
@@ -898,11 +1006,13 @@ class PolicyRuntime:
         self.engine.scheduler.schedule_at(at_seconds, 'policy.checkpoint', {})
 
     def schedule_intervention(self, at_seconds, *, platform_id=None, config=None, role=None, person_id=None,
-                              preferred_app=None, launch=None, regulation=None):
+                              preferred_app=None, launch=None, regulation=None, shutdown=None, delay=None):
         # Config is compiled before scheduling; execution only selects an immutable version.
         finite_number(at_seconds, 'intervention time', minimum=self.now)
         if launch is not None and launch not in self.platforms:
             raise ValueError('Unknown launch platform')
+        if shutdown is not None and shutdown not in self.platforms:
+            raise ValueError('Unknown shutdown platform')
         if platform_id is not None and platform_id not in self.platforms:
             raise ValueError('Unknown platform')
         if config is not None and (not isinstance(config, PlatformPolicy) or platform_id is None):
@@ -911,7 +1021,7 @@ class PolicyRuntime:
             raise ValueError('Preferred intervention requires installed, account-enabled and registered access')
         item = {'at': at_seconds, 'platform_id': platform_id, 'config': plain(config), 'role': role,
                 'person_id': person_id, 'preferred_app': preferred_app, 'launch': launch,
-                'regulation': regulation, 'applied': False}
+                'regulation': regulation, 'shutdown': shutdown, 'delay': delay, 'applied': False}
         self.interventions.append(item)
         self.engine.scheduler.schedule_at(at_seconds, 'policy.intervention', {})
 
@@ -923,6 +1033,12 @@ class PolicyRuntime:
                 self.engine.launch_platform(item['launch'])
             if item.get('regulation') is not None:
                 self.engine.impose_regulation(**item['regulation'])
+            # .get, not [...]: a restored intervention list from a pre-phase-6 snapshot has
+            # neither key, and a shutdown/delay intervention is simply not there to apply.
+            if item.get('shutdown') is not None:
+                self.engine.shutdown_platform(item['shutdown'])
+            if item.get('delay') is not None:
+                self.engine.impose_delay(**item['delay'])
             if item['config'] is not None:
                 config = item['config']
                 implementation = policy_class('marketplace', self.implementations['marketplace'][item['platform_id']])
@@ -988,7 +1104,11 @@ class PolicyRuntime:
                     'exposure': s['exposure'], 'offer_counts': s['offer_counts'],
                     'phase': s['phase'] if role == 'driver' else 'off',
                     'sticky_preference': s.get('sticky_preference', False),
-                    'neighbor_install_share': neighbor_shares[role].get(person_id, {})})
+                    'neighbor_install_share': neighbor_shares[role].get(person_id, {}),
+                    # AST-210 zone learning: unconditional, like every other context key -- an @1
+                    # (or non-V2) evolution policy simply never reads these two, exactly as it never
+                    # read neighbor_install_share before AST-209.
+                    'zone_outcomes': s.get('zone_outcomes', []), 'zones': self.zone_boxes()})
                 decision = self.bindings['evolution'](profile.evolution).checkpoint(context, freeze(s['evolution']),
                         RandomValues(self.seed, ('checkpoint', role, person_id, self.now)))
                 proposals.append((role, person_id, decision))
@@ -1000,6 +1120,8 @@ class PolicyRuntime:
             s['preferred_app'] = a.preferred_app
             s['last_checkpoint'] = self.now
             s['observations'] = []
+            if 'zone_outcomes' in s:  # only if the commitment_released branch ever wrote one
+                s['zone_outcomes'] = []
             if a.download:
                 self.engine.install_app(role, person_id, a.download)
                 self.observations.append({'type': 'app_installed', 'at_seconds': self.now,
@@ -1014,6 +1136,66 @@ class PolicyRuntime:
                 if role == 'driver':
                     s['generation'] += 1
                     self.queue_expansion(person_id)
+
+    # ----------------------------------------------------------------------
+    # evolution.ledger: lease/bankruptcy postings and platform dividends (AST-210). All
+    # configuration travels in the event payload -- nothing enters PolicyRuntime.snapshot(), so a
+    # restored run continues the whole schedule from the scheduler snapshot alone (the
+    # _controller/schedule_program_windows self-rescheduling precedent).
+    # ----------------------------------------------------------------------
+
+    def schedule_ledger(self, *, at_seconds, amount_minor, interval_seconds, bankruptcy_minor):
+        self.engine.scheduler.schedule_at(at_seconds, 'policy.ledger.lease',
+            {'amount_minor': amount_minor, 'interval_seconds': interval_seconds, 'bankruptcy_minor': bankruptcy_minor})
+
+    def _ledger_lease(self, event):
+        amount_minor = event.payload['amount_minor']
+        interval_seconds, bankruptcy_minor = event.payload['interval_seconds'], event.payload['bankruptcy_minor']
+        # The _observe_window ordering idiom: id-sorted by (type name, str(id)) so a mixed-type
+        # driver id table orders identically continuous and restored.
+        for driver_id in sorted(self.engine.drivers, key=lambda d: (type(d).__name__, str(d))):
+            driver = self.engine.drivers[driver_id]
+            if driver.deactivated_at is not None:
+                continue
+            if amount_minor > 0:
+                self.engine.post_transfer('lease', 'driver', driver_id, -amount_minor, counterparty='external')
+            if (bankruptcy_minor is not None
+                    and self.engine.account('driver', driver_id).balance_minor < bankruptcy_minor):
+                self.engine.deactivate_driver(driver_id, 'bankruptcy')
+        # Reschedules unconditionally, like _observe_window: a trailing pending event past the
+        # horizon is identical in a continuous run and a restored one.
+        self.engine.scheduler.schedule_after(interval_seconds, 'policy.ledger.lease',
+            {'amount_minor': amount_minor, 'interval_seconds': interval_seconds, 'bankruptcy_minor': bankruptcy_minor})
+
+    def schedule_dividend(self, *, at_seconds, platform_id, reserve_minor, min_completed_rides, period_seconds,
+                          period_start_seconds):
+        self.engine.scheduler.schedule_at(at_seconds, 'policy.ledger.dividend',
+            {'platform_id': platform_id, 'reserve_minor': reserve_minor, 'min_completed_rides': min_completed_rides,
+             'period_seconds': period_seconds, 'period_start_seconds': period_start_seconds})
+
+    def _ledger_dividend(self, event):
+        pid = event.payload['platform_id']
+        reserve_minor, min_completed_rides = event.payload['reserve_minor'], event.payload['min_completed_rides']
+        period_seconds, period_start = event.payload['period_seconds'], event.payload['period_start_seconds']
+        counts = {}
+        for settlement in self.engine.settlements.values():
+            if (settlement.platform_id == pid and settlement.reason == 'completed_ride'
+                    and period_start <= settlement.at < self.now):
+                counts[settlement.driver_id] = counts.get(settlement.driver_id, 0) + 1
+        qualifying = sorted(driver_id for driver_id, count in counts.items() if count >= min_completed_rides)
+        balance = self.engine.account('platform', pid).balance_minor
+        excess = None if balance is None else balance - reserve_minor
+        if excess is not None and excess > 0 and qualifying:
+            share = excess // len(qualifying)
+            if share > 0:  # the integer remainder always stays with the platform
+                for driver_id in qualifying:
+                    self.engine.post_transfer('dividend', 'driver', driver_id, share, platform_id=pid)
+                self.observations.append({'type': 'dividend_paid', 'at_seconds': self.now, 'platform_id': pid,
+                                          'qualifying_drivers': len(qualifying), 'share_minor': share,
+                                          'excess_minor': excess})
+        self.engine.scheduler.schedule_after(period_seconds, 'policy.ledger.dividend',
+            {'platform_id': pid, 'reserve_minor': reserve_minor, 'min_completed_rides': min_completed_rides,
+             'period_seconds': period_seconds, 'period_start_seconds': self.now})
 
     def snapshot(self):
         return plain({'schema_version': self.schema_version, 'platform_memory': self.platform_memory,

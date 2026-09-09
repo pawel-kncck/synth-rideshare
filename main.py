@@ -50,7 +50,8 @@ class Simulation:
         self.engine = MarketplaceEngine(self.world, registry)
         for platform_id, platform in plan.platforms.items():
             self.engine.add_platform(platform_id, launched=platform.launched,
-                                     starting_cash_minor=platform.starting_cash_minor)
+                                     starting_cash_minor=platform.starting_cash_minor,
+                                     insolvency=platform.insolvency)
         profiles = {}
         for person in inputs.people:
             profile = load_profile(person['profile'], plan.implementations)
@@ -67,6 +68,8 @@ class Simulation:
         self._register_sessions(registry)
         self.scheduler = Scheduler(registry)
         self.engine.bind(self.scheduler)
+        for item in plan.speed_zones:  # no duration: a world.speed_zones entry is permanent
+            self.engine.impose_delay(item['min'], item['max'], item['multiplier'])
         for session in inputs.sessions:
             payload = {k: v for k, v in session.items() if k != 'kind'}
             self.scheduler.schedule_at(session['at_seconds'], f"{session['kind']}.start", payload)
@@ -77,6 +80,19 @@ class Simulation:
                 self.policies.schedule_controller(0, platform_id, interval_seconds=platform.controller[0],
                                                   until_seconds=platform.controller[1])
         self.policies.schedule_program_windows()
+        if plan.ledger is not None:
+            ledger = plan.ledger
+            self.policies.schedule_ledger(at_seconds=ledger['lease_seconds'], amount_minor=ledger['driver_lease_minor'],
+                                          interval_seconds=ledger['lease_seconds'],
+                                          bankruptcy_minor=ledger['driver_bankruptcy_minor'])
+        for platform_id, platform in plan.platforms.items():
+            if platform.dividend is not None:
+                self.policies.schedule_dividend(at_seconds=platform.dividend['period_seconds'],
+                                                platform_id=platform_id,
+                                                reserve_minor=platform.dividend['reserve_minor'],
+                                                min_completed_rides=platform.dividend['min_completed_rides'],
+                                                period_seconds=platform.dividend['period_seconds'],
+                                                period_start_seconds=0)
         for item in plan.interventions:
             self._schedule_intervention(item, inputs.people)
         self._initialize_runner()
@@ -94,6 +110,12 @@ class Simulation:
             self.policies.schedule_intervention(item['at_seconds'], regulation={
                 'max_base_fare_minor': item['max_base_fare_minor'], 'max_per_km_minor': item['max_per_km_minor'],
                 'max_commission_fraction': item['max_commission_fraction']})
+        elif item['kind'] == 'shutdown':
+            self.policies.schedule_intervention(item['at_seconds'], shutdown=item['platform'])
+        elif item['kind'] == 'delay':
+            self.policies.schedule_intervention(item['at_seconds'], delay={
+                'box_min': item['min'], 'box_max': item['max'], 'multiplier': item['multiplier'],
+                'duration_seconds': item['duration_seconds']})
         else:
             targets = [p['id'] for p in people if p['role'] == item['role']
                        and (p['id'] in item['people'] or (item['segment'] is not None and p['segment'] == item['segment']))]
@@ -249,6 +271,17 @@ class Simulation:
 
     def _on_shift_start(self, event):
         driver_id = event.payload['driver']
+        driver = self.engine.drivers[driver_id]
+        # An explicit deactivated_at test, never try/except CommandRejected: that would also
+        # swallow the "driver already on shift" run failure an authored extension overlapping the
+        # next scheduled shift must still produce (AST-210 resolution note 10).
+        if driver.deactivated_at is not None:
+            self._write_log('session_skipped', kind='shift', id=event.payload['id'], driver=driver.id,
+                            reason=f'driver deactivated ({driver.deactivation_reason})')
+            self.policies.observations.append({'type': 'session_skipped', 'at_seconds': self.current_time,
+                                               'kind': 'shift', 'id': event.payload['id'], 'driver': driver.id,
+                                               'reason': driver.deactivation_reason})
+            return
         shift = self.engine.start_shift(driver_id, tuple(event.payload['location']))
         if event.payload['shift_seconds'] is not None:
             self.scheduler.schedule_after(event.payload['shift_seconds'], 'shift.end',
@@ -256,8 +289,13 @@ class Simulation:
 
     def _on_shift_end(self, event):
         driver = self.engine.drivers[event.payload['driver']]
-        if driver.shift_id == event.payload['shift_id']:
-            self.engine.end_shift(driver.id)
+        if driver.shift_id != event.payload['shift_id']:
+            return
+        extension = self.policies.shift_end(driver.id)
+        if extension > 0:
+            self.scheduler.schedule_after(extension, 'shift.end', dict(event.payload))
+            return
+        self.engine.end_shift(driver.id)
 
     def _on_trip_start(self, event):
         self.engine.begin_intent(event.payload['rider'], tuple(event.payload['origin']),
