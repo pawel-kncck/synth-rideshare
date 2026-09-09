@@ -191,6 +191,9 @@ def load_run(path):
     metric inputs. A missing terminal record is an incomplete log, not a run
     with zero outcomes. Handled failures have a final snapshot and are analyzed
     only through their actual stopping time, with failed status preserved.
+    `session_skipped` (AST-210: a scheduled shift skipped for a deactivated
+    driver) is diagnostic in the same way as `notification` -- passed through
+    without affecting header/footer/boundary bookkeeping.
     """
     header = footer = initial = final = None
     with Path(path).open(encoding="utf-8") as stream:
@@ -227,7 +230,7 @@ def load_run(path):
                     raise ValueError("State timestamp does not match its scheduler")
             elif kind == "run_finished":
                 footer = record
-            elif kind != "notification":
+            elif kind not in ("notification", "session_skipped"):
                 raise ValueError(f"Unknown log record type: {kind!r}")
     if any(value is None for value in (header, initial, final, footer)):
         raise ValueError("Incomplete log: initial/final states and run_finished are required")
@@ -248,7 +251,8 @@ def _reject_constant(value):
 
 def _tables(snapshot):
     return {name: {record["id"]: record for record in snapshot["engine"].get(name, [])}
-            for name in ("shifts", "intents", "quotes", "orders", "offers", "services", "settlements", "transfers")}
+            for name in ("shifts", "intents", "quotes", "orders", "offers", "services", "relocations",
+                        "settlements", "transfers")}
 
 
 def _accounts(snapshot, role):
@@ -596,19 +600,32 @@ def driver_distance(initial, final):
     restored one. Cohorting by identity instead means a leg is counted
     exactly once no matter where a snapshot falls, which is what makes a
     continuous run and a restored continuation agree byte-for-byte on driver
-    distance (see plans/architecture/experiment-runner.md). Reposition legs
-    do not exist yet (plan phase 6, marketplace-engine.md) and would land in
-    other_km; boarding legs have zero length and add nothing to any bucket.
-    loaded_km equals summary.completed_distance_km whenever every transport
-    leg in the run belongs to a completed order (true exactly when
-    orders_active_at_end is 0). loaded_share_pct is null for a driver (or the
-    fleet) with no logged distance at all.
+    distance (see plans/architecture/experiment-runner.md). Boarding legs
+    have zero length and add nothing to any bucket. loaded_km equals
+    summary.completed_distance_km whenever every transport leg in the run
+    belongs to a completed order (true exactly when orders_active_at_end is
+    0). loaded_share_pct is null for a driver (or the fleet) with no logged
+    distance at all.
+
+    reposition_km (AST-210) sums `Relocation` legs the same way, but
+    cohorted by relocation id, not by a `started_at` window -- a relocation
+    has exactly one leg, so "the relocation is new in this run" already
+    settles it, and never testing a time bound is what keeps a snapshot
+    boundary landing exactly on a relocation's own start from double
+    counting it. total_km now includes reposition_km, so loaded_share_pct's
+    denominator grows accordingly -- exactly plan section 10 S6's "net
+    earnings per total km including empty and reposition km".
     """
     end = final["scheduler"]["clock_seconds"]
     before_services = {s["id"]: s for s in initial["engine"]["services"]}
-    by_driver = {d["id"]: {"empty": [], "loaded": [], "other": []} for d in final["engine"]["drivers"]}
+    before_relocations = {r["id"] for r in initial["engine"].get("relocations", [])}
+
+    def _blank_bucket():
+        return {"empty": [], "loaded": [], "other": [], "reposition": []}
+
+    by_driver = {d["id"]: _blank_bucket() for d in final["engine"]["drivers"]}
     for service in final["engine"]["services"]:
-        bucket = by_driver.setdefault(service["driver_id"], {"empty": [], "loaded": [], "other": []})
+        bucket = by_driver.setdefault(service["driver_id"], _blank_bucket())
         already = len(before_services[service["id"]]["legs"]) if service["id"] in before_services else 0
         for index, leg in enumerate(service["legs"]):
             if index < already or leg["started_at"] > end:
@@ -616,17 +633,25 @@ def driver_distance(initial, final):
             distance = math.dist(leg["origin"], leg["destination"])
             key = "empty" if leg["kind"] == "pickup" else "loaded" if leg["kind"] == "transport" else "other"
             bucket[key].append(distance)
+    for relocation in final["engine"].get("relocations", []):
+        if relocation["id"] in before_relocations:
+            continue
+        bucket = by_driver.setdefault(relocation["driver_id"], _blank_bucket())
+        for leg in relocation["legs"]:
+            if leg["started_at"] > end:
+                continue
+            bucket["reposition"].append(math.dist(leg["origin"], leg["destination"]))
 
     def _row(bucket):
-        empty_km, loaded_km, other_km = math.fsum(bucket["empty"]), math.fsum(bucket["loaded"]), math.fsum(bucket["other"])
-        total_km = empty_km + loaded_km + other_km
-        return {"empty_km": empty_km, "loaded_km": loaded_km, "other_km": other_km, "total_km": total_km,
-                "loaded_share_pct": 100 * loaded_km / total_km if total_km else None}
+        empty_km, loaded_km = math.fsum(bucket["empty"]), math.fsum(bucket["loaded"])
+        other_km, reposition_km = math.fsum(bucket["other"]), math.fsum(bucket["reposition"])
+        total_km = empty_km + loaded_km + other_km + reposition_km
+        return {"empty_km": empty_km, "loaded_km": loaded_km, "other_km": other_km, "reposition_km": reposition_km,
+                "total_km": total_km, "loaded_share_pct": 100 * loaded_km / total_km if total_km else None}
 
     result = {driver_id: _row(bucket) for driver_id, bucket in by_driver.items()}
-    result["totals"] = _row({"empty": [v for b in by_driver.values() for v in b["empty"]],
-                             "loaded": [v for b in by_driver.values() for v in b["loaded"]],
-                             "other": [v for b in by_driver.values() for v in b["other"]]})
+    result["totals"] = _row({key: [v for b in by_driver.values() for v in b[key]]
+                             for key in ("empty", "loaded", "other", "reposition")})
     return result
 
 

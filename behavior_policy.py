@@ -153,6 +153,14 @@ class DriverTraitsV2(DriverTraits):
     penalty_tolerance_minor: int = 0
     availability: str = 'always_open'
     tie_break: str = 'stable'
+    idle_rule: str = 'stay'
+    reposition_min_gain_minor: float = 0
+    max_reposition_km: float = 5
+    reposition_horizon_km: float = 10
+    shift_end_rule: str = 'end'
+    daily_net_target_minor: int = 0
+    max_extension_seconds: float = 0
+    extension_step_seconds: float = 1800
 
     def __post_init__(self):
         super().__post_init__()
@@ -175,6 +183,16 @@ class DriverTraitsV2(DriverTraits):
             raise ValueError('Unknown driver availability policy')
         if self.tie_break not in ('stable', 'random'):
             raise ValueError('Unknown driver tie-break')
+        if self.idle_rule not in ('stay', 'zone_return'):
+            raise ValueError('Unknown driver idle rule')
+        finite_number(self.reposition_min_gain_minor, 'reposition_min_gain_minor', minimum=0)
+        finite_number(self.max_reposition_km, 'max_reposition_km', minimum=0)
+        finite_number(self.reposition_horizon_km, 'reposition_horizon_km', strictly_positive=True)
+        if self.shift_end_rule not in ('end', 'extend_to_target'):
+            raise ValueError('Unknown driver shift_end rule')
+        finite_number(self.daily_net_target_minor, 'daily_net_target_minor', minimum=0)
+        finite_number(self.max_extension_seconds, 'max_extension_seconds', minimum=0)
+        finite_number(self.extension_step_seconds, 'extension_step_seconds', strictly_positive=True)
 
 
 @dataclass(frozen=True)
@@ -207,6 +225,7 @@ class EvolutionTraitsV2(EvolutionTraits):
     install_trigger_peer_share: float = 0
     vicinity_km: float = 2
     adoption_phase: str = 'any'
+    zone_learning_rate: float = 0
 
     def __post_init__(self):
         super().__post_init__()
@@ -214,6 +233,7 @@ class EvolutionTraitsV2(EvolutionTraits):
         finite_number(self.vicinity_km, 'vicinity_km', strictly_positive=True)
         if self.adoption_phase not in ('any', 'idle'):
             raise ValueError('Unknown adoption phase gate')
+        finite_number(self.zone_learning_rate, 'zone_learning_rate', maximum=1)
 
 
 @dataclass(frozen=True)
@@ -268,6 +288,27 @@ class Respond:
 class ExpandApps:
     open_app: str
     close_apps: tuple = ()
+
+
+@dataclass(frozen=True)
+class Reposition:
+    """`driver_participation@2` idle hook (AST-210): move without any accepted work, to
+    `destination` -- a service-free `Relocation`, applied by the runtime as
+    `engine.reposition(driver_id, destination)`. `zone_id`, when given, is the destination zone's
+    id for diagnostics only; the engine derives nothing from it."""
+    destination: tuple
+    zone_id: str | None = None
+
+
+@dataclass(frozen=True)
+class Extend:
+    """`driver_participation@2` shift_end hook (AST-210): propose extending the current shift by
+    this many seconds. The policy proposes; `PolicyRuntime.shift_end` is the sole enforcer of
+    `max_extension_seconds`, clamping (and possibly dropping) the proposal."""
+    seconds: float
+
+    def __post_init__(self):
+        finite_number(self.seconds, 'extension seconds', strictly_positive=True)
 
 
 @dataclass(frozen=True)
@@ -572,10 +613,12 @@ class DriverPolicyV2(DriverPolicy):
     declaration = Declaration('driver_participation', '2', DriverTraitsV2,
         ('now', 'position', 'commitments', 'offer', 'private_eta_seconds', 'free_slots',
          'open_apps', 'usable_apps', 'preferred_app', 'scores', 'announced', 'exit_requested',
-         'pending_offers', 'terms', 'estimated_wait_seconds', 'speed_kmh', 'tie_draw'),
-        (ExpandApps, Respond, Cancel, Stop, Wait), 1, ('expand', 'respond', 'progress'),
+         'pending_offers', 'terms', 'estimated_wait_seconds', 'speed_kmh', 'tie_draw',
+         'zones', 'current_zone', 'zone_scores', 'shift_net_minor', 'extension_used_seconds'),
+        (ExpandApps, Respond, Cancel, Stop, Wait, Reposition, Extend), 1,
+        ('expand', 'respond', 'progress', 'idle', 'shift_end'),
         (('no_offer_since', 'number'), ('visited', 'array'), ('expanded_at', 'number'),
-         ('last_result', 'string')))
+         ('last_result', 'string'), ('repositioned_at', 'number')))
 
     def respond(self, context, memory, random):
         """Layers response_rule/hold_for_better on the unchanged @1 logistic (identical score,
@@ -639,6 +682,49 @@ class DriverPolicyV2(DriverPolicy):
                 return Decision(Cancel(order.id, 'driver', 'private pickup eta exceeds threshold'), plain(memory),
                                 'Cancel an overlong pickup whose declared penalty exposure is tolerable')
         return super().progress(context, memory, random)
+
+    def idle(self, context, memory, random):
+        """AST-210: fires after an unqueued drop-off and again at the no-offer threshold
+        (policy_runtime.PolicyRuntime.queue_idle). `idle_rule='zone_return'` compares the expected
+        net per km where the driver stands (`zone_scores`, learned by `personal_evolution@2`) against
+        every other reachable zone's, discounted by deadhead distance over a fixed horizon, and
+        repositions only when the gain clears `reposition_min_gain_minor`. The random stream is
+        unused -- this is a deterministic rule -- but RandomValues is still passed for hook-contract
+        uniformity with every other typed hook."""
+        t, m = self.traits, plain(memory)
+        if t.idle_rule != 'zone_return' or not context.zones:
+            return Decision(Stop('stay'), m, 'Idle rule is stay, or no zones are configured')
+        here = context.zone_scores.get(context.current_zone, 0.0)
+        candidates = []
+        for zid in sorted(context.zones):
+            if zid == context.current_zone:
+                continue
+            distance = math.dist(context.position, context.zones[zid]['centroid'])
+            if distance > t.max_reposition_km:
+                continue
+            value = context.zone_scores.get(zid, 0.0) * t.reposition_horizon_km / (t.reposition_horizon_km + distance)
+            candidates.append((value, zid))
+        best = min(candidates, key=lambda item: (-item[0], item[1])) if candidates else None
+        if best is not None and best[0] - here >= t.reposition_min_gain_minor:
+            value, zid = best
+            m['repositioned_at'] = context.now
+            return Decision(Reposition(context.zones[zid]['centroid'], zid), m,
+                            'Return to the zone with the higher expected net per km')
+        return Decision(Stop('staying'), m, 'No zone beats the expected net per km of staying')
+
+    def shift_end(self, context, memory, random):
+        """AST-210: `shift_end_rule='extend_to_target'` keeps extending, in
+        `extension_step_seconds` slices capped to the remaining `max_extension_seconds`, while this
+        shift's own net payout (`shift_net_minor`) is still below `daily_net_target_minor`. The
+        policy only proposes; `PolicyRuntime.shift_end` clamps the proposal to the actual remaining
+        cap and is the sole place `extension_used_seconds` is persisted."""
+        t, m = self.traits, plain(memory)
+        if (t.shift_end_rule != 'extend_to_target' or t.max_extension_seconds <= 0
+                or context.shift_net_minor >= t.daily_net_target_minor
+                or context.extension_used_seconds >= t.max_extension_seconds):
+            return Decision(Stop('end shift'), m, 'Extension is off, exhausted, or the net target is already met')
+        seconds = min(t.extension_step_seconds, t.max_extension_seconds - context.extension_used_seconds)
+        return Decision(Extend(seconds), m, "Shift net payout is below target; extend toward the cap")
 
 
 class EvolutionPolicy:
@@ -705,13 +791,14 @@ class EvolutionPolicyV2(EvolutionPolicy):
     `adoption_phase` discards its result) and applies three overrides to the result: sticky
     preference, an idle-only adoption phase, and a deterministic peer-installed-share cascade."""
     declaration = Declaration('personal_evolution', '2', EvolutionTraitsV2,
-        EvolutionPolicy.declaration.inputs + ('phase', 'neighbor_install_share', 'sticky_preference'),
-        (Evolve,), 1, ('checkpoint',), EvolutionPolicy.declaration.memory_schema)
+        EvolutionPolicy.declaration.inputs + ('phase', 'neighbor_install_share', 'sticky_preference',
+                                              'zone_outcomes', 'zones'),
+        (Evolve,), 1, ('checkpoint',), EvolutionPolicy.declaration.memory_schema + (('zone_scores', 'object'),))
 
     def checkpoint(self, context, memory, random):
         t = self.traits
         decision = super().checkpoint(context, memory, random)
-        preferred_app, download = decision.action.preferred_app, decision.action.download
+        preferred_app, download, m = decision.action.preferred_app, decision.action.download, decision.memory
         if context.sticky_preference:
             # Learning-driven switching is suppressed; fatigue switching still works because it
             # runs in the rider policy, not here.
@@ -723,7 +810,21 @@ class EvolutionPolicyV2(EvolutionPolicy):
                                 and context.neighbor_install_share.get(p, 0) >= t.install_trigger_peer_share)
             if candidates:
                 download = candidates[0]
-        return Decision(Evolve(download, preferred_app, t.onboard_car), decision.memory, decision.explanation)
+        if t.zone_learning_rate:
+            # AST-210: fold this checkpoint's completed-ride zone outcomes into zone_scores, an EWMA
+            # per zone read back by driver_participation@2's idle hook. A zone's first sighting
+            # anchors on its own observation, not on 0, so one ride does not manufacture a swing
+            # toward zero. The key is never written when the rate is 0, so an @1/default-@2 memory
+            # dict stays byte-identical.
+            zone_scores = dict(m.get('zone_scores', {}))
+            for obs in context.zone_outcomes:
+                if obs['zone'] is None:
+                    continue
+                value = obs['payout_minor'] / max(0.1, obs['km'])
+                prev = zone_scores.get(obs['zone'], value)
+                zone_scores[obs['zone']] = prev + t.zone_learning_rate * (value - prev)
+            m = {**m, 'zone_scores': zone_scores}
+        return Decision(Evolve(download, preferred_app, t.onboard_car), m, decision.explanation)
 
 
 def personal_pickup_eta(now, position, orders, speed_kmh, boarding_seconds):

@@ -198,6 +198,7 @@ class Platform:
     open_driver_ids: set = field(default_factory=set)
     open_rider_ids: set = field(default_factory=set)
     starting_cash_minor: Optional[int] = None  # seeds the platform's cash account; None = not tracked
+    insolvency: Optional[str] = None  # None | "shutdown" (AST-210): shut down when tracked cash reaches zero
 
 
 @dataclass(frozen=True)
@@ -250,6 +251,9 @@ class Driver:
     service_id: Optional[int] = None  # the physical service currently performed
     accounts: set = field(default_factory=set)
     paused_apps: set = field(default_factory=set)  # subset of open_apps: open for commitments, not accepting
+    relocation_id: Optional[int] = None  # AST-210: the live Relocation, if any
+    deactivated_at: Optional[float] = None  # AST-210: set once; refuses any later start_shift
+    deactivation_reason: Optional[str] = None
 
 
 @dataclass
@@ -403,6 +407,38 @@ class Service:
     ended_at: Optional[float] = None
     end_reason: Optional[str] = None
     end_position: Optional[tuple] = None
+
+
+@dataclass
+class Relocation:
+    """A service-free repositioning move (AST-210): no order, no settlement, no platform.
+
+    `legs` mirrors `Service.legs` -- append-only, exactly one `Leg(kind="reposition", ...)` -- so
+    `metrics.driver_distance`'s cohorting rule (identity, never a time filter) applies unchanged.
+    `end_reason` is one of "arrived" (reached destination), "interrupted" (an accepted order
+    started pickup from wherever the car actually was), "shift_ended", or "deactivated".
+    """
+    id: int
+    driver_id: Any
+    car_id: Any
+    started_at: float
+    legs: list = field(default_factory=list)
+    ended_at: Optional[float] = None
+    end_reason: Optional[str] = None
+    end_position: Optional[tuple] = None
+
+
+@dataclass(frozen=True)
+class SpeedZone:
+    """A closed box whose speed multiplier applies to legs BEGINNING inside it while active
+    (AST-210). A static `world.speed_zones` entry has no end time; a `delay` intervention sets
+    `ends_at`. A leg already in progress keeps its planned end -- `_begin_leg` computes it once."""
+    id: int
+    at: float
+    min: tuple
+    max: tuple
+    multiplier: float
+    ends_at: Optional[float] = None  # None = until the run ends
 
 
 @dataclass(frozen=True)
@@ -715,7 +751,7 @@ class MarketplaceEngine:
     listeners reacting with further commands always see a consistent market.
     """
 
-    EVENT_KINDS = ("offer.expire", "service.advance")
+    EVENT_KINDS = ("offer.expire", "service.advance", "relocation.advance", "platform.insolvency")
 
     def __init__(self, world, registry):
         self.world = world
@@ -723,6 +759,8 @@ class MarketplaceEngine:
         self.scheduler = None
         registry.register("offer.expire", self._on_offer_expiry)
         registry.register("service.advance", self._on_service_advance)
+        registry.register("relocation.advance", self._on_relocation_advance)
+        registry.register("platform.insolvency", self._on_platform_insolvency)
         self.platforms = {}
         self.riders = {}
         self.drivers = {}
@@ -733,13 +771,15 @@ class MarketplaceEngine:
         self.orders = {}
         self.offers = {}
         self.services = {}
+        self.relocations = {}
         self.settlements = {}
         self.transfers = {}
         self.regulations = {}
+        self.speed_zones = {}
         self._sequences = {
             name: itertools.count(1)
-            for name in ("shift", "intent", "quote", "order", "offer", "service", "settlement", "transfer",
-                        "regulation")
+            for name in ("shift", "intent", "quote", "order", "offer", "service", "relocation", "settlement",
+                        "transfer", "regulation", "speed_zone")
         }
         self.accounts = {}  # (role, id) -> Account; derived, never decoded from a snapshot (see restore())
         self._pending_by_order = {}  # order id -> set of pending offer ids
@@ -795,13 +835,17 @@ class MarketplaceEngine:
     # Population and access
     # ----------------------------------------------------------------------
 
-    def add_platform(self, platform_id, name=None, launched=True, *, starting_cash_minor=None):
+    def add_platform(self, platform_id, name=None, launched=True, *, starting_cash_minor=None, insolvency=None):
         if platform_id in self.platforms:
             raise CommandRejected(f"Platform {platform_id!r} already exists")
         if starting_cash_minor is not None:
             minor_units(starting_cash_minor, "starting_cash_minor")
+        if insolvency not in (None, "shutdown"):
+            raise CommandRejected("insolvency must be None or 'shutdown'")
+        if insolvency is not None and starting_cash_minor is None:
+            raise CommandRejected("insolvency requires a tracked starting_cash_minor")
         self.platforms[platform_id] = Platform(platform_id, name or platform_id, launched,
-                                                starting_cash_minor=starting_cash_minor)
+                                                starting_cash_minor=starting_cash_minor, insolvency=insolvency)
         self._open_account("platform", platform_id, starting_cash_minor)
         return self.platforms[platform_id]
 
@@ -871,6 +915,8 @@ class MarketplaceEngine:
     def start_shift(self, driver_id, location):
         driver = self._driver(driver_id)
         location = point(location, "Location")
+        if driver.deactivated_at is not None:
+            raise CommandRejected(f"Driver {driver_id!r} was deactivated ({driver.deactivation_reason})")
         if driver.shift_id is not None:
             raise CommandRejected(f"Driver {driver_id!r} is already on shift")
         with self._transition():
@@ -903,6 +949,8 @@ class MarketplaceEngine:
         return shift
 
     def _finish_shift(self, driver, shift):
+        if driver.relocation_id is not None:
+            self._end_relocation(self.relocations[driver.relocation_id], "shift_ended")
         assert driver.service_id is None and not driver.commitments
         shift.ended_at = self.now
         driver.shift_id = None
@@ -1004,6 +1052,35 @@ class MarketplaceEngine:
             and platform_id in self.cars[driver.car_id].registrations
             and self.platforms[platform_id].launched
         )
+
+    def deactivate_driver(self, driver_id, reason):
+        """Permanently retire a driver (AST-210): every not-yet-boarded commitment is canceled, a
+        boarded ride finishes on frozen terms, and any later `start_shift` is refused. Reuses
+        `end_shift` for the presence side (exit request, pending-offer sweep, `driver_availability`
+        notifications, and the eventual `_finish_shift` once commitments drain) so a boarded ride's
+        own drop-off closes the apps exactly as an ordinary shift end would. Idempotent --
+        deactivating an already-deactivated driver changes nothing and notifies nothing."""
+        driver = self._driver(driver_id)
+        if driver.deactivated_at is not None:
+            return driver
+        if not isinstance(reason, str) or not reason:
+            raise CommandRejected("A deactivation needs a reason")
+        with self._transition():
+            driver.deactivated_at = self.now
+            driver.deactivation_reason = reason
+            if driver.relocation_id is not None:
+                self._end_relocation(self.relocations[driver.relocation_id], "deactivated")
+            if driver.shift_id is not None:
+                self.end_shift(driver_id)
+            for order_id in list(driver.commitments):
+                order = self.orders[order_id]
+                service = self.services.get(order.service_id)
+                if service is not None and service.ended_at is None and service.phase == "transport":
+                    continue  # an onboard ride completes first, on frozen terms
+                self.cancel_order(order_id, "driver", "driver_deactivated")
+            self._notify("driver", driver_id, "driver_deactivated", reason=reason,
+                         remaining_commitments=len(driver.commitments))
+        return driver
 
     # ----------------------------------------------------------------------
     # Regulation
@@ -1325,6 +1402,10 @@ class MarketplaceEngine:
         driver = self.drivers[order.assignment.driver_id]
         car = self.cars[driver.car_id]
         assert driver.service_id is None and driver.commitments[0] == order.id
+        if driver.relocation_id is not None:
+            # An accepted order interrupts a live reposition: pickup starts from wherever the car
+            # actually was (the position_at read below), never the relocation's planned destination.
+            self._end_relocation(self.relocations[driver.relocation_id], "interrupted")
         origin = car.motion.position_at(self.now)
         service = Service(self._next_id("service"), order.id, order.platform_id, driver.id,
                           car.id, order.rider_id, self.now)
@@ -1340,7 +1421,7 @@ class MarketplaceEngine:
         if kind == "boarding":
             duration = self.world.boarding_seconds
         else:
-            duration = self.world.travel_seconds(math.dist(origin, destination))
+            duration = self.travel_seconds(math.dist(origin, destination), origin)
         leg = Leg(kind, origin, destination, self.now, self.now + duration)
         service.legs.append(leg)
         self.cars[service.car_id].motion = Motion(origin, destination, self.now, self.now + duration)
@@ -1431,6 +1512,104 @@ class MarketplaceEngine:
                 shift = self.shifts.get(driver.shift_id)
                 if shift is not None and shift.exit_requested_at is not None:
                     self._finish_shift(driver, shift)
+
+    # ----------------------------------------------------------------------
+    # Repositioning and delays (AST-210)
+    # ----------------------------------------------------------------------
+
+    def travel_seconds(self, distance_km, origin):
+        """Travel time for a leg beginning at `origin`, at today's effective speed there. Early
+        returns the identical expression `self.world.travel_seconds(distance_km)` when no speed
+        zone exists -- not an equivalent one -- so every seed-0 `@1` run stays byte-identical."""
+        if not self.speed_zones:
+            return self.world.travel_seconds(distance_km)
+        return distance_km / self.speed_kmh_at(origin) * 3600
+
+    def speed_kmh_at(self, position, at_seconds=None):
+        """`world.speed_kmh` times the multiplier of every active speed zone (in id order, for
+        float determinism) whose closed box contains `position`. A static `world.speed_zones`
+        entry has no end time; a `delay` intervention's ends when its duration elapses."""
+        at_seconds = self.now if at_seconds is None else at_seconds
+        speed = self.world.speed_kmh
+        for record in sorted(self.speed_zones.values(), key=lambda r: r.id):
+            if (record.at <= at_seconds and (record.ends_at is None or at_seconds < record.ends_at)
+                    and record.min[0] <= position[0] <= record.max[0]
+                    and record.min[1] <= position[1] <= record.max[1]):
+                speed *= record.multiplier
+        return speed
+
+    def impose_delay(self, box_min, box_max, multiplier, duration_seconds=None):
+        """A physical speed multiplier over a closed box, from now until `duration_seconds` later
+        (`None` = until the run ends). Legs already in progress are unaffected -- `planned_end` is
+        computed once, in `_begin_leg`. No notification: a delay is physical and public by
+        construction, exactly like `impose_regulation`."""
+        box_min, box_max = point(box_min, "min"), point(box_max, "max")
+        finite(multiplier, "multiplier", strictly_positive=True)
+        if box_max[0] <= box_min[0] or box_max[1] <= box_min[1]:
+            raise CommandRejected("A delay box needs max greater than min on both axes")
+        finite(duration_seconds, "duration_seconds", strictly_positive=True, allow_none=True)
+        with self._transition():
+            record = SpeedZone(self._next_id("speed_zone"), self.now, box_min, box_max, multiplier,
+                               None if duration_seconds is None else self.now + duration_seconds)
+            self.speed_zones[record.id] = record
+        return record
+
+    def reposition(self, driver_id, destination):
+        """Move a driver without any accepted work, to build supply where policy expects it. No
+        settlement, no platform side at all: the only notifications are driver-audience
+        `reposition_started`/`reposition_ended`. A repositioning driver stays `accepting` (unless
+        paused) and is exactly as visible to every platform as a moving on-service driver --
+        `PlatformView.drivers()` reads `car.motion.position_at(now)` either way -- so this leaks
+        nothing into a hidden-state-free candidate list."""
+        driver = self._driver(driver_id)
+        destination = point(destination, "Destination")
+        if driver.shift_id is None:
+            raise CommandRejected(f"Driver {driver_id!r} is not on shift")
+        if driver.deactivated_at is not None:
+            raise CommandRejected(f"Driver {driver_id!r} was deactivated ({driver.deactivation_reason})")
+        if driver.commitments or driver.service_id is not None:
+            raise CommandRejected(f"Driver {driver_id!r} cannot reposition while committed to work")
+        if driver.relocation_id is not None:
+            raise CommandRejected(f"Driver {driver_id!r} is already repositioning")
+        car = self.cars[driver.car_id]
+        origin = car.motion.position_at(self.now)
+        duration = self.travel_seconds(math.dist(origin, destination), origin)
+        with self._transition():
+            record = Relocation(self._next_id("relocation"), driver_id, car.id, self.now)
+            record.legs.append(Leg("reposition", origin, destination, self.now, self.now + duration))
+            self.relocations[record.id] = record
+            driver.relocation_id = record.id
+            car.motion = Motion(origin, destination, self.now, self.now + duration)
+            self.scheduler.schedule_after(duration, "relocation.advance", {"relocation_id": record.id, "leg": 0})
+            self._notify("driver", driver_id, "reposition_started", relocation_id=record.id, origin=origin,
+                         destination=destination, arrives_at=self.now + duration)
+        return record
+
+    def _end_relocation(self, relocation, reason):
+        """End a live relocation wherever the car actually is. Called from `_on_relocation_advance`
+        ("arrived"), `_start_service` ("interrupted" -- an accepted order starts pickup from here),
+        `_finish_shift` ("shift_ended"), and `deactivate_driver` ("deactivated"). Always invoked
+        from inside an already-open transition, exactly like `_end_service`."""
+        driver = self.drivers[relocation.driver_id]
+        car = self.cars[relocation.car_id]
+        position = car.motion.position_at(self.now)
+        relocation.ended_at = self.now
+        relocation.end_reason = reason
+        relocation.end_position = position
+        driver.relocation_id = None
+        car.motion = Motion.idle(position, self.now)
+        self._notify("driver", driver.id, "reposition_ended", relocation_id=relocation.id, reason=reason,
+                     position=position)
+
+    def _on_relocation_advance(self, event):
+        relocation = self.relocations.get(event.payload["relocation_id"])
+        if relocation is None or relocation.ended_at is not None or event.payload["leg"] != len(relocation.legs) - 1:
+            return
+        leg = relocation.legs[-1]
+        if self.now < leg.planned_end:
+            return
+        with self._transition():
+            self._end_relocation(relocation, "arrived")
 
     # ----------------------------------------------------------------------
     # Cancellation and money
@@ -1545,6 +1724,7 @@ class MarketplaceEngine:
         self.settlements[settlement.id] = settlement
         order.settlement_ids.append(settlement.id)
         self._post_settlement(settlement)
+        self._check_solvency(order.platform_id)
         return settlement
 
     def post_transfer(self, reason, role, person_id, amount_minor, *, platform_id=None,
@@ -1589,7 +1769,61 @@ class MarketplaceEngine:
                 self._notify("platform", platform_id, "transfer_posted", transfer_id=transfer.id, reason=reason,
                              role=role, person_id=person_id, amount_minor=amount_minor, order_id=order_id,
                              program_id=program_id)
+                self._check_solvency(platform_id)
         return transfer
+
+    def shutdown_platform(self, platform_id, reason="platform_shutdown"):
+        """Retire a platform (AST-210): no more launches, quotes, or offers -- `issue_quote`,
+        `place_order`, and `create_offer`/`respond_to_offer` (through `_driver_accepting`) already
+        check `platform.launched`. Every not-yet-boarded order of this platform is canceled and
+        every pending offer resolved (offers first, so an order's own cancellation finds nothing
+        left over to resolve with the wrong reason); every open app session is closed. A boarded
+        ride finishes on frozen terms. Idempotent -- shutting down an already-shut-down platform
+        changes nothing and notifies nothing."""
+        platform = self._platform(platform_id)
+        if not platform.launched:
+            return platform
+        with self._transition():
+            platform.launched = False
+            for offer_id in sorted(oid for oid, o in self.offers.items()
+                                   if o.platform_id == platform_id and o.state == "pending"):
+                self._resolve_offer(self.offers[offer_id], "canceled", reason)
+            for order in sorted((o for o in self.orders.values() if o.platform_id == platform_id and not o.terminal),
+                                key=lambda o: o.id):
+                service = self.services.get(order.service_id)
+                if service is not None and service.ended_at is None and service.phase == "transport":
+                    continue  # a boarded ride finishes on frozen terms
+                self.cancel_order(order.id, "platform", reason)
+            for driver_id in sorted(platform.open_driver_ids):
+                self.close_app("driver", driver_id, platform_id)
+            for rider_id in sorted(platform.open_rider_ids):
+                self.close_app("rider", rider_id, platform_id)
+            self._notify("platform", platform_id, "platform_shutdown", reason=reason)
+        return platform
+
+    def _check_solvency(self, platform_id):
+        """Schedule a zero-delay `platform.insolvency` when a tracked cash balance reaches zero
+        under the `insolvency='shutdown'` rule -- never execute the shutdown inline: `_settle` and
+        `post_transfer` call this from inside `_drop_off`'s or their own transition, and cancelling
+        orders in the middle of one would re-enter a half-applied transition. Scheduling instead
+        runs `shutdown_platform`'s cascade at the same clock instant but outside it. Default-off:
+        with `Platform.insolvency is None` (every preset, every scenario without the rule) this
+        returns on its first line, schedules nothing, and notifies nothing."""
+        platform = self.platforms[platform_id]
+        if platform.insolvency != "shutdown" or not platform.launched:
+            return
+        balance = self.accounts[("platform", platform_id)].balance_minor
+        if balance is not None and balance <= 0:
+            self.scheduler.schedule_after(0, "platform.insolvency", {"platform_id": platform_id})
+
+    def _on_platform_insolvency(self, event):
+        platform_id = event.payload["platform_id"]
+        platform = self.platforms[platform_id]
+        if platform.insolvency != "shutdown" or not platform.launched:
+            return  # already shut down by an earlier same-instant event, or the rule was removed
+        balance = self.accounts[("platform", platform_id)].balance_minor
+        if balance is not None and balance <= 0:
+            self.shutdown_platform(platform_id, "insolvency")
 
     # ----------------------------------------------------------------------
     # Serialization. A market snapshot plus the scheduler's snapshot, taken
@@ -1720,10 +1954,12 @@ def _motion(value):
 
 
 def _platform(item):
-    # .get, not [...]: a snapshot taken before starting_cash_minor existed still restores,
-    # with the platform's cash untracked (None), exactly the TripIntent.source_id precedent.
+    # .get, not [...]: a snapshot taken before starting_cash_minor/insolvency existed still
+    # restores, with the platform's cash untracked (None) and no insolvency rule -- the
+    # TripIntent.source_id precedent.
     return Platform(item["id"], item["name"], item["launched"],
-                    set(item["open_driver_ids"]), set(item["open_rider_ids"]), item.get("starting_cash_minor"))
+                    set(item["open_driver_ids"]), set(item["open_rider_ids"]), item.get("starting_cash_minor"),
+                    item.get("insolvency"))
 
 
 def _car(item):
@@ -1731,11 +1967,13 @@ def _car(item):
 
 
 def _driver(item):
-    # .get, not [...]: a snapshot taken before paused_apps existed still restores, with no
-    # driver paused -- same tolerance as TripIntent.source_id / Platform.starting_cash_minor.
+    # .get, not [...]: a snapshot taken before paused_apps/relocation_id/deactivated_at existed
+    # still restores, with no driver paused, repositioning, or deactivated -- same tolerance as
+    # TripIntent.source_id / Platform.starting_cash_minor.
     return Driver(item["id"], set(item["apps"]), item["car_id"], set(item["open_apps"]),
                   item["shift_id"], list(item["commitments"]), item["service_id"], set(item["accounts"]),
-                  set(item.get("paused_apps", ())))
+                  set(item.get("paused_apps", ())), item.get("relocation_id"), item.get("deactivated_at"),
+                  item.get("deactivation_reason"))
 
 
 def _rider(item):
@@ -1790,6 +2028,13 @@ def _service(item):
                    item["boarded_at"], item["ended_at"], item["end_reason"], _opt_point(item["end_position"]))
 
 
+def _relocation(item):
+    legs = [Leg(leg["kind"], tuple(leg["origin"]), tuple(leg["destination"]), leg["started_at"], leg["planned_end"])
+            for leg in item["legs"]]
+    return Relocation(item["id"], item["driver_id"], item["car_id"], item["started_at"], legs,
+                      item["ended_at"], item["end_reason"], _opt_point(item["end_position"]))
+
+
 def _settlement(item):
     return Settlement(**item)
 
@@ -1802,8 +2047,14 @@ def _regulation(item):
     return Regulation(**item)
 
 
+def _speed_zone(item):
+    return SpeedZone(item["id"], item["at"], tuple(item["min"]), tuple(item["max"]), item["multiplier"],
+                     item["ends_at"])
+
+
 _TABLES = {
     "platforms": _platform, "cars": _car, "drivers": _driver, "riders": _rider, "shifts": _shift,
     "intents": _intent, "quotes": _quote, "orders": _order, "offers": _offer, "services": _service,
-    "settlements": _settlement, "transfers": _transfer, "regulations": _regulation,
+    "relocations": _relocation, "settlements": _settlement, "transfers": _transfer, "regulations": _regulation,
+    "speed_zones": _speed_zone,
 }

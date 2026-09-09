@@ -47,7 +47,7 @@ def trait_schema(implementations, family):
     """
     identifier = (implementations or {}).get(family)
     return TRAITS[family] if identifier is None else policy_class(family, identifier).declaration.parameter_schema
-INTERVENTION_ORDER = {'launch': 0, 'regulation': 1, 'policy': 2, 'preference': 3}
+INTERVENTION_ORDER = {'launch': 0, 'regulation': 1, 'policy': 2, 'preference': 3, 'shutdown': 4, 'delay': 5}
 
 
 class ScenarioError(ValueError):
@@ -622,6 +622,9 @@ PROGRAM = Map({'id': Scalar('string'), 'kind': Scalar('string', choices=('hourly
               'min_online_hours': Scalar('number', minimum=0), 'zero_dispatch_qualifies': Scalar('boolean')})
 POLICY_EXTRA = {'version': Scalar('string'), 'rules': Keyed(RULE), 'campaigns': Keyed(CAMPAIGN),
                 'fallback': Scalar('string'), 'programs': Keyed(PROGRAM)}
+# AST-210: a period dividend, paid to qualifying drivers from a platform's cash above its reserve.
+DIVIDEND = Map({'reserve_minor': Scalar('integer', minimum=0), 'period_hours': POSITIVE_HOURS,
+                'min_completed_rides': Scalar('integer', minimum=0)}, nullable=True)
 PLATFORM = Map({
     'launched': Scalar('boolean'),
     'policy': Implementation('marketplace', POLICY_EXTRA),
@@ -629,11 +632,24 @@ PLATFORM = Map({
     # Seeds the platform's tracked cash account (marketplace_engine.Account); null (every
     # preset's default) means untracked -- flows still post, there is just no balance to report.
     'starting_cash_minor': Scalar('integer', minimum=0, nullable=True),
+    # AST-210: null (every preset's default) means no insolvency rule; 'shutdown' cancels open
+    # orders/offers, closes every app session and stops quoting once tracked cash reaches zero.
+    'insolvency': Scalar('string', choices=('shutdown',), nullable=True),
+    'dividend': DIVIDEND,
 })
 PEAK = Map({'id': Scalar('string'), 'weekdays': Seq(Scalar('integer', minimum=0, maximum=6)),
             'start_hour': Scalar('integer', minimum=0, maximum=23), 'end_hour': Scalar('integer', minimum=0, maximum=24),
             'multiplier': Scalar('number', minimum=1)})
 ZONE = Map({'min': Point(), 'max': Point()})  # closed axis-aligned box in km; map_km stays a sampling extent, not a fence
+# AST-210: zone id -> speed multiplier, in effect for the whole run (world.zones must declare the
+# zone; a temporary multiplier is the delay intervention below, not this table).
+SPEED_ZONES = Table(Scalar('number', positive=True))
+# AST-210: driver_lease_minor posts an external "lease" transfer to every non-deactivated driver
+# every lease_hours; driver_bankruptcy_minor (when set) deactivates a driver whose account balance
+# falls below it, evaluated at that same posting.
+LEDGER = Map({'driver_lease_minor': Scalar('integer', minimum=0),
+              'lease_hours': Scalar('number', positive=True, nullable=True),
+              'driver_bankruptcy_minor': Scalar('integer', nullable=True)}, nullable=True)
 
 
 def registered_generator():
@@ -678,6 +694,16 @@ INTERVENTION = Choice('kind', {
                        'max_base_fare_minor': Scalar('integer', minimum=0, nullable=True),
                        'max_per_km_minor': Scalar('integer', minimum=0, nullable=True),
                        'max_commission_fraction': Scalar('number', minimum=0, maximum=1, nullable=True)}),
+    # AST-210: cancels the platform's open orders/offers, closes every app session and stops it
+    # quoting -- see marketplace_engine.shutdown_platform.
+    'shutdown': Map({'id': Scalar('string'), 'at_hours': NONNEGATIVE_HOURS, 'platform': Scalar('string')}),
+    # AST-210: a temporary speed multiplier over a zone or an explicit box, unlike the permanent
+    # world.speed_zones table. Exactly one of zone/box is required.
+    'delay': Map({'id': Scalar('string'), 'at_hours': NONNEGATIVE_HOURS,
+                  'zone': Scalar('string', nullable=True),
+                  'box': Map({'min': Point(), 'max': Point()}, nullable=True),
+                  'multiplier': Scalar('number', positive=True),
+                  'duration_hours': Scalar('number', positive=True, nullable=True)}),
 })
 _SCENARIO_SPEC_CACHE = {}
 
@@ -705,6 +731,7 @@ def scenario_spec(implementations=None):
                 'minor_units_per_major': Scalar('integer', minimum=1), 'map_km': Point(positive=True),
                 'sampling': Scalar('string', choices=('grid', 'continuous')), 'grid_step_km': Scalar('number', positive=True),
                 'zones': Table(ZONE),
+                'speed_zones': SPEED_ZONES,
                 'calendar': Map({'weekday': Scalar('integer', minimum=0, maximum=6), 'hour': Scalar('number', minimum=0, maximum=24)}),
                 'horizon_hours': POSITIVE_HOURS,
             }),
@@ -715,7 +742,8 @@ def scenario_spec(implementations=None):
                                'drivers': population_spec('driver', implementations)}),
             'activity': Map({'shifts': SHIFTS, 'trips': TRIPS, 'conflicts': Scalar('string', choices=('fail',))}),
             'evolution': Map({'checkpoint_hours': Scalar('number', positive=True, nullable=True),
-                              'first_checkpoint_hours': Scalar('number', positive=True, nullable=True)}),
+                              'first_checkpoint_hours': Scalar('number', positive=True, nullable=True),
+                              'ledger': LEDGER}),
             'interventions': Keyed(INTERVENTION),
         })
     return _SCENARIO_SPEC_CACHE[key]
@@ -798,6 +826,25 @@ def regulation(id, *, at_hours, max_base_fare_minor=None, max_per_km_minor=None,
     return _build(INTERVENTION.options['regulation'], {'id': id, 'kind': 'regulation', 'at_hours': at_hours,
         'max_base_fare_minor': max_base_fare_minor, 'max_per_km_minor': max_per_km_minor,
         'max_commission_fraction': max_commission_fraction}, f'regulation {id}')
+
+
+def shutdown(id, *, at_hours, platform):
+    """Retire a platform at a simulated time: cancel its open (not-yet-boarded) orders and pending
+    offers as `platform_shutdown`, close every open app session, and stop it quoting. Boarded
+    rides finish on frozen terms. See marketplace_engine.shutdown_platform."""
+    return _build(INTERVENTION.options['shutdown'], {'id': id, 'kind': 'shutdown', 'at_hours': at_hours,
+                                                      'platform': platform}, f'shutdown {id}')
+
+
+def delay(id, *, at_hours, multiplier, zone=None, box=None, duration_hours=None):
+    """A temporary speed multiplier over a named zone or an explicit box, from `at_hours` for
+    `duration_hours` (`None` = until the run ends). Exactly one of `zone`/`box` is required;
+    `compile_scenario` resolves a named zone to its box, so the runtime never consults the zone
+    table. Legs already in progress when the delay begins keep their originally planned end."""
+    return _build(INTERVENTION.options['delay'], {
+        'id': id, 'kind': 'delay', 'at_hours': at_hours, 'zone': zone,
+        'box': None if box is None else {'min': list(box[0]), 'max': list(box[1])},
+        'multiplier': multiplier, 'duration_hours': duration_hours}, f'delay {id}')
 
 
 def peak(id, *, weekdays, start_hour, end_hour, multiplier):
@@ -901,7 +948,7 @@ ALL_APPS = ['rebu', 'blot', 'flyt']
 
 
 def _platform_v1():
-    return {'launched': True, 'controller': None, 'starting_cash_minor': None,
+    return {'launched': True, 'controller': None, 'starting_cash_minor': None, 'insolvency': None, 'dividend': None,
             'policy': {'implementation': 'marketplace@1', 'version': 'modern-v1',
                        'parameters': dict(MARKETPLACE_DEFAULTS_V1), 'rules': [], 'campaigns': [], 'programs': [],
                        'fallback': 'default'}}
@@ -927,7 +974,8 @@ def _base_v1(name, *, horizon_hours, calendar):
     return {
         'name': name, 'schema_version': SCHEMA_VERSION, 'preset': None, 'calibration': 'synthetic', 'notes': {},
         'world': {'speed_kmh': 30, 'boarding_seconds': 30, 'minor_units_per_major': 100, 'map_km': [10, 10],
-                  'sampling': 'grid', 'grid_step_km': 1, 'zones': {}, 'calendar': dict(calendar), 'horizon_hours': horizon_hours},
+                  'sampling': 'grid', 'grid_step_km': 1, 'zones': {}, 'speed_zones': {},
+                  'calendar': dict(calendar), 'horizon_hours': horizon_hours},
         'platforms': {app: _platform_v1() for app in ALL_APPS},
         'behavior': {'rider': {'implementation': 'rider_search@1', 'parameters': dict(RIDER_DEFAULTS_V1)},
                      'driver': {'implementation': 'driver_participation@1', 'parameters': dict(DRIVER_DEFAULTS_V1)},
@@ -935,7 +983,7 @@ def _base_v1(name, *, horizon_hours, calendar):
         'population': {'riders': {'count': 0, 'segments': _segments_v1('rider'), 'people': [], 'generator': {'kind': 'segments'}},
                        'drivers': {'count': 0, 'segments': _segments_v1('driver'), 'people': [], 'generator': {'kind': 'segments'}}},
         'activity': {'shifts': {'generator': 'none'}, 'trips': {'generator': 'none'}, 'conflicts': 'fail'},
-        'evolution': {'checkpoint_hours': None, 'first_checkpoint_hours': None},
+        'evolution': {'checkpoint_hours': None, 'first_checkpoint_hours': None, 'ledger': None},
         'interventions': [],
     }
 
@@ -962,7 +1010,7 @@ def _three_platform_week_v1():
         'peaks': [{'id': 'morning-commute', 'weekdays': [0, 1, 2, 3, 4], 'start_hour': 7, 'end_hour': 9, 'multiplier': 2.5},
                   {'id': 'afternoon-commute', 'weekdays': [0, 1, 2, 3, 4], 'start_hour': 16, 'end_hour': 19, 'multiplier': 2.8},
                   {'id': 'weekend-night', 'weekdays': [4, 5], 'start_hour': 21, 'end_hour': 3, 'multiplier': 3}]}
-    base['evolution'] = {'checkpoint_hours': 24, 'first_checkpoint_hours': 24}
+    base['evolution'] = {'checkpoint_hours': 24, 'first_checkpoint_hours': 24, 'ledger': None}
     return base
 
 
@@ -1002,7 +1050,7 @@ def preset_definition(identifier):
 
 
 def platform(id, *, launched=True, version='modern-v1', rules=(), campaigns=(), programs=(), fallback='default',
-            controller=None, starting_cash_minor=None, **parameters):
+            controller=None, starting_cash_minor=None, insolvency=None, dividend=None, **parameters):
     """One complete platform entry keyed by its ID: ``{id: <PLATFORM entry>}``.
 
     Unnamed keyword parameters override `MARKETPLACE_DEFAULTS_V1`; every
@@ -1029,6 +1077,7 @@ def platform(id, *, launched=True, version='modern-v1', rules=(), campaigns=(), 
     if not isinstance(id, str) or not id or '.' in id:
         diag.error('platform', 'IDs must be nonempty strings without dots')
     entry = {'launched': launched, 'controller': controller, 'starting_cash_minor': starting_cash_minor,
+             'insolvency': insolvency, 'dividend': None if dividend is None else dict(dividend),
              'policy': {'implementation': BUILTIN_IMPLEMENTATIONS['marketplace'], 'version': version,
                         'parameters': {**MARKETPLACE_DEFAULTS_V1, **parameters},
                         'rules': list(rules), 'campaigns': list(campaigns), 'programs': list(programs),
@@ -1298,6 +1347,8 @@ class PlatformPlan:
     policy: PlatformPolicy
     controller: tuple | None  # (interval_seconds, until_seconds)
     starting_cash_minor: int | None = None
+    insolvency: str | None = None  # AST-210: None | "shutdown"
+    dividend: dict | None = None  # AST-210: {'reserve_minor', 'period_seconds', 'min_completed_rides'} | None
 
 
 @dataclass(frozen=True)
@@ -1336,6 +1387,26 @@ class Plan:
     def zones(self):
         """`{id: {'min': [x0, y0], 'max': [x1, y1]}}`. Never reaches `World`; the engine still does not fence coordinates."""
         return copy.deepcopy(self.resolved['world']['zones'])
+
+    @property
+    def ledger(self):
+        """AST-210: `None`, or `{'driver_lease_minor', 'lease_seconds', 'driver_bankruptcy_minor'}` --
+        hours already converted to seconds, the `controller` precedent, so `main.py` schedules it
+        with no further unit math."""
+        ledger = self.resolved['evolution']['ledger']
+        if ledger is None:
+            return None
+        return {'driver_lease_minor': ledger['driver_lease_minor'], 'lease_seconds': ledger['lease_hours'] * HOUR,
+                'driver_bankruptcy_minor': ledger['driver_bankruptcy_minor']}
+
+    @property
+    def speed_zones(self):
+        """AST-210: `[{'min', 'max', 'multiplier'}, ...]` for each `world.speed_zones` entry, resolved
+        against `self.zones` and sorted by zone id -- what `main.py` feeds to `engine.impose_delay`
+        at t=0, permanently (no duration)."""
+        zones, multipliers = self.resolved['world']['zones'], self.resolved['world']['speed_zones']
+        return [{'min': list(zones[zid]['min']), 'max': list(zones[zid]['max']), 'multiplier': multiplier}
+                for zid, multiplier in sorted(multipliers.items())]
 
     def manifest(self):
         """Everything needed to reconstruct and identify this plan without today's defaults."""
@@ -1376,8 +1447,20 @@ def compile_scenario(scenario):
             controller = (item['controller']['interval_hours'] * HOUR, item['controller']['until_hours'] * HOUR)
             if controller[1] > horizon:
                 diag.warn(f'platforms.{pid}.controller.until_hours', 'extends beyond the horizon')
+        # AST-210: both the insolvency rule and a dividend need a real cash figure to test/pay from.
+        if item['insolvency'] == 'shutdown' and item['starting_cash_minor'] is None:
+            diag.error(f'platforms.{pid}.insolvency', 'needs a tracked cash balance (starting_cash_minor)')
+        dividend = None
+        if item['dividend'] is not None:
+            if item['starting_cash_minor'] is None:
+                diag.error(f'platforms.{pid}.dividend', 'needs a tracked cash balance (starting_cash_minor)')
+            dividend = {'reserve_minor': item['dividend']['reserve_minor'],
+                       'period_seconds': item['dividend']['period_hours'] * HOUR,
+                       'min_completed_rides': item['dividend']['min_completed_rides']}
+            if dividend['period_seconds'] > horizon:
+                diag.warn(f'platforms.{pid}.dividend.period_hours', 'no dividend period closes within the horizon')
         platforms[pid] = PlatformPlan(item['launched'], item['policy']['implementation'], policy, controller,
-                                      item['starting_cash_minor'])
+                                      item['starting_cash_minor'], item['insolvency'], dividend)
     if not platforms:
         diag.error('platforms', 'at least one platform is required')
     implementations = {family: resolved['behavior'][family]['implementation'] for family in ('rider', 'driver', 'evolution')}
@@ -1437,6 +1520,34 @@ def compile_scenario(scenario):
                 diag.error(path, 'a regulation needs at least one cap')
             if (caps['max_base_fare_minor'] is None) != (caps['max_per_km_minor'] is None):
                 diag.error(path, 'max_base_fare_minor and max_per_km_minor must be set together')
+        elif item['kind'] == 'shutdown':
+            pid = item['platform']
+            entry['platform'] = pid
+            if pid not in platforms:
+                diag.error(f'{path}.platform', f'unknown platform {pid!r}')
+            # "never launches" cannot be decided here: a same-scenario 'launch' intervention for
+            # this platform may simply appear later in authoring order -- checked once launched_at
+            # is fully resolved, in the pass below that mirrors the preference-validity one.
+        elif item['kind'] == 'delay':
+            if (item['zone'] is None) == (item['box'] is None):
+                diag.error(path, 'a delay names either a zone or a box')
+            box_min = box_max = None
+            if item['zone'] is not None:
+                if item['zone'] not in world_def['zones']:
+                    diag.error(f'{path}.zone', f'unknown zone {item["zone"]!r}; declared: {sorted(world_def["zones"])}')
+                else:
+                    box_min, box_max = world_def['zones'][item['zone']]['min'], world_def['zones'][item['zone']]['max']
+            elif item['box'] is not None:
+                box_min, box_max = item['box']['min'], item['box']['max']
+                if box_max[0] <= box_min[0] or box_max[1] <= box_min[1]:
+                    diag.error(f'{path}.box', 'a delay box needs max greater than min on both axes')
+            if item['multiplier'] == 1:
+                diag.warn(f'{path}.multiplier', 'has no effect')
+            # The compiler resolves a named zone to its box here, once, so the runtime never needs
+            # the zone table at all (the _resolve_service_area precedent).
+            entry.update({'min': None if box_min is None else list(box_min),
+                         'max': None if box_max is None else list(box_max), 'multiplier': item['multiplier'],
+                         'duration_seconds': None if item['duration_hours'] is None else item['duration_hours'] * HOUR})
         else:
             entry.update({'role': item['role'], 'segment': item['segment'], 'people': list(item['people']),
                           'preferred_app': item['preferred_app']})
@@ -1462,6 +1573,10 @@ def compile_scenario(scenario):
             target = (entry['at_seconds'], 'preference', entry['role'], entry['segment'], tuple(entry['people']))
         elif entry['kind'] == 'regulation':
             target = (entry['at_seconds'], 'regulation')
+        elif entry['kind'] == 'delay':
+            # Several delays may coexist at one instant (different zones/boxes), so the dedupe key
+            # is the intervention's own id, never its target.
+            target = (entry['at_seconds'], 'delay', entry['id'])
         else:
             target = (entry['at_seconds'], entry['kind'], entry['platform'])
         if target in seen:
@@ -1531,6 +1646,11 @@ def compile_scenario(scenario):
         app = entry['preferred_app']
         if app in launched_at and (launched_at[app] is None or launched_at[app] > entry['at_seconds']):
             diag.error(f'{path}.preferred_app', f'{app!r} is not launched at that time')
+    # Shutdown interventions targeting a platform that never launches are legal (nothing to shut
+    # down) but suspicious -- same deferred-launched_at reasoning as the preference pass above.
+    for entry in interventions:
+        if entry['kind'] == 'shutdown' and entry['platform'] in launched_at and launched_at[entry['platform']] is None:
+            diag.warn(f"interventions.{entry['id']}", 'target platform never launches')
     # Activity generators: references and static conflicts that do not depend on realized rides.
     activity = resolved['activity']
     shifts, trips = activity['shifts'], activity['trips']
@@ -1580,6 +1700,17 @@ def compile_scenario(scenario):
         checkpoints = tuple(times)
     elif evolution['first_checkpoint_hours'] is not None:
         diag.error('evolution.first_checkpoint_hours', 'requires checkpoint_hours')
+    ledger = evolution['ledger']
+    if ledger is not None:
+        # AST-210: the lease cadence IS the bankruptcy posting cadence, so a lease amount or a
+        # bankruptcy threshold with no lease_hours is a compile error, not a silent no-op.
+        if ledger['driver_lease_minor'] > 0 and ledger['lease_hours'] is None:
+            diag.error('evolution.ledger.driver_lease_minor', 'a lease amount needs lease_hours')
+        if ledger['driver_bankruptcy_minor'] is not None and ledger['lease_hours'] is None:
+            diag.error('evolution.ledger.driver_bankruptcy_minor',
+                       'bankruptcy is evaluated at each lease posting; set lease_hours')
+        if ledger['lease_hours'] is not None and ledger['lease_hours'] * HOUR > horizon:
+            diag.warn('evolution.ledger.lease_hours', 'no lease posting occurs within the horizon')
     learning = any(segments[role][sid]['traits']['evolution'].get(key, behavior.get('evolution', {}).get(key, 0))
                    for role in ROLES for sid in segments[role] for key in ('adoption_rate_per_day', 'learning_rate'))
     if learning and not checkpoints:
@@ -1709,6 +1840,12 @@ def _check_zones(world_def, diag):
             diag.warn(path, 'extends beyond map_km; sampled points can fall outside the sampling extent')
         if sampling == 'grid' and not all(_has_grid_point(lo[axis], hi[axis], step) for axis in (0, 1)):
             diag.error(path, f'contains no grid point at grid_step_km={step}')
+    for zid, multiplier in world_def['speed_zones'].items():
+        path = f'world.speed_zones.{zid}'
+        if zid not in world_def['zones']:
+            diag.error(path, f'must name a zone in world.zones; declared: {sorted(world_def["zones"])}')
+        if multiplier == 1:
+            diag.warn(path, 'has no effect')
 
 
 def _merge_person(role, item, base):

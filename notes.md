@@ -111,6 +111,52 @@ Authoring restrictions added in phase 5 (AST-209; `behavior_policy.py`,
   set, same order); landed and gated alone before anything else in this
   phase.
 
+Physical engine extensions added in phase 6 (AST-210; `marketplace_engine.py`,
+`behavior_policy.py`, `policy_runtime.py`, `scenario.py`, `main.py`,
+`metrics.py`) -- six mechanisms, all default-off:
+- `reposition`/`Relocation`: a service-free move, no settlement, no
+  platform side; `driver_participation@2` gains an `idle` hook
+  (`idle_rule='zone_return'`) that compares expected net per km of staying
+  against a zone-return, discounted by deadhead distance, using
+  `personal_evolution@2`'s new `zone_scores` memory
+  (`zone_learning_rate`). `metrics.driver_distance` gains a `reposition_km`
+  bucket, cohorted by relocation id like every other segment.
+- `deactivate_driver`: permanent retirement -- ends a live relocation,
+  drains not-yet-boarded commitments, refuses any later `start_shift`; a
+  scheduled shift for an already-deactivated driver is skipped
+  (`main._on_shift_start`) with a `session_skipped` log record instead of
+  failing the run.
+- `shutdown_platform` and `Platform.insolvency='shutdown'`: cancels open
+  orders/offers, closes every app session, leaves a boarded ride to finish
+  on frozen terms; the cash rule schedules the shutdown as a zero-delay
+  event from `_check_solvency` (called after every settlement/platform
+  transfer) so it never re-enters a half-applied transition.
+  `metrics.load_run` gains `session_skipped` to its known top-level record
+  types (a raw diagnostic record, treated like `notification`).
+- `evolution.ledger`: a recurring external `lease` transfer to every
+  driver, with an optional `driver_bankruptcy_minor` deactivation check at
+  the same posting; `platforms.<id>.dividend`: a recurring equal-split
+  payout of tracked cash above a reserve to drivers meeting a per-period
+  completed-ride threshold. All of a ledger's/dividend's own configuration
+  travels in the scheduled event's payload, never through
+  `PolicyRuntime.snapshot()`.
+- `shift_end` hook + `Extend`: `driver_participation@2`'s
+  `shift_end_rule='extend_to_target'` may propose extending a shift while
+  its own net payout is below `daily_net_target_minor`; the runtime
+  (`PolicyRuntime.shift_end`), not the policy, is the sole enforcer of
+  `max_extension_seconds`.
+- `world.speed_zones` (permanent) and a `delay` intervention (temporary,
+  zone or box): a per-position speed multiplier consulted once, when a leg
+  *begins* (`MarketplaceEngine.travel_seconds`/`speed_kmh_at`), so a leg
+  already in progress keeps its planned end. Platform ETA estimates stay
+  delay-unaware on purpose, which is what lets `rider_search@2`'s
+  pre-existing `eta_drift_cancel_seconds` react to a delay unmodified.
+- `Relocation`/`SpeedZone` join `_TABLES` (`SNAPSHOT_SCHEMA_VERSION` stays
+  2, same `.get(name, [])` restore tolerance as phase 3's `transfers` and
+  phase 4's `regulations`); `Driver.relocation_id`/`deactivated_at`/
+  `deactivation_reason` and `Platform.insolvency` restore through the
+  existing `.get`-tolerant driver/platform factories.
+
 Multi-platform realism, current as of phase 1 (see the linked architecture
 docs for the normative contract):
 - Baselines: roughly 55% session-to-order with supply, 70% offer acceptance

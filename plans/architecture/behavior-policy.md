@@ -300,6 +300,107 @@ participant-side answer to the competitor-occupancy boundary (plan section
 5): a platform still never learns another platform's commitment count or
 service; a driver can only *disclose* busyness through its own pause.
 
+**Reposition and shift extension (AST-210, plan section 4.G).**
+`driver_participation@2` gains two more hooks, `idle` and `shift_end`,
+neither declared by `@1`'s `POLICY_FAMILIES['driver']` required-hook tuple
+(which stays `('expand', 'respond', 'progress')`, so an externally registered
+`@1`-shaped driver policy keeps validating unaffected) -- the runtime gates
+both on `'idle'`/`'shift_end' in self.bindings['driver'].declaration.hooks`,
+which is `False` for `@1` and for a `@2` selection whose declaration a
+custom subclass narrowed, so neither hook fires, no decision is recorded,
+and no state key is written unless a policy actually declares it.
+
+New `DriverTraitsV2` fields, all default-off:
+
+| Trait | Default (= `@1`, i.e. off) | Meaning |
+| --- | --- | --- |
+| `idle_rule` | `'stay'` | `'zone_return'` compares expected net per km of staying against returning to a zone |
+| `reposition_min_gain_minor` | `0` | minimum gain (over staying) required before proposing a reposition |
+| `max_reposition_km` | `5` | zones farther than this from the driver's current position are not candidates |
+| `reposition_horizon_km` | `10` | the deadhead discount's scale (below) |
+| `shift_end_rule` | `'end'` | `'extend_to_target'` may propose extending the shift |
+| `daily_net_target_minor` | `0` | extend while this shift's own net payout is below it |
+| `max_extension_seconds` | `0` | the runtime-enforced cap on total extension within one shift (resets for the driver's next shift) |
+| `extension_step_seconds` | `1800` | the size of each proposed extension slice |
+
+**`idle(context, memory, random)`** fires at two points, both generation-
+guarded so a driver cannot be asked twice for the same episode:
+`PolicyRuntime.queue_expansion` queues it (delay `no_offer_seconds`) as its
+own first statement, before any of that function's early returns, so a
+driver with nothing left to expand still gets the hook; the
+`commitment_released` branch of `on_notification` queues it at delay `0`
+specifically for an *unqueued* drop-off (`not driver.commitments`), never for
+a queued promotion or a cancellation. Arrival at a reposition destination
+queues neither trigger and does not bump the driver's generation, so a
+driver cannot oscillate between two zones inside one idle spell. With
+`idle_rule != 'zone_return'` or no zones configured, the hook always returns
+`Stop`. Otherwise: let `here` be `context.zone_scores.get(current_zone, 0)`
+(the expected net per km where the driver already is); for every other zone
+within `max_reposition_km`, its candidate value is
+
+```text
+value(zone) = zone_scores.get(zone, 0) * reposition_horizon_km / (reposition_horizon_km + distance)
+```
+
+-- a deadhead discount, monotone decreasing in distance to the zone's
+centroid, so a farther zone must promise a strictly higher underlying score
+to still win once travel is priced in. The policy proposes `Reposition` for
+the best-discounted candidate only when its value clears `here` by at least
+`reposition_min_gain_minor`; ties break on the lower zone id. The random
+stream is unused (the rule is deterministic); `RandomValues` is still passed
+for hook-contract uniformity with every other typed hook. The runtime applies
+`Reposition` as `engine.reposition(driver_id, destination)`
+(marketplace-engine.md "Repositioning").
+
+**`zone_scores`** (`personal_evolution@2` memory, gated on `zone_learning_rate
+> 0` so an `@1`/default-`@2` memory dict never gains the key) is an EWMA per
+zone of payout-per-km on completed rides: `EvolutionTraitsV2.zone_learning_rate`
+(default `0`, `<= 1`) controls the smoothing. `PolicyRuntime` appends a
+`{'zone': pickup's zone, 'payout_minor', 'km'}` observation per completed,
+unqueued ride (gated the same way, plus `self.zones` nonempty) into
+`zone_outcomes`; at the next checkpoint, `EvolutionPolicyV2.checkpoint` folds
+each observation into `zone_scores[zone] = prev + rate * (value - prev)` with
+`value = payout_minor / max(0.1, km)`, and `prev` defaulting to `value` itself
+on a zone's first sighting -- so one ride never manufactures a swing toward
+an arbitrary zero prior. `zone_outcomes` is cleared after every checkpoint
+that read it, again only when the key already exists, so it never appears in
+state that never used it.
+
+**`shift_end(context, memory, random)`** fires once, from
+`main.Simulation._on_shift_end`, at a shift's own scheduled end instant, via
+`PolicyRuntime.shift_end(driver_id)` -- which returns `0` immediately (before
+touching any state) when the driver's bound policy does not declare the
+hook, so `@1`'s call sequence (`engine.end_shift` right away) is exactly
+today's. Otherwise it computes `context.shift_net_minor` -- driver payouts
+from `completed_ride`/`cancellation_fee` settlements, plus every transfer
+credited or debited to this driver, both restricted to `at >= Shift.started_at`
+-- and `context.extension_used_seconds`, the extension budget already spent
+**within this shift**. `shift_end_rule != 'extend_to_target'`, an exhausted or
+zero `max_extension_seconds`, a net payout already at or above
+`daily_net_target_minor`, or an already-exhausted cap all force `Stop`;
+otherwise the policy proposes `Extend(min(extension_step_seconds,
+max_extension_seconds - extension_used_seconds))`. The runtime, not the
+policy, is the sole enforcer of the cap: `PolicyRuntime.shift_end` clamps
+the granted extension to `max_extension_seconds - used`, and persists the new
+`used_seconds` together with the ending shift's own `id` in the driver's
+state (`s['shift_extension'] = {'shift_id', 'used_seconds'}`); it appends a
+`shift_extended` observation. On the *next* call -- whether a later
+extension of the same shift or a wholly different, later shift for the same
+driver -- the stored `used_seconds` is read back only when the stored
+`shift_id` still matches the shift now ending; otherwise `used` starts over
+at `0`. This is what makes the cap a **per-shift** budget: a driver who
+worked yesterday's shift down to `max_extension_seconds` starts today's
+shift with a full, untouched extension budget, exactly as `daily_net_target_minor`'s
+name implies. A policy that proposes more than its own remaining budget can
+never exceed it, and `main._on_shift_end` simply reschedules `shift.end` by
+whatever positive number of seconds came back, or ends the shift now when
+it is `0`. An authored shift that would overlap the *next* scheduled shift
+for the same driver is still a run failure exactly as before extension
+existed: `main._on_shift_start` tests `deactivated_at is not None`
+explicitly rather than wrapping `engine.start_shift` in a broad `except
+CommandRejected`, so the pre-existing "driver is already on shift"
+`CommandRejected` still propagates as a `HandlerFailure`.
+
 **`RiderTraitsV2`** (subclasses `RiderTraits`):
 
 | Trait | Default (= `@1`) | Meaning |
