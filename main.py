@@ -276,11 +276,14 @@ class Simulation:
         # swallow the "driver already on shift" run failure an authored extension overlapping the
         # next scheduled shift must still produce (AST-210 resolution note 10).
         if driver.deactivated_at is not None:
-            self._write_log('session_skipped', kind='shift', id=event.payload['id'], driver=driver.id,
+            # session_kind, not kind: _write_log(self, kind, **data) already binds its own first
+            # positional argument to 'kind' (the record's own `type` field, here 'session_skipped');
+            # a **data key also named 'kind' collides with it (TypeError: multiple values for 'kind').
+            self._write_log('session_skipped', session_kind='shift', id=event.payload['id'], driver=driver.id,
                             reason=f'driver deactivated ({driver.deactivation_reason})')
             self.policies.observations.append({'type': 'session_skipped', 'at_seconds': self.current_time,
-                                               'kind': 'shift', 'id': event.payload['id'], 'driver': driver.id,
-                                               'reason': driver.deactivation_reason})
+                                               'session_kind': 'shift', 'id': event.payload['id'],
+                                               'driver': driver.id, 'reason': driver.deactivation_reason})
             return
         shift = self.engine.start_shift(driver_id, tuple(event.payload['location']))
         if event.payload['shift_seconds'] is not None:

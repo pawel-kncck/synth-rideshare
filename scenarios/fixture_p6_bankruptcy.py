@@ -1,12 +1,22 @@
 """AST-210 evolution.ledger: lease posting and bankruptcy (plan section 4.G; S10 driver debt).
 
 Two platforms, 30-hour horizon starting Monday midnight. driver_lease_minor=500000 posts every
-lease_hours=24, landing exactly at each midnight. d1 never drives (no trips, no income): the
-first posting drops its account to -500000, below driver_bankruptcy_minor=-100000, so
-deactivate_driver('bankruptcy') fires -- an observation is recorded, d1 disappears from every
-platform's candidates, and its second explicit shift (authored at t=25h, after the posting)
-is skipped with a logged reason instead of failing the run. d2 completes one high-fare ride
-first, so the same lease still leaves it solvent.
+lease_hours=24, landing exactly at each midnight. d1 never drives (shift locations far from the
+one authored trip, so dispatch never reaches it) and has no income: the first posting drops its
+account to -500000, below driver_bankruptcy_minor=-100000, so deactivate_driver('bankruptcy')
+fires -- an observation is recorded, d1 disappears from every platform's candidates, and its
+second explicit shift (authored at t=25h, after the posting) is skipped with a logged reason
+instead of failing the run. d2 is co-located with the ride and completes it first (r1's
+purchase_bias is raised only to force purchase of the deliberately oversized fare that funds
+the payout -- see behavior-policy.md's "For deterministic purchase tests..." note -- everything
+else about r1 is default), so the same lease still leaves d2 solvent.
+
+The candidate check specifically re-runs a second, unlogged `Simulation` from the same compiled
+inputs and stops it at t=25.5h -- squarely inside the window the skipped second shift would have
+occupied -- rather than at the run's end, where d2's own shift has also long since ended and an
+empty candidate list would prove nothing about deactivation specifically (a control run with the
+ledger removed shows d1 as a candidate on both platforms at that same instant, confirming the
+check is not vacuous).
 """
 import sys
 from pathlib import Path
@@ -18,6 +28,7 @@ from metrics import conservation, load_run
 from scenario import compile_scenario, person, shift, trip, two_platform
 
 LEDGER = {'driver_lease_minor': 500000, 'lease_hours': 24, 'driver_bankruptcy_minor': -100000}
+SECOND_SHIFT_MIDPOINT_SECONDS = 25.5 * 3600  # inside the would-be t=25h..26h window
 
 
 def build():
@@ -26,8 +37,10 @@ def build():
                             ).renamed('fixture-p6-bankruptcy').with_changes({
         'evolution.ledger': LEDGER,
         'activity.shifts': {'generator': 'explicit', 'items': [
-            shift('d1-shift1', driver='d1', at_hours=0, hours=8, location=(0, 0)),
-            shift('d1-shift2', driver='d1', at_hours=25, hours=1, location=(0, 0)),
+            # d1 parks far from the ride: nearest-match dispatch never reaches it, so it earns
+            # nothing while still being an ordinary candidate on both platforms until deactivated.
+            shift('d1-shift1', driver='d1', at_hours=0, hours=8, location=(50, 50)),
+            shift('d1-shift2', driver='d1', at_hours=25, hours=1, location=(50, 50)),
             shift('d2-shift', driver='d2', at_hours=0, hours=10, location=(0, 0)),
         ]},
         'activity.trips': {'generator': 'explicit', 'items': [
@@ -40,7 +53,10 @@ def build():
                                             driver={'acceptance_bias': 10, 'no_offer_seconds': 5})
     ).add(
         'population.riders.people', person('r1', apps=('alpha',), preferred_app='alpha',
-                                           rider={'taste_scale': 0, 'purchase_bias': 5})
+                                           # purchase_bias offsets the artificially huge fare (~$10k
+                                           # against a ~$3.50 route reference) so the ride reliably
+                                           # converts; taste_scale=0 keeps the draw out of the way.
+                                           rider={'taste_scale': 0, 'purchase_bias': 5000})
     )
     return scenario
 
@@ -49,11 +65,22 @@ def run():
     inputs = compile_scenario(build()).prepare(seed=0)
     sim = Simulation(inputs)
     sim.run(log_dir='logs')
-    return sim
+    return sim, inputs
+
+
+def candidates_mid_second_shift(inputs):
+    """A second Simulation from the same compiled inputs, advanced (unlogged) only to the middle
+    of what would have been d1's second shift. Distinct from the full run above so the primary
+    log's initial/final snapshot boundary -- what `metrics.load_run`/`conservation` compare --
+    stays the full 0..30h window."""
+    probe = Simulation(inputs)
+    probe.advance_to(SECOND_SHIFT_MIDPOINT_SECONDS)
+    return {pid: sorted(d.driver_id for d in probe.engine.platform_view(pid).drivers())
+            for pid in probe.engine.platforms}
 
 
 def main():
-    sim = run()
+    sim, inputs = run()
     lease_transfers = sorted((t for t in sim.engine.transfers.values() if t.reason == 'lease'), key=lambda t: t.id)
     print('=== lease transfers ===')
     for t in lease_transfers:
@@ -67,10 +94,12 @@ def main():
     deactivated_obs = [o for o in sim.policies.observations if o['type'] == 'driver_deactivated']
     print(f"driver_deactivated observations: {deactivated_obs}")
 
-    for pid in sim.engine.platforms:
-        candidates = [d.driver_id for d in sim.engine.platform_view(pid).drivers()]
-        print(f"platform {pid}: d1 in candidates = {'d1' in candidates} (candidates={candidates})")
-    print(f"d1.open_apps = {d1.open_apps!r}")
+    print(f"=== candidates at t={SECOND_SHIFT_MIDPOINT_SECONDS:.0f}s"
+          f" (inside d1's skipped second shift window) ===")
+    mid_candidates = candidates_mid_second_shift(inputs)
+    for pid, candidates in mid_candidates.items():
+        print(f"  platform {pid}: d1 in candidates = {'d1' in candidates} (candidates={candidates})")
+    print(f"d1.open_apps at run end = {d1.open_apps!r}")
 
     skipped = [json_line for json_line in _log_records(sim.log_path) if json_line.get('type') == 'session_skipped']
     print(f"session_skipped records: {skipped}")

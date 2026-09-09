@@ -191,6 +191,9 @@ def load_run(path):
     metric inputs. A missing terminal record is an incomplete log, not a run
     with zero outcomes. Handled failures have a final snapshot and are analyzed
     only through their actual stopping time, with failed status preserved.
+    `session_skipped` (AST-210: a scheduled shift skipped for a deactivated
+    driver) is diagnostic in the same way as `notification` -- passed through
+    without affecting header/footer/boundary bookkeeping.
     """
     header = footer = initial = final = None
     with Path(path).open(encoding="utf-8") as stream:
@@ -227,7 +230,7 @@ def load_run(path):
                     raise ValueError("State timestamp does not match its scheduler")
             elif kind == "run_finished":
                 footer = record
-            elif kind != "notification":
+            elif kind not in ("notification", "session_skipped"):
                 raise ValueError(f"Unknown log record type: {kind!r}")
     if any(value is None for value in (header, initial, final, footer)):
         raise ValueError("Incomplete log: initial/final states and run_finished are required")

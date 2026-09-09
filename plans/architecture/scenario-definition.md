@@ -510,6 +510,76 @@ teleport entities, clear a queue, or interrupt a passenger ride. A driver app
 download and car registration remain separately validated and logged even when
 one onboarding policy coordinates them.
 
+## Physical engine extensions (AST-210)
+
+Plan section 4.G. Every setting below defaults to off (`None`/`{}`/empty), so an
+existing scenario's resolved definition keeps the same *values*; only its
+*shape* grows, exactly the `starting_cash_minor` precedent above --
+`platforms.<id>.insolvency` and `platforms.<id>.dividend` are new required
+(nullable) keys on the already-complete `PLATFORM` map, so a scenario dict or
+saved manifest from before this phase fails `Scenario.load`/`from_definition`
+with `platforms.<id>.insolvency: missing required setting` (and the same for
+`dividend`); add `"insolvency": null, "dividend": null` per platform to
+migrate. `world.speed_zones` and `evolution.ledger` are the same class of
+addition to `world` and `evolution`.
+
+`world.speed_zones` (`Table(Scalar('number', positive=True))`, zone id to
+multiplier, default `{}`) is a *permanent* per-zone speed multiplier in force
+for the whole run, applied once at `t=0` (`Plan.speed_zones` resolves each
+entry against `Plan.zones` into `{'min', 'max', 'multiplier'}`, sorted by zone
+id; `Simulation.__init__` feeds each into `engine.impose_delay(..., duration_seconds=None)`
+-- see marketplace-engine.md "Delays"). `_check_zones` rejects an unknown zone
+id at `world.speed_zones.<zid>` and warns when a multiplier is `1` ("has no
+effect").
+
+The `shutdown` intervention (`Map({'id', 'at_hours', 'platform'})`,
+`INTERVENTION_ORDER['shutdown'] = 4`) retires one platform at a simulated
+time -- `shutdown(id, *, at_hours, platform)` builds it; `compile_scenario`
+rejects an unknown platform and, once every intervention's `launched_at` is
+resolved, warns (not errors: "nothing to shut down" is legal) when the target
+never launches. The `delay` intervention (`Map({'id', 'at_hours', 'zone',
+'box', 'multiplier', 'duration_hours'})`, `INTERVENTION_ORDER['delay'] = 5`)
+imposes a *temporary* speed multiplier -- `delay(id, *, at_hours, multiplier,
+zone=None, box=None, duration_hours=None)` requires exactly one of `zone`/`box`
+(a compile error otherwise); a named `zone` is resolved to its box at compile
+time (the same `_resolve_service_area` precedent used elsewhere), so the
+runtime never consults the zone table for a delay. Both kinds join the
+same-time/same-target `seen` dedupe that already covers `launch`/`policy`/
+`regulation`/`preference`: `shutdown`'s target is `(at_seconds, 'shutdown',
+platform)`; `delay`'s is `(at_seconds, 'delay', id)` -- keyed by the
+intervention's own id, not a target, because several delays (different zones
+or boxes) may legitimately coexist at one instant.
+
+`platforms.<id>.insolvency` (`Scalar('string', choices=('shutdown',),
+nullable=True)`, default `None`) and `platforms.<id>.dividend`
+(`Map({'reserve_minor', 'period_hours', 'min_completed_rides'}, nullable=True)`,
+default `None`) are both authored through `platform(id, *, insolvency=None,
+dividend=None, **parameters)`. Either one without a tracked
+`starting_cash_minor` is a compile error ("needs a tracked cash balance
+(starting_cash_minor)") -- both need a real balance to test or pay from,
+never an untracked (`None`) one. A `dividend.period_hours * HOUR` exceeding
+the horizon warns ("no dividend period closes within the horizon"); see
+marketplace-engine.md "Insolvency" for what `insolvency='shutdown'` actually
+does at runtime.
+
+`evolution.ledger` (`Map({'driver_lease_minor', 'lease_hours',
+'driver_bankruptcy_minor'}, nullable=True)`, default `None`) schedules a
+recurring, market-wide (not per-platform) driver lease posting: every
+`lease_hours`, `driver_lease_minor` (an integer `>= 0`) posts an external
+`lease` `Transfer` debiting every not-yet-deactivated driver, and, when
+`driver_bankruptcy_minor` is set, deactivates (`marketplace_engine
+.deactivate_driver`, reason `"bankruptcy"`) any driver whose account balance
+is then below it -- the lease cadence *is* the bankruptcy posting cadence, so
+`compile_scenario` requires `lease_hours` whenever `driver_lease_minor > 0` or
+`driver_bankruptcy_minor` is set (two separate errors, both naming
+`evolution.ledger.lease_hours`), and warns when `lease_hours * HOUR` exceeds
+the horizon ("no lease posting occurs within the horizon"). `Plan.ledger`
+converts `lease_hours` to `lease_seconds` (the `controller` precedent), so
+`main.py` schedules `PolicyRuntime.schedule_ledger` with no further unit math;
+all of a ledger's or a dividend's configuration travels in the scheduled
+event's own payload, never through `PolicyRuntime.snapshot()`, so a restored
+run continues the whole recurring schedule from the scheduler snapshot alone.
+
 ## Compiler pipeline and output
 
 The initial compiler prepares execution; it does not emit machine code or a

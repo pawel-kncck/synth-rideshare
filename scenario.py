@@ -47,7 +47,7 @@ def trait_schema(implementations, family):
     """
     identifier = (implementations or {}).get(family)
     return TRAITS[family] if identifier is None else policy_class(family, identifier).declaration.parameter_schema
-INTERVENTION_ORDER = {'launch': 0, 'regulation': 1, 'policy': 2, 'preference': 3}
+INTERVENTION_ORDER = {'launch': 0, 'regulation': 1, 'policy': 2, 'preference': 3, 'shutdown': 4, 'delay': 5}
 
 
 class ScenarioError(ValueError):
