@@ -1,5 +1,8 @@
 version: 1
 base_branch: main
+# Role models are pinned in the orchestrator's central Scenario readiness config:
+# coder/escalation gpt-5.6-terra; reviewer/planner claude-opus-5.
+# Workspace preparation fetches origin/main before branching and local verification.
 verification:
   test:
     - python3 scripts/check_scenario_readiness.py
