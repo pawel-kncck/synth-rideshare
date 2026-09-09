@@ -126,3 +126,38 @@ class Cancel:
     reason: str
     rider_fee_minor: int = 0
     driver_compensation_minor: int = 0
+    driver_penalty_minor: int = 0
+
+
+@dataclass(frozen=True)
+class Transfer:
+    """A proposal to post money outside a ride. amount_minor is signed; positive credits the person.
+
+    The reason vocabulary is intentionally not checked here: this module
+    imports nothing from marketplace_engine.py (only hashlib/json/math and
+    dataclass helpers), and importing TRANSFER_REASONS would create a
+    cycle. marketplace_engine.post_transfer is the single authority on
+    reasons; this contract only proves the proposal's shape.
+    """
+    reason: str
+    role: str
+    person_id: object
+    amount_minor: int
+    platform_id: str | None = None
+    counterparty: str = 'platform'
+    order_id: int | None = None
+    program_id: str | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.reason, str) or not self.reason:
+            raise ValueError('A transfer needs a reason')
+        if self.role not in ('rider', 'driver'):
+            raise ValueError('A transfer names a rider or a driver')
+        if isinstance(self.amount_minor, bool) or not isinstance(self.amount_minor, int) or self.amount_minor == 0:
+            raise ValueError('Transfer amount must be a nonzero integer of minor units')
+        if self.counterparty not in ('platform', 'external'):
+            raise ValueError('Unknown transfer counterparty')
+        if self.counterparty == 'external' and self.platform_id is not None:
+            raise ValueError('An external transfer has no platform side')
+        if self.program_id is not None and (not isinstance(self.program_id, str) or not self.program_id):
+            raise ValueError('program_id must be a nonempty string')

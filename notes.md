@@ -28,6 +28,25 @@ Authoring restrictions added in phase 1 (`scenario.py`):
   given at least one platform (`platform()`/`with_changes`) before
   `compile_scenario` succeeds.
 
+Authoring restrictions added in phase 3 (`scenario.py`, `marketplace_engine.py`):
+- `platforms.<id>.starting_cash_minor` is a required (nullable) platform key
+  (seeds that platform's tracked cash account; `null`, every preset's
+  default, means untracked). A definition or saved manifest written before
+  phase 3 fails `Scenario.load` with
+  `platforms.<id>.starting_cash_minor: missing required setting` -- add
+  `"starting_cash_minor": null` per platform to migrate, the same class of
+  break `notes` caused in phase 1.
+- `driver_cancellation_penalty_minor` (default 0) is a nonnegative-integer
+  `MarketplaceParameters` field and applies only to a driver-initiated
+  cancellation; `cancel_order(..., driver_penalty_minor=...)` rejects a
+  nonzero value for any other cancelling party (`CommandRejected`), before
+  any mutation.
+- `post_transfer`'s `amount_minor` must be a nonzero integer (signed: positive
+  credits the person); `reason` must be one of a closed vocabulary
+  (`driver_penalty`, `guarantee_topup`, `lease`, `dividend`,
+  `operating_cost`, `grant`); `counterparty="platform"` requires and debits
+  `platform_id`, `counterparty="external"` forbids it.
+
 Multi-platform realism, current as of phase 1 (see the linked architecture
 docs for the normative contract):
 - Baselines: roughly 55% session-to-order with supply, 70% offer acceptance

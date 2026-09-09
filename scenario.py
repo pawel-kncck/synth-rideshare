@@ -605,6 +605,9 @@ PLATFORM = Map({
     'launched': Scalar('boolean'),
     'policy': Implementation('marketplace', POLICY_EXTRA),
     'controller': Map({'interval_hours': POSITIVE_HOURS, 'until_hours': POSITIVE_HOURS}, nullable=True),
+    # Seeds the platform's tracked cash account (marketplace_engine.Account); null (every
+    # preset's default) means untracked -- flows still post, there is just no balance to report.
+    'starting_cash_minor': Scalar('integer', minimum=0, nullable=True),
 })
 PEAK = Map({'id': Scalar('string'), 'weekdays': Seq(Scalar('integer', minimum=0, maximum=6)),
             'start_hour': Scalar('integer', minimum=0, maximum=23), 'end_hour': Scalar('integer', minimum=0, maximum=24),
@@ -815,12 +818,13 @@ MARKETPLACE_DEFAULTS_V1 = {
     'matching': 'nearest', 'max_local_commitments': 2, 'back_to_back_within_seconds': 1800, 'max_attempts': 5,
     'retry_drivers': False, 'retry_seconds': 1, 'order_patience_seconds': 60, 'offer_seconds': 10, 'quote_seconds': 30,
     'rider_cancellation_fee_minor': 0, 'driver_cancellation_compensation_minor': 0,
+    'driver_cancellation_penalty_minor': 0,
 }
 ALL_APPS = ['rebu', 'blot', 'flyt']
 
 
 def _platform_v1():
-    return {'launched': True, 'controller': None,
+    return {'launched': True, 'controller': None, 'starting_cash_minor': None,
             'policy': {'implementation': 'marketplace@1', 'version': 'modern-v1',
                        'parameters': dict(MARKETPLACE_DEFAULTS_V1), 'rules': [], 'campaigns': [], 'fallback': 'default'}}
 
@@ -920,7 +924,7 @@ def preset_definition(identifier):
 
 
 def platform(id, *, launched=True, version='modern-v1', rules=(), campaigns=(), fallback='default',
-            controller=None, **parameters):
+            controller=None, starting_cash_minor=None, **parameters):
     """One complete platform entry keyed by its ID: ``{id: <PLATFORM entry>}``.
 
     Unnamed keyword parameters override `MARKETPLACE_DEFAULTS_V1`; every
@@ -937,13 +941,16 @@ def platform(id, *, launched=True, version='modern-v1', rules=(), campaigns=(), 
     misspelled parameter name is rejected with the exact path (for example
     ``platform alpha.policy.parameters.comission_fraction``); `controller`
     must be `None` or `{"interval_hours": ..., "until_hours": ...}`.
-    `compile_scenario` still re-validates cross-field combinations one
-    platform cannot see alone, such as `max_local_commitments > 2`.
+    `starting_cash_minor` (an explicit keyword, not one of `**parameters`:
+    it seeds the platform's cash `Account`, not a `MarketplaceParameters`
+    field) defaults to `None`, meaning untracked. `compile_scenario` still
+    re-validates cross-field combinations one platform cannot see alone,
+    such as `max_local_commitments > 2`.
     """
     diag = Diagnostics()
     if not isinstance(id, str) or not id or '.' in id:
         diag.error('platform', 'IDs must be nonempty strings without dots')
-    entry = {'launched': launched, 'controller': controller,
+    entry = {'launched': launched, 'controller': controller, 'starting_cash_minor': starting_cash_minor,
              'policy': {'implementation': BUILTIN_IMPLEMENTATIONS['marketplace'], 'version': version,
                         'parameters': {**MARKETPLACE_DEFAULTS_V1, **parameters},
                         'rules': list(rules), 'campaigns': list(campaigns), 'fallback': fallback}}
@@ -1168,6 +1175,7 @@ class PlatformPlan:
     implementation: str
     policy: PlatformPolicy
     controller: tuple | None  # (interval_seconds, until_seconds)
+    starting_cash_minor: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1246,7 +1254,8 @@ def compile_scenario(scenario):
             controller = (item['controller']['interval_hours'] * HOUR, item['controller']['until_hours'] * HOUR)
             if controller[1] > horizon:
                 diag.warn(f'platforms.{pid}.controller.until_hours', 'extends beyond the horizon')
-        platforms[pid] = PlatformPlan(item['launched'], item['policy']['implementation'], policy, controller)
+        platforms[pid] = PlatformPlan(item['launched'], item['policy']['implementation'], policy, controller,
+                                      item['starting_cash_minor'])
     if not platforms:
         diag.error('platforms', 'at least one platform is required')
     implementations = {family: resolved['behavior'][family]['implementation'] for family in ('rider', 'driver', 'evolution')}

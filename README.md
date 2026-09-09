@@ -249,6 +249,7 @@ python3 metrics.py logs/simulation-<run-id>/simulation.log --market-share-days 7
 python3 metrics.py logs/simulation-<run-id>/simulation.log --windows 24,96
 python3 metrics.py logs/simulation-<run-id>/simulation.log --platform-detail
 python3 metrics.py logs/simulation-<run-id>/simulation.log --first-choice-days 1
+python3 metrics.py logs/simulation-<run-id>/simulation.log --ledger --ledger-drivers
 ```
 
 These commands print JSON to stdout and leave the log unchanged. No HTML, CSV,
@@ -258,7 +259,7 @@ first command calculates a whole-run summary; the second adds interval rows
 shares in seven-day periods; use `--market-share-days 1` for daily shares. Periods
 are relative to run start, and the last can be shorter.
 
-Three more flags are opt-in and additive; with none of them,
+Four more flags are opt-in and additive; with none of them,
 `calculate_metrics(path)` is byte-identical to before they existed. `--windows
 H1,H2,...` (comma-separated, strictly increasing hours after run start) splits
 money and the funnel into consecutive windows plus a `cumulative` running
@@ -267,9 +268,16 @@ result (`window_rows`). `--platform-detail` adds `platform_detail`: per-
 platform money (`money_by_platform`), funnel (`platform_funnel`), cancellations
 by party (`cancellations_by_party`), driver km (`driver_distance`), ETA-drift
 cancellations (`eta_drift`), the base/bonus/discount settlement split
-(`settlement_breakdown`, with an always-empty `transfers` placeholder for
-phase 3's `Transfer` record) and order/money conservation identities
-(`conservation`). `--first-choice-days N` adds `first_choice_periods`: each
+(`settlement_breakdown`, transfers by reason included since phase 3) and
+order/money conservation identities (`conservation`, three additive phase-3
+keys: `transfer_party_delta_minor`, `unattributed_driver_payout_minor`,
+`account_deltas_match_records`). `--ledger` (`--ledger-drivers` implies it,
+and additionally fills one row per driver) adds `ledger`
+(`ledger_section`, phase 3): per-platform cash start/end, ride contribution,
+and transfers by reason, cross-checked as
+`cash_end_minor - cash_start_minor == ride_contribution_minor + transfers_minor`
+from two independently derived sources -- boundary account balances and the
+records new in this run. `--first-choice-days N` adds `first_choice_periods`: each
 period's first-choice query share (the platform of a rider's earliest quote
 per intent) against the installed base at that period's start; a rider can
 have several apps installed, so installed shares can sum past 100% within a

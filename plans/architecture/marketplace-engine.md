@@ -43,7 +43,7 @@ occupancy legality does not change with them.
 
 | Record | Contents |
 | --- | --- |
-| `Platform` | Identity, launch state, and the sets of driver/rider ids with its app open. |
+| `Platform` | Identity, launch state, the sets of driver/rider ids with its app open, and `starting_cash_minor` (seeds its cash `Account`; `None` = untracked). |
 | `Rider` | Installed apps, open apps, location when not onboard, live trip intent, and the service they are onboard. |
 | `Driver` | Installed apps, open apps, car binding, current shift, ordered accepted commitments, and current physical service. |
 | `Car` | Registrations, the controlling driver, and one `Motion` (origin, destination, start, arrival) resolving position at any time. |
@@ -53,7 +53,8 @@ occupancy legality does not change with them.
 | `Order` | Owning platform, intent, bound fare terms, `open`/`assigned`/`completed`/`canceled` state, `Assignment`, offer ids, service id, timeline, cancellation, settlements. |
 | `Offer` | One proposal to one driver: frozen `PayoutTerms`, displayed ETA, deadline, and exactly one disposition. |
 | `Service` | Actual pickup, boarding, and transport legs for one order, with arrival, boarding, and end times and the actual end position. |
-| `Settlement` | Rider payment, driver payout, and the platform contribution residual, with a reason (`completed_ride` or `cancellation_fee`). |
+| `Settlement` | Rider payment, driver payout, the platform contribution residual, a reason (`completed_ride` or `cancellation_fee`), and `bonus_minor` (the accepted offer's bonus on `completed_ride`, `0` on `cancellation_fee`, so the base/bonus split survives without joining the assignment). |
+| `Transfer` | Money moved outside a ride: signed `amount_minor` (positive credits the person), `reason` (one of `TRANSFER_REASONS`), `role`/`person_id`, `platform_id` (funding platform, or `None`), `counterparty` (`platform` debits that platform by the same amount; `external` -- lease, operating cost -- has no platform side), and optional `order_id`/`program_id`. |
 
 Records refer to each other by id, never by object, so the whole market
 serializes: `snapshot()` and `MarketplaceEngine.restore(snapshot, registry)`
@@ -72,6 +73,34 @@ dataclass and `_intent`'s positional restore reads it with `.get`, so a
 snapshot taken before this field existed still restores (with `source_id`
 `None`); `SNAPSHOT_SCHEMA_VERSION` stays unchanged because the field is
 additive and optional.
+
+### Money accounts
+
+`Account` (`role`, `id`, `opening_minor`, `settlement_minor`, `transfer_minor`,
+derived `balance_minor`) is a money balance the engine keeps in
+`MarketplaceEngine.accounts`, keyed `(role, id)` for every platform, driver
+and rider -- unrelated to a person's platform *app* accounts
+(`Driver.accounts`/`Rider.accounts`, `activate_account`), which are
+membership, not money. `account(role, id)` reads one; callers never write it
+directly. `opening_minor` is `Platform.starting_cash_minor` for a platform
+(`None` = untracked: `settlement_minor`/`transfer_minor` still accumulate, so
+a ledger can report contribution and transfers, but `balance_minor` is `None`
+too) and `0` for a driver or rider. Both `add_platform` and `_settle`/
+`post_transfer` open and post accounts directly; **no account posting emits a
+notification** -- `_post`, `_post_settlement` and `_post_transfer_record` are
+silent, so a zero-effect posting (or none at all) never perturbs a
+notification trace.
+
+`Account` is deliberately **not** one of `_TABLES`: `snapshot()` emits
+`"accounts"` (sorted by `(role, type(id).__name__, str(id))` so insertion
+order never affects the emitted bytes) purely for offline reading (`metrics.py`
+reads cash start/end from it), but `restore()` ignores that list entirely and
+calls `_rebuild_accounts()`, which derives every balance from scratch by
+replaying `settlements` and `transfers` in id order. A restored engine's own
+`snapshot()` therefore re-derives the same `"accounts"` list a continuous run
+would have produced only if replaying the tables truly reproduces every
+posted balance -- the strongest conservation check in the repository, not a
+tautology one gets by decoding stored totals.
 
 One car per driver is bound at `add_driver`; rebinding is not supported.
 Platform status stays separate from physical status: `Order.phase` reports
@@ -97,7 +126,8 @@ being delivered; they always observe a completed transition.
 | `place_order(intent, quote)` | Creates the platform order and converts the intent once. One live order per intent. |
 | `create_offer(platform, order, driver, payout, bonus, expires_at=, eta_seconds=)` | Proposes an open order to an accepting driver; schedules `offer.expire`. |
 | `respond_to_offer(offer, accept)` | Returns the disposition, or `stale` when already resolved. |
-| `cancel_order(order, by, reason, rider_fee_minor=, driver_compensation_minor=)` | Ends an order before boarding, freeing only that commitment. |
+| `cancel_order(order, by, reason, rider_fee_minor=, driver_compensation_minor=, driver_penalty_minor=)` | Ends an order before boarding, freeing only that commitment. A nonzero `driver_penalty_minor` is only legal for `by="driver"`; when nonzero it posts a `driver_penalty` `Transfer` between the existing driver `order_canceled` notification and releasing the commitment. |
+| `post_transfer(reason, role, person, amount_minor, platform_id=, counterparty=, order_id=, program_id=)` | Posts a `Transfer` outside a ride: `counterparty="platform"` requires and debits `platform_id`; `"external"` forbids it. Notifies the credited person and, for a platform counterparty, the funding platform; never the account posting itself. |
 
 Runtime legality is mandatory even for a compiled scenario: acceptance
 re-checks everything at execution time because an offer may expire, an order
@@ -166,12 +196,33 @@ Amounts are integer minor units; `World.to_minor` rounds half up from major
 units. Settlements satisfy `rider_payment = driver_payout +
 platform_contribution` exactly, contribution being the residual and possibly
 negative. A completed ride settles once; cancellation fees use a distinct
-reason and record.
+reason and record. A settlement's driver leg posts only when
+`driver_id is not None`; a rider cancelling an *unassigned* order under a
+nonzero `driver_cancellation_compensation_minor` is the one case where a
+settlement's `driver_payout_minor` has nowhere to post (there is no driver to
+credit) -- the engine does not reject it (that would change legality for
+already-authored scenarios), it is simply excluded from every account, and
+`metrics.py` names the gap explicitly as `unattributed_driver_payout_minor`
+in `ledger_section`/`conservation`.
+
+Every `Transfer` conserves money at the record level: a `platform`
+counterparty credits the named person by `amount_minor` and debits that
+platform's account by the same amount, so the party deltas sum to zero; an
+`external` counterparty (a lease, an operating cost) has no platform side at
+all, so the person's delta alone IS the declared external amount --
+`metrics.py` reports this as `party_delta_minor`/`transfer_party_delta_minor`
+rather than pretending it nets to zero. A platform's per-transfer rows
+therefore do not sum to the global transfers row whenever any external
+transfer exists in the run; that gap is the external total itself, not
+something to attribute to a platform.
 
 Notifications are scoped to an audience: `platform` (own app sessions,
 orders, offers, arrivals, boardings, completions, cancellations, driver
-availability), `driver` (offers, commitments, service progress, shift
-changes), and `rider` (quotes, order progress, intent end). `PlatformView`
+availability, and `transfer_posted` for transfers it funds), `driver`
+(offers, commitments, service progress, shift changes, and `transfer_posted`
+when credited or debited), and `rider` (quotes, order progress, intent end,
+and `transfer_posted` when credited or debited) -- an external `lease` is
+private to the driver; the platform is never told about it. `PlatformView`
 exposes own orders, offers, quotes, rider requests, and `DriverPresence`
 observations (position, accepting, own accepted orders, own pending offers)
 for drivers with that app open. `DriverView` shows a driver's cross-app
@@ -206,6 +257,46 @@ scenarios whenever the engine changed:
   never overlap per driver or rider and lie inside shifts, position is
   continuous across promoted services, and physical service hours equal the
   report's active hours.
+- (Phase 3) A subsidized ride (`payout_minor > rider_payment_minor`) reduces
+  the funding platform's cash account by exactly `payout - rider_payment`,
+  credits the driver the full payout and debits the rider the full payment;
+  `Settlement.bonus_minor` matches the accepted offer's bonus.
+  `driver_cancellation_penalty_minor` posts one `driver_penalty` `Transfer`
+  of the configured (negated) amount on a driver-initiated cancellation, and
+  posts none at all (not a zero-valued record) when the parameter is zero; a
+  rider-initiated cancellation with a nonzero `driver_penalty_minor` is
+  rejected before any mutation, and no `driver_penalty` transfer is ever
+  found attached to a rider cancellation.
+- (Phase 3) An external transfer (`counterparty="external"`) has no platform
+  leg and its declared `amount_minor` is exactly the credited/debited
+  person's delta; a platform transfer's person and platform deltas sum to
+  zero. Every value/shape rejection (zero amount, unknown reason, a platform
+  counterparty with no `platform_id`, an external counterparty with one, an
+  unknown person, a float `amount_minor`, an `order_id` belonging to another
+  platform, a nonzero `driver_penalty_minor` for a non-driver party) raises
+  `CommandRejected` and leaves the market unchanged.
+- (Phase 3) `engine.snapshot()["accounts"]`, JSON round-tripped and restored,
+  reproduces every account's `balance_minor` exactly, and
+  `restored.snapshot() == engine.snapshot()` -- because `restore()` derives
+  accounts by replaying `settlements`/`transfers` (`_rebuild_accounts`),
+  never by decoding the emitted list, this equality is itself the
+  conservation proof. Replaying every settlement and transfer into an
+  independent `{party: delta}` accumulator reproduces each account's own
+  `settlement_minor + transfer_minor` exactly.
+- (Phase 3) A full scenario run (platforms built through
+  `scenario.platform(starting_cash_minor=...)`, `driver_cancellation_penalty_minor`
+  set through `platforms.<id>.policy.parameters`) reproduces the same
+  per-cancellation penalty transfers end to end through
+  `MarketplacePolicy.cancel` -> `PolicyRuntime.cancel` ->
+  `cancel_order`; a custom marketplace policy returning a `Transfer` from its
+  `controller` hook (the only reachable phase-3 application site, since
+  `marketplace@1`'s `controller` always returns `Stop`) is applied by
+  `PolicyRuntime.apply_transfer` with the calling platform bound as funder;
+  `main.Simulation.snapshot()`/`restore()` reproduce every account balance
+  the same way the bare engine does. Both seed-0 `@1` presets are unaffected
+  byte-for-byte (`scripts/check_scenario_readiness.py`), including a
+  1000+-order scenario-review run compared field-by-field against pristine
+  `origin/main`.
 
 Measure physical active time from service intervals, never from overlapping
 accepted-order timelines; queued waiting is a separate quantity.

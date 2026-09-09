@@ -85,15 +85,30 @@ estimated trip distance and actual completed transport distance separately.
 `rider_cancellation_fee_minor` and
 `driver_cancellation_compensation_minor` configure separate cancellation
 settlements for rider requests before boarding; defaults are zero. Driver and
-platform cancellation requests have zero fees. The current cancellation policy
+platform cancellation requests have zero fees, except `driver_cancellation_penalty_minor`
+(phase 3, default zero), which `MarketplacePolicy.cancel` fills into
+`Cancel.driver_penalty_minor` only when the requesting party is the driver;
+`cancel_order` posts it as a `driver_penalty` `Transfer` (marketplace-engine.md
+"Money accounts"), never a `Settlement` -- it is not a ride-bound amount. A
+zero penalty (the default, and always the case for a rider or platform
+cancellation) posts no record at all. The current cancellation policy
 is consulted at request time; accepted completion payouts are never changed.
 Canceled attempts do not advance completed-ride eligibility.
 
-The initial controller is fixed: `controller` produces no tariff change. A
-platform's scenario `controller` setting (`interval_hours`, `until_hours`)
-schedules a bounded cadence with explicit serializable memory. Timed
-`policy_change` interventions in the scenario select new compiled versions;
-scenario campaigns declare `start_hours`/`end_hours`, which the compiler
+The initial controller is fixed: `controller` produces no tariff change --
+`marketplace@1` always returns `Stop`. A platform's scenario `controller`
+setting (`interval_hours`, `until_hours`) schedules a bounded cadence with
+explicit serializable memory. As of phase 3 the `controller` hook may also
+return a `Transfer` proposal (`policy_contracts.Transfer`, declared in
+`MarketplacePolicy.declaration`'s outputs); `PolicyRuntime.apply_transfer`
+applies it with the calling platform bound as the funder (a platform may only
+post its own transfers, mirroring cancellation's own-order-and-party check),
+then posts the returned memory exactly as a `Stop` would. This is the only
+call site that can apply a `Transfer` today; a custom marketplace
+implementation is the only way to reach it, since the built-in `@1`
+`controller` never returns one. Timed `policy_change` interventions in the
+scenario select new compiled versions; scenario campaigns declare
+`start_hours`/`end_hours`, which the compiler
 converts to simulated seconds. Automatic surge, broadcast dispatch,
 road-network routing, campaign budgets, stacking variants and quests remain
 extensions rather than advertised implementations. Built-in declarations expose
@@ -106,10 +121,11 @@ approximate a zone with a map-wide `policy_change`, as the review scenarios
 under `scenarios/reviews/` do); a driver-side pass-through surcharge distinct
 from the tariff; first-N or budgeted campaign redemption (a campaign discounts
 every eligible ride in its window, not just a rider's first few); driver
-earnings guarantees or top-ups; driver cancellation penalties or platform-side
-dispatch lockouts; platform or driver cash balances and any ledger `Transfer`;
-and service areas (a platform cannot refuse a query or a candidate by
-location). Plan sections 4.A-4.C name the phases that add each of these.
+earnings guarantees or top-ups; platform-side dispatch lockouts; and service
+areas (a platform cannot refuse a query or a candidate by location). Plan
+sections 4.B-4.C name the phases that add each of these. (Driver cancellation
+penalties and platform/driver cash balances with ledger `Transfer`s landed in
+phase 3, section 4.A.)
 
 The fare binds at quote time and the commission at offer/acceptance time
 (both frozen into the order/assignment, per "Pricing, incentives, and
