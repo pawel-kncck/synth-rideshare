@@ -47,6 +47,42 @@ Authoring restrictions added in phase 3 (`scenario.py`, `marketplace_engine.py`)
   `operating_cost`, `grant`); `counterparty="platform"` requires and debits
   `platform_id`, `counterparty="external"` forbids it.
 
+Authoring restrictions added in phase 4 (`scenario.py`, `marketplace_policy.py`,
+`marketplace_engine.py`, `policy_runtime.py`) -- eight new `MarketplaceParameters`
+keys, all default-off, so every preset's resolved/manifest gains only the new
+schema, never a changed value:
+- `surcharge_minor`/`surcharge_driver_share` (flat post-multiplier surcharge,
+  with a commission-exempt driver share), `commission_binding` (`"offer"` or
+  `"quote"`), `driver_lockout_seconds`, `guarantee_window_seconds`,
+  `announce_terms`, `service_area` (`None`, a declared zone id, or a box).
+- `service_area` is validated in its *authored* form (`Params.check` builds
+  `MarketplaceParameters(**scalars)` before any compilation step can resolve
+  a zone id), so a string is accepted as a nonempty zone id and only
+  `_compile_policy` resolves it against `world.zones`; an unknown id is a
+  compile error naming the declared ids.
+- `ConditionalRule` gains an optional `start`/`end` window (both or
+  neither, `end > start`); `PlatformPolicy` gains `programs` (unique ids;
+  every program's `window_seconds` must equal the platform's own
+  `guarantee_window_seconds`, and a program requires it to be positive); a
+  rule may not itself change `guarantee_window_seconds` from the base
+  (it is one platform-wide cadence, not a per-segment one).
+- `Campaign` gains `budget_minor` (nonnegative or `None`) and
+  `max_completed_rides` (positive or `None`).
+- A `regulation` intervention requires at least one cap, with
+  `max_base_fare_minor`/`max_per_km_minor` jointly set or jointly absent;
+  `impose_regulation` (the engine command it schedules) enforces the same
+  rule at apply time. `issue_quote`/`create_offer` raise `RegulationRejected`
+  (a `CommandRejected` subclass) when the in-force regulation's cap is
+  exceeded -- nothing is disclosed beyond `command_result:
+  regulation_rejected`.
+- A `policy_change` intervention (wildcard or not) may not change
+  `guarantee_window_seconds` -- rejected at compile time, since that cadence
+  is scheduled once, from the platform's launch-time policy, and never from
+  a later intervention or a restore.
+- `Quote` gains `commission_fraction`/`driver_surcharge_minor` (both
+  default-valued, restored with `.get` tolerance); `SNAPSHOT_SCHEMA_VERSION`
+  stays 2 (additive), the same precedent phase 3's `transfers` table set.
+
 Multi-platform realism, current as of phase 1 (see the linked architecture
 docs for the normative contract):
 - Baselines: roughly 55% session-to-order with supply, 70% offer acceptance

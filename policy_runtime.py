@@ -10,7 +10,7 @@ from behavior_policy import (DriverPolicy, EvolutionPolicy, ExpandApps, OpenApp,
                              OrderQuote, Respond, RiderPolicy, personal_pickup_eta, rider_reward, driver_reward)
 from marketplace_policy import (EtaProposal, MarketplacePolicy, OfferProposal, PlatformPolicy,
                                 QuoteProposal)
-from marketplace_engine import CommandRejected
+from marketplace_engine import CommandRejected, RegulationRejected
 from policy_contracts import Cancel, Decision, RandomValues, Stop, Transfer, Wait, finite_number, freeze, plain
 
 
@@ -22,7 +22,7 @@ POLICY_FAMILIES = {
     'rider': (RiderPolicy, ('decide', 'progress')),
     'driver': (DriverPolicy, ('expand', 'respond', 'progress')),
     'evolution': (EvolutionPolicy, ('checkpoint',)),
-    'marketplace': (MarketplacePolicy, ('quote', 'dispatch', 'revise', 'cancel', 'controller')),
+    'marketplace': (MarketplacePolicy, ('quote', 'dispatch', 'revise', 'cancel', 'controller', 'observe')),
 }
 POLICY_REGISTRY = {family: {} for family in POLICY_FAMILIES}
 
@@ -70,8 +70,9 @@ BUILTIN_IMPLEMENTATIONS = {family: policy_id(implementation) for family, (implem
 class PolicyRuntime:
     schema_version = 2
 
-    def __init__(self, engine, registry, seed, platforms, profiles, implementations=None):
+    def __init__(self, engine, registry, seed, platforms, profiles, implementations=None, zones=None):
         self.engine, self.seed = engine, seed
+        self.zones = dict(zones or {})
         selected = dict(implementations or {})
         marketplace = selected.pop('marketplace', None)
         marketplace = ({p: BUILTIN_IMPLEMENTATIONS['marketplace'] for p in platforms} if marketplace is None
@@ -84,6 +85,7 @@ class PolicyRuntime:
         self.bindings = {family: policy_class(family, identifier)
                          for family, identifier in self.implementations.items() if family != 'marketplace'}
         self.platforms = {p: policy_class('marketplace', marketplace[p])(c) for p, c in platforms.items()}
+        self.observing = {p: self._observed_kinds(policy) for p, policy in self.platforms.items()}
         self.profiles = profiles
         self.platform_memory = {p: {} for p in platforms}
         self.people = {key: {'preferred_app': profile.preferred_app, 'scores': {},
@@ -102,6 +104,7 @@ class PolicyRuntime:
             ('policy.driver.expand', self._driver_expand), ('policy.driver.respond', self._driver_respond),
             ('policy.driver.progress', self._driver_progress), ('policy.checkpoint', self._checkpoint),
             ('policy.intervention', self._intervene), ('policy.controller', self._controller),
+            ('policy.observe_window', self._observe_window),
         ):
             registry.register(kind, handler)
         engine.add_listener(self.on_notification)
@@ -113,6 +116,25 @@ class PolicyRuntime:
     @staticmethod
     def key(role, person_id):
         return f'{role}:{person_id}'
+
+    def _observed_kinds(self, policy):
+        """Config-derived gate: which platform-audience kinds this policy's observe hook actually
+        needs. A policy may not request an undeclared kind; empty for every shipped preset, so
+        on_notification never calls observe() and platform_memory stays untouched."""
+        declared = set(policy.declaration.observations)
+        requested = set(policy.observed_kinds())
+        if requested - declared:
+            raise ValueError(f'Policy requested undeclared observation kinds {sorted(requested - declared)}')
+        return frozenset(requested)
+
+    def zone_of(self, point):
+        """First zone id (sorted) whose closed box contains point, else None -- matches
+        scenario._check_zones' semantics; overlap is resolved deterministically by sorted id."""
+        for zid in sorted(self.zones):
+            box = self.zones[zid]
+            if box['min'][0] <= point[0] <= box['max'][0] and box['min'][1] <= point[1] <= box['max'][1]:
+                return zid
+        return None
 
     def state(self, role, person_id):
         return self.people[self.key(role, person_id)]
@@ -154,9 +176,16 @@ class PolicyRuntime:
             for offer_id in order.offer_ids:
                 offers[str(offer_id)] = view.offer(offer_id)
         rider_id = request.rider_id if request else order.rider_id
+        visible = self.visible(platform_id, 'rider', rider_id)
+        if self.zones and (request is not None or order is not None):
+            origin = request.origin if request is not None else order.pickup
+            destination = request.destination if request is not None else order.destination
+            visible = {**visible, 'origin_zone': self.zone_of(origin), 'destination_zone': self.zone_of(destination)}
+        if order is not None:
+            extra = {'quote': view.quote(order.quote_id), **extra}
         return freeze({'now': self.now, 'platform_id': platform_id, 'request': request, 'order': order,
                        'drivers': drivers, 'own_orders': orders, 'own_offers': offers,
-                       'visible': self.visible(platform_id, 'rider', rider_id), **extra})
+                       'visible': visible, **extra})
 
     def usable_apps(self, role, person_id):
         person = self.engine._person(role, person_id)
@@ -183,8 +212,13 @@ class PolicyRuntime:
             campaigns = [c for c in self.platforms[p].config.campaigns
                          if c.awareness == 'announced' and c.eligible(self.now, self.visible(p, role, person_id))]
             # This is an announced incentive salience, not a hidden route-specific quote.
-            result[p] = max((c.discount_minor / 1000 + c.discount_fraction if role == 'rider'
-                             else c.bonus_minor / 1000 for c in campaigns), default=0)
+            salience = max((c.discount_minor / 1000 + c.discount_fraction if role == 'rider'
+                            else c.bonus_minor / 1000 for c in campaigns), default=0)
+            if role == 'driver' and self.platforms[p].config.parameters.announce_terms:
+                # A driver also learns the platform's public (base, not rule-specific) commission --
+                # comparable in scale to the preferred-app bonus of 1 in behavior_policy.ranked_apps.
+                salience += 1 - self.platforms[p].config.parameters.commission_fraction
+            result[p] = salience
         return result
 
     def rider_context(self, intent):
@@ -209,10 +243,24 @@ class PolicyRuntime:
         decision = policy.quote(context, freeze(self.platform_memory[platform_id]),
                                 RandomValues(self.seed, ('quote', platform_id, request.intent_id)))
         self.record('platform', platform_id, 'quote', decision, policy.config.version)
+        if isinstance(decision.action, Stop):
+            self.platform_memory[platform_id] = decision.memory
+            self.observations.append({'type': 'quote_refused', 'at_seconds': self.now, 'platform_id': platform_id,
+                                      'intent_id': request.intent_id, 'rider_id': request.rider_id,
+                                      'reason': decision.action.reason})
+            # Nothing else wakes the rider without a quote_received; re-queue so a missing quote is
+            # treated like missing supply and the rider can inspect another app.
+            self.queue_rider(request.intent_id, self.profile('rider', request.rider_id).rider.retry_seconds)
+            return
         if not isinstance(decision.action, QuoteProposal):
             raise ValueError('Quote hook must produce QuoteProposal')
         self.platform_memory[platform_id] = decision.memory
-        self.engine.issue_quote(platform_id, request.intent_id, **asdict(decision.action))
+        try:
+            self.engine.issue_quote(platform_id, request.intent_id, **asdict(decision.action))
+        except RegulationRejected:
+            self.observations.append({'type': 'command_result', 'at_seconds': self.now, 'platform_id': platform_id,
+                                      'intent_id': request.intent_id, 'result': 'regulation_rejected'})
+            self.queue_rider(request.intent_id, self.profile('rider', request.rider_id).rider.retry_seconds)
 
     def queue_dispatch(self, order_id, delay):
         generation = self.dispatch_generation.get(str(order_id), 0) + 1
@@ -233,6 +281,10 @@ class PolicyRuntime:
         if isinstance(action, OfferProposal):
             try:
                 self.engine.create_offer(p, order.id, **asdict(action))
+            except RegulationRejected:
+                self.observations.append({'type': 'command_result', 'at_seconds': self.now,
+                                          'platform_id': p, 'order_id': order.id, 'result': 'regulation_rejected'})
+                self.queue_dispatch(order.id, policy.config.parameters.retry_seconds)
             except CommandRejected:
                 # Runtime legality can differ from the visible proposal. Do not disclose private cause.
                 self.observations.append({'type': 'command_result', 'at_seconds': self.now,
@@ -287,6 +339,65 @@ class PolicyRuntime:
                                   platform_id=platform_id if action.counterparty == 'platform' else None,
                                   counterparty=action.counterparty, order_id=action.order_id,
                                   program_id=action.program_id)
+
+    def observe_context(self, platform_id, kind, data, **extra):
+        """Detached context for a platform-audience notification the policy asked for (or the
+        runtime-generated window_closed). order/offer are this platform's own records (own_orders/
+        own_offers precedent); driver_id is the driver the notification is about, when there is
+        one; visible matches the driver-side (or rider-side) dict quote/dispatch would resolve."""
+        view = self.engine.platform_view(platform_id)
+        order = view.order(data['order_id']) if kind.startswith('order_') else None
+        offer = view.offer(data['offer_id']) if kind == 'offer_resolved' else None
+        driver_id = data.get('driver_id')
+        if driver_id is None and offer is not None:
+            driver_id = offer.driver_id
+        if driver_id is None and order is not None and order.assignment is not None:
+            driver_id = order.assignment.driver_id
+        visible = (self.visible(platform_id, 'driver', driver_id) if driver_id is not None
+                  else self.visible(platform_id, 'rider', order.rider_id))
+        return freeze({'now': self.now, 'platform_id': platform_id, 'kind': kind, 'data': data,
+                       'order': order, 'offer': offer, 'driver_id': driver_id, 'visible': visible, **extra})
+
+    def observe(self, platform_id, kind, data, **extra):
+        context = self.observe_context(platform_id, kind, data, **extra)
+        discriminator = data.get('order_id', data.get('offer_id', data.get('driver_id', data.get('window_start'))))
+        policy = self.platforms[platform_id]
+        decision = policy.observe(context, freeze(self.platform_memory[platform_id]),
+                                  RandomValues(self.seed, ('observe', platform_id, kind, self.now, discriminator)))
+        self.record('platform', platform_id, 'observe', decision, policy.config.version)
+        self.platform_memory[platform_id] = decision.memory
+        if isinstance(decision.action, Transfer):
+            self.apply_transfer(platform_id, decision.action)
+        elif not isinstance(decision.action, Stop):
+            raise ValueError('Unsupported observe action')
+
+    def schedule_program_windows(self):
+        """Schedule each platform's first window-close event, aligned to the world clock: window
+        start w = floor(now/window)*window, close at w+window. Call only from Simulation.__init__
+        after engine.bind (self.engine.scheduler is not yet set inside PolicyRuntime.__init__);
+        never from restore, where the pending event already lives in the scheduler snapshot."""
+        for platform_id, policy in self.platforms.items():
+            window = policy.config.parameters.guarantee_window_seconds
+            if window > 0:
+                start = math.floor(self.now / window) * window
+                self.engine.scheduler.schedule_at(start + window, 'policy.observe_window',
+                                                  {'platform_id': platform_id, 'window_seconds': window})
+
+    def _observe_window(self, event):
+        platform_id, window = event.payload['platform_id'], event.payload['window_seconds']
+        close_at = self.now
+        window_start = close_at - window
+        members = sorted((driver_id for driver_id, driver in self.engine.drivers.items()
+                          if platform_id in driver.apps & driver.accounts),
+                         key=lambda d: (type(d).__name__, d))
+        for driver_id in members:
+            self.observe(platform_id, 'window_closed',
+                        {'driver_id': driver_id, 'window_start': window_start, 'window_end': close_at},
+                        driver_id=driver_id)
+        # Reschedules unconditionally: a trailing pending event past the horizon is identical in
+        # continuous and restored runs.
+        self.engine.scheduler.schedule_at(close_at + window, 'policy.observe_window',
+                                          {'platform_id': platform_id, 'window_seconds': window})
 
     def queue_rider(self, intent_id, delay):
         m = self.intents[str(intent_id)]
@@ -488,6 +599,8 @@ class PolicyRuntime:
                     other = e.orders[other_id]
                     if other.platform_id == person_id:
                         self.revise(other)
+            if kind in self.observing[person_id]:
+                self.observe(person_id, kind, d)
         elif n.audience == 'rider':
             t = self.profile('rider', person_id).rider
             if kind == 'intent_started':
@@ -616,7 +729,7 @@ class PolicyRuntime:
         self.engine.scheduler.schedule_at(at_seconds, 'policy.checkpoint', {})
 
     def schedule_intervention(self, at_seconds, *, platform_id=None, config=None, role=None, person_id=None,
-                              preferred_app=None, launch=None):
+                              preferred_app=None, launch=None, regulation=None):
         # Config is compiled before scheduling; execution only selects an immutable version.
         finite_number(at_seconds, 'intervention time', minimum=self.now)
         if launch is not None and launch not in self.platforms:
@@ -628,7 +741,8 @@ class PolicyRuntime:
         if preferred_app is not None and preferred_app not in self.accessible_apps(role, person_id):
             raise ValueError('Preferred intervention requires installed, account-enabled and registered access')
         item = {'at': at_seconds, 'platform_id': platform_id, 'config': plain(config), 'role': role,
-                'person_id': person_id, 'preferred_app': preferred_app, 'launch': launch, 'applied': False}
+                'person_id': person_id, 'preferred_app': preferred_app, 'launch': launch,
+                'regulation': regulation, 'applied': False}
         self.interventions.append(item)
         self.engine.scheduler.schedule_at(at_seconds, 'policy.intervention', {})
 
@@ -638,12 +752,15 @@ class PolicyRuntime:
                 continue
             if item['launch'] is not None:
                 self.engine.launch_platform(item['launch'])
+            if item.get('regulation') is not None:
+                self.engine.impose_regulation(**item['regulation'])
             if item['config'] is not None:
                 config = item['config']
                 implementation = policy_class('marketplace', self.implementations['marketplace'][item['platform_id']])
                 self.platforms[item['platform_id']] = implementation(PlatformPolicy.compile(
                     overrides=config['parameters'], rules=config['rules'], campaigns=config['campaigns'],
-                    version=config['version'], fallback=config['fallback']))
+                    programs=config.get('programs', ()), version=config['version'], fallback=config['fallback']))
+                self.observing[item['platform_id']] = self._observed_kinds(self.platforms[item['platform_id']])
             if item['preferred_app'] is not None:
                 if item['preferred_app'] not in self.usable_apps(item['role'], item['person_id']):
                     raise ValueError('Intervention preference is no longer usable')

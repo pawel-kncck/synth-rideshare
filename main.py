@@ -61,7 +61,7 @@ class Simulation:
             else:
                 self.engine.add_rider(person['id'], profile.apps, accounts=profile.accounts)
         self.policies = PolicyRuntime(self.engine, registry, self.seed, {p: item.policy for p, item in plan.platforms.items()},
-                                      profiles, implementations=plan.implementations)
+                                      profiles, implementations=plan.implementations, zones=plan.zones)
         for person in inputs.people:
             self.policies.state(person['role'], person['id'])['scores'] = dict(person['initial_scores'])
         self._register_sessions(registry)
@@ -76,6 +76,7 @@ class Simulation:
             if platform.controller is not None:
                 self.policies.schedule_controller(0, platform_id, interval_seconds=platform.controller[0],
                                                   until_seconds=platform.controller[1])
+        self.policies.schedule_program_windows()
         for item in plan.interventions:
             self._schedule_intervention(item, inputs.people)
         self._initialize_runner()
@@ -87,8 +88,12 @@ class Simulation:
             config = item['policy']
             self.policies.schedule_intervention(item['at_seconds'], platform_id=item['platform'],
                 config=PlatformPolicy.compile(overrides=config['parameters'], rules=config['rules'],
-                                              campaigns=config['campaigns'], version=config['version'],
-                                              fallback=config['fallback']))
+                                              campaigns=config['campaigns'], programs=config.get('programs', ()),
+                                              version=config['version'], fallback=config['fallback']))
+        elif item['kind'] == 'regulation':
+            self.policies.schedule_intervention(item['at_seconds'], regulation={
+                'max_base_fare_minor': item['max_base_fare_minor'], 'max_per_km_minor': item['max_per_km_minor'],
+                'max_commission_fraction': item['max_commission_fraction']})
         else:
             targets = [p['id'] for p in people if p['role'] == item['role']
                        and (p['id'] in item['people'] or (item['segment'] is not None and p['segment'] == item['segment']))]
@@ -135,10 +140,12 @@ class Simulation:
         sim.world = sim.engine.world
         sim.scenario, sim.inputs = snapshot['scenario'], snapshot['inputs']
         configs = {p: PlatformPolicy.compile(overrides=c['parameters'], rules=c['rules'], campaigns=c['campaigns'],
-                    version=c['version'], fallback=c['fallback']) for p, c in snapshot['policies']['platforms'].items()}
+                    programs=c.get('programs', ()), version=c['version'], fallback=c['fallback'])
+                  for p, c in snapshot['policies']['platforms'].items()}
         profiles = {key: load_profile(values) for key, values in snapshot['profiles'].items()}
         sim.policies = PolicyRuntime(sim.engine, registry, sim.seed, configs, profiles,
-                                     implementations=snapshot['policies']['implementations'])
+                                     implementations=snapshot['policies']['implementations'],
+                                     zones=snapshot['scenario']['resolved'].get('world', {}).get('zones', {}))
         sim.policies.restore_memory(snapshot['policies'])
         sim._register_sessions(registry)
         sim.scheduler = Scheduler.restore(snapshot['scheduler'], registry)

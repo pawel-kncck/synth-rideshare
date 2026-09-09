@@ -57,6 +57,19 @@ profiles, model equations, adoption and learning in
 [Behavior policy](plans/architecture/behavior-policy.md); commercial
 configuration in [Marketplace policy](plans/architecture/marketplace-policy.md).
 
+Phase 4 adds platform-side state and pricing structures, every one
+default-off: zone/time-window rule conditions, a flat surcharge with a
+driver-share exemption, `commission_binding` (bind the commission at quote
+time instead of offer time), first-N and budgeted campaigns, driver
+cancellation lockouts, declared service areas, `hourly_guarantee` programs
+paid from windowed driver records, a `policy_change(platform="*")`
+intervention that expands to every launched platform, and a market-wide
+`regulation` intervention enforced by the engine. See
+[Marketplace policy](plans/architecture/marketplace-policy.md)'s "Platform
+state and the observe hook" and "Pricing, incentives, and commitments", and
+[Marketplace engine](plans/architecture/marketplace-engine.md)'s
+"Regulation" section.
+
 Platform IDs are free strings: nothing requires `rebu`/`blot`/`flyt`, and
 `market-blank@1` starts with no platforms and no segments so a script can
 build any market it names. `platform(id, **parameters)` returns one complete

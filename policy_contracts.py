@@ -94,6 +94,7 @@ class Declaration:
     memory_version: int
     hooks: tuple
     memory_schema: tuple = ()  # (field name, JSON value type); empty means stateless
+    observations: tuple = ()  # platform-audience notification kinds an `observe` hook may request
 
 
 @dataclass(frozen=True)
