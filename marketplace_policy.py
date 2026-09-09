@@ -560,6 +560,12 @@ class MarketplacePolicy:
                 open_.setdefault(key, context.now)
             elif key in open_:
                 w = self._window_start(context.now)
+                if context.now == w:
+                    # A boundary-instant close: _window_start(now) resolves to the window that is
+                    # only now starting, but the interval being closed belongs to the one that just
+                    # ended -- credit that window instead, or the whole interval is dropped and a
+                    # zero-valued phantom record is left in the window that hasn't started yet.
+                    w -= self.config.parameters.guarantee_window_seconds
                 self._window_record(m, w, key)['online_seconds'] += context.now - max(open_[key], w)
                 del open_[key]
         action = self._close_window(m, context) if kind == 'window_closed' else Stop('observed')

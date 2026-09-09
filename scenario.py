@@ -1553,10 +1553,29 @@ def implementation_fingerprint(implementations, generators=None):
                         'compiler': COMPILER_VERSION})
 
 
+def _resolve_service_area(parameters, zones, path, diag):
+    """Resolve a string `service_area` in `parameters` against `zones` into a box, in place -- the
+    one place a zone id becomes a box before it reaches `MarketplaceParameters` (plan section 4.C;
+    scenario-definition.md). Shared by a policy's base parameters and every rule's parameters, since
+    a rule can override service_area like any other MarketplaceParameters field; an unresolved string
+    reaching MarketplaceParameters would later crash marketplace_policy.inside() at decision time."""
+    area = parameters.get('service_area')
+    if isinstance(area, str):
+        zones = zones or {}
+        if area not in zones:
+            diag.error(f'{path}.service_area', f'unknown zone {area!r}; declared: {sorted(zones)}')
+        else:
+            box = zones[area]
+            parameters['service_area'] = [list(box['min']), list(box['max'])]
+
+
 def _compile_policy(definition, path, diag, zones=None):
     """Normalize hours to seconds (campaign/rule windows, program window/online hours) and resolve
     a string `service_area` against the world's declared zones -- the one place a zone id becomes a
-    box before it reaches `MarketplaceParameters` (plan section 4.C; scenario-definition.md)."""
+    box before it reaches `MarketplaceParameters` (plan section 4.C; scenario-definition.md). Applied
+    via `_resolve_service_area` to the base parameters and to every rule's parameters alike;
+    `_apply_policy_change` routes interventions through this same function, so intervention rules
+    get the same treatment."""
     campaigns = []
     for item in definition['campaigns']:
         campaigns.append({key: value for key, value in item.items() if key not in ('start_hours', 'end_hours')}
@@ -1566,6 +1585,8 @@ def _compile_policy(definition, path, diag, zones=None):
         entry = {key: value for key, value in item.items() if key not in ('start_hours', 'end_hours')}
         if item.get('start_hours') is not None:
             entry['start'], entry['end'] = item['start_hours'] * HOUR, item['end_hours'] * HOUR
+        entry['parameters'] = dict(entry.get('parameters') or {})
+        _resolve_service_area(entry['parameters'], zones, f'{path}.rules.{item["id"]}.parameters', diag)
         rules.append(entry)
     programs = []
     for item in definition.get('programs', ()):
@@ -1573,14 +1594,7 @@ def _compile_policy(definition, path, diag, zones=None):
                         | {'window_seconds': item['window_hours'] * HOUR,
                            'min_online_seconds': item['min_online_hours'] * HOUR})
     parameters = dict(definition['parameters'])
-    area = parameters.get('service_area')
-    if isinstance(area, str):
-        zones = zones or {}
-        if area not in zones:
-            diag.error(f'{path}.parameters.service_area', f'unknown zone {area!r}; declared: {sorted(zones)}')
-        else:
-            box = zones[area]
-            parameters['service_area'] = [list(box['min']), list(box['max'])]
+    _resolve_service_area(parameters, zones, f'{path}.parameters', diag)
     try:
         return PlatformPolicy.compile(overrides=parameters, rules=rules, campaigns=campaigns, programs=programs,
                                       version=definition['version'], fallback=definition['fallback'])
