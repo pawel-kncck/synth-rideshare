@@ -666,18 +666,18 @@ Per-phase acceptance, in addition to the verifications in section 4:
 
 ## 7. Per-scenario readiness
 
-| Scenario | Runnable now as an approximation | Needs | Open questions for the author |
+| Scenario | Runnable now as an approximation | Needs | Assumption adopted (section 10) |
 | --- | --- | --- | --- |
-| S1 Take-rate elasticity | Yes: 20%/10% commissions, dual access, ETA-led riders via traits; drivers accept independently | Phase 1 (payout ratio, funnel), phase 5 (compare, hold, open all, coin flip) | Is "exactly 12.5%" per-ride after integer rounding or the design ratio? Does "dispatched" mean offered or assigned? Is the $0.30/unit cost part of the checks? |
-| S2 Flat fee vs multiplier | Partly: map-wide timed multiplier and base-fare bump via `policy_change`; explicit trips for distance groups | Phase 2 (distances, zone shock), phase 4 (zone rules, surcharge), phase 5 (lexicographic riders, per-minute drivers) | Max payout per minute favors Urban's short trips, but the check expects drivers to reject them for Metro's long trips. Which rule wins? Is the doubling relative to the zone off-peak or the map? Take-rate is unspecified. |
-| S3 Cancellation penalties | Partly: fares, patience, driver cancel by elapsed time | Phase 3 (penalty), phase 4 (lockout), phase 5 (ETA-threshold cancel), phase 1 (party-split metrics) | None blocking. |
-| S4 Cold-start vouchers | Partly: unlaunched Challenger, launch at 24 h, commission schedule, capped `new_user_only` discount, checkpoint adoption | Phase 4 (first-N, announced terms, budget), phase 5 (ETA install, peer cascade, idle-hour adoption), phase 1 (windowed burn) | Vicinity radius is unspecified. Is the voucher window or the third ride the terminal condition? |
-| S5 Queue collisions | Partly: cap, cross-platform queueing, `back_to_back_within_seconds=180`, `expand_while_busy`; the shipped fixture shows the ETA gap | Phase 5 (pausing, drift cancel, periodic revise), phase 6 (delay) | "Both platforms register the driver as locked" conflicts with the boundary; section 5 resolves it by driver disclosure. Confirm. |
-| S6 Geo-fence and deadheading | Partly: CityWide is the default; core starts via explicit shifts; suburb waiting emerges; empty km reconstructible from legs | Phase 2 (zones, OD mixes), phase 4 (service area), phase 1 (km split), phase 6 (reposition, zone memory) | The zones leave uncovered strips of the map. "Retention" has no simulator meaning; earnings and utilization are the proxies. |
-| S7 Reliability hysteresis | Partly: tariffs, dual installs, Reliable-exclusive drivers, Budget supply injected by explicit shifts at 48 h, learned preferences | Phase 5 (failure counters, sticky switch, long-wait failures), phase 1 (query share vs installs) | Phase 1 wait and cancellation rates are emergent, not settable; calibrate counts and geography. |
-| S8 Regulatory cap | Yes for the core question: contracts are bound at quote and offer time and settled from bound terms (verified by the review's fixtures) | Phase 1 (trip IDs, implied-rate checks), phase 4 (regulation, commission binding, all-platform change), phase 2 (corridor) | `t = 11.45` decimal hours or clock time? Is $2.00/unit a cap or the new tariff? "Dispatched" equals assignment. |
-| S9 Hourly guarantee | Partly: two platforms, exclusive versus dual segments, timed map-wide Flash multiplier, fringe parking via explicit shifts and trips | Phase 3 (top-up transfer), phase 4 (windows, program, zone surge), phase 5 (availability, strategic response), phase 6 (return to fringe) | Clock hours or rolling windows? Gross or payout? Does 0 of 0 dispatches qualify? Is a timeout a rejection? "No ghost double-booking" versus the two-order cap. |
-| S10 Solvency and debt | Partly: take-rates, 50% subsidy with 0% commission, per-ride burn identity from settlements | Phase 3 (cash, balances), phase 6 (lease, bankruptcy, shutdown, dividends, shift extension), phase 1 (money series) | Exact hour of insolvency versus event time; do boarded Burn rides finish; are all riders and drivers already on Corp and Coop for "forced migration"; is the $2,000 reserve the starting cash. |
+| S1 Take-rate elasticity | Yes: 20%/10% commissions, dual access, ETA-led riders via traits; drivers accept independently | Phase 1 (payout ratio, funnel), phase 5 (compare, hold, open all, coin flip) | Design ratio with per-platform half-up rounding; "dispatched" is assignment; operating cost is an offline metric only. |
+| S2 Flat fee vs multiplier | Partly: map-wide timed multiplier and base-fare bump via `policy_change`; explicit trips for distance groups | Phase 2 (distances, zone shock), phase 4 (zone rules, surcharge), phase 5 (lexicographic riders, per-minute drivers) | Drivers maximize total payout across pending offers; doubling is relative to the zone's off-window rate; 20% take-rate; closed zone box. |
+| S3 Cancellation penalties | Partly: fares, patience, driver cancel by elapsed time | Phase 3 (penalty), phase 4 (lockout), phase 5 (ETA-threshold cancel), phase 1 (party-split metrics) | None needed. |
+| S4 Cold-start vouchers | Partly: unlaunched Challenger, launch at 24 h, commission schedule, capped `new_user_only` discount, checkpoint adoption | Phase 4 (first-N, announced terms, budget), phase 5 (ETA install, peer cascade, idle-hour adoption), phase 1 (windowed burn) | Vicinity 2 km; voucher ends at the earlier of ride three and t = 96. |
+| S5 Queue collisions | Partly: cap, cross-platform queueing, `back_to_back_within_seconds=180`, `expand_while_busy`; the shipped fixture shows the ETA gap | Phase 5 (pausing, drift cancel, periodic revise), phase 6 (delay) | Driver disclosure through `pause_when_full`; Green stays blind to Blue's remaining ride; the delay is a zone `delay` intervention. |
+| S6 Geo-fence and deadheading | Partly: CityWide is the default; core starts via explicit shifts; suburb waiting emerges; empty km reconstructible from legs | Phase 2 (zones, OD mixes), phase 4 (service area), phase 1 (km split), phase 6 (reposition, zone memory) | UrbanOnly serves the core box only, everything else is suburban; retention is earnings per hour, net per total km and idle share. |
+| S7 Reliability hysteresis | Partly: tariffs, dual installs, Reliable-exclusive drivers, Budget supply injected by explicit shifts at 48 h, learned preferences | Phase 5 (failure counters, sticky switch, long-wait failures), phase 1 (query share vs installs) | Rates are emergent and calibrated by supply; a failure is a driver cancel or a pickup wait over 12 minutes. |
+| S8 Regulatory cap | Yes for the core question: contracts are bound at quote and offer time and settled from bound terms (verified by the review's fixtures) | Phase 1 (trip IDs, implied-rate checks), phase 4 (regulation, commission binding, all-platform change), phase 2 (corridor) | Decimal hours as written; the order is a regulation (250 base, 200 per km, 10%) that both platforms match by `policy_change`; "dispatched" is assignment. |
+| S9 Hourly guarantee | Partly: two platforms, exclusive versus dual segments, timed map-wide Flash multiplier, fringe parking via explicit shifts and trips | Phase 3 (top-up transfer), phase 4 (windows, program, zone surge), phase 5 (availability, strategic response), phase 6 (return to fringe) | Calendar clock hours; payout excluding bonus; 0 of 0 qualifies; expiry counts as rejection; strategic drivers take no second order and keep Steady open. |
+| S10 Solvency and debt | Partly: take-rates, 50% subsidy with 0% commission, per-ride burn identity from settlements | Phase 3 (cash, balances), phase 6 (lease, bankruptcy, shutdown, dividends, shift extension), phase 1 (money series) | Shutdown at the event that crosses zero; boarded rides finish, the rest cancel; everyone already has Corp and Coop; reserve equals starting cash; weekly dividend on 20 completions per period. |
 
 ## 8. What not to do
 
@@ -723,21 +723,64 @@ These can land with phase 1 and address section 2.3:
    after the calendar origin) for future reviewers.
 7. Refresh or remove `notes.md`.
 
-## 10. Ambiguities to return to the scenario authors
+## 10. Assumptions adopted for ambiguous requirements
 
-Collected from section 7, these need an answer before a check can be written
-as pass or fail rather than as an assumption:
+The scenario authors cannot be consulted, so each ambiguity in section 7 is
+resolved here. Every scenario script records the assumption it uses in its
+docstring and in the definition's `notes`, so a check reads as pass or fail
+against a stated reading rather than against a guess.
 
-- S1: rounding of "exactly 12.5%"; "dispatched" as offer or assignment;
-  whether operating cost enters any check.
-- S2: per-minute objective versus the reject-short-for-long example; the
-  baseline of "demand doubles"; take-rate; whether the zone box is closed.
-- S4: vicinity radius; whether unused voucher rides expire at 96 h.
-- S5: whether platform-visible locking is required or experimenter-visible
-  capacity suffices.
-- S6: coverage of the strip between the two zones; the meaning of retention.
-- S8: time notation; cap versus replacement tariff.
-- S9: window definition; earnings definition; 0-of-0 acceptance; timeout as
-  rejection; the meaning of "ghost double-booking" given the two-order cap.
-- S10: insolvency timing; boarded rides at shutdown; migration for people
-  without other apps; reserve versus starting cash.
+- **S1.** "Exactly 12.5% higher" is the design ratio: the check is
+  `payout == round_half_up((1 - c) * gross)` per platform, with the ratio of
+  the unrounded shares equal to 1.125. "Dispatched" means an accepted offer
+  (assignment), not an offer created. The $0.30 per km operating cost is an
+  offline metric on driver net earnings and enters no check.
+- **S2.** The worked example wins over the verbal objective: drivers maximize
+  total expected net payout across pending offers, so a driver rejects Urban's
+  short trip for Metro's long trip. Demand doubling is relative to the zone's
+  own off-window arrival rate. The take-rate is the shipped 20% on both
+  platforms, so Urban's driver pass-through is a surcharge with
+  `surcharge_driver_share = 1`. The zone box `(4,4)` to `(6,6)` is closed.
+- **S4.** Vicinity is a 2 km radius around the rider's last known location.
+  A voucher ends at the earlier of the third completed Challenger ride and
+  `t = 96`. Drivers learn of the 0% commission through `announce_terms`.
+- **S5.** Experimenter-visible capacity (`MAX_COMMITMENTS`, `no_free_slot`)
+  satisfies the capacity check. The "both platforms register the driver as
+  busy" check is satisfied by driver disclosure: the scenario sets
+  `availability = pause_when_full`. Green's ETA blindness to Blue's remaining
+  ride is preserved and reported, not fixed. The "active Blue delay" is a
+  `delay` intervention on the zone the Blue ride is transiting.
+- **S6.** UrbanOnly's service area is the core box only; every other point on
+  the 15 km map, including the strip between the boxes, is suburban for
+  CityWide and outside for UrbanOnly. Retention is measured as driver
+  earnings per online hour, net earnings per total km including empty and
+  reposition km, and idle share, compared between the two platforms' completed
+  work.
+- **S7.** No further assumption: wait and cancellation rates in phase 1 are
+  emergent and are calibrated by supply counts and geography; a failure is a
+  driver cancellation or a completed ride whose pickup wait exceeds 12
+  minutes.
+- **S8.** Times are decimal hours after the calendar origin as written, so
+  `11.45` is 11:27 and the boundary trips are authored with explicit trips at
+  those instants. The municipal order is a replacement tariff expressed as a
+  regulation: `max_base_fare_minor = 250`, `max_per_km_minor = 200`,
+  `max_commission_fraction = 0.10`, with both platforms scheduling a matching
+  `policy_change` at `t = 12`. "Dispatched" means assignment.
+- **S9.** Windows are calendar clock hours aligned to the world clock.
+  Earnings are the driver's payout on completed Steady rides in the window,
+  excluding bonuses. A window with zero Steady dispatches qualifies (0 of 0
+  counts as 100%). An expired offer counts as a rejection for the acceptance
+  rate. "Ghost double-booking" means two simultaneous physical services,
+  which the engine already prevents; the strategic segment additionally sets
+  `second_order_probability = 0` so a queued Steady order never blocks a Flash
+  ride, and uses `availability = always_open` so it keeps earning Steady online
+  time while on Flash.
+- **S10.** Insolvency is evaluated at the settlement or posting that takes the
+  balance to or below zero and takes effect at that event time; the check
+  reports the containing hour. Boarded Burn rides complete on frozen terms;
+  unboarded Burn orders and pending offers are canceled with
+  `platform_shutdown`. Every rider and driver starts with Corp and Coop
+  installed alongside Burn, so migration needs no new install. Coop's
+  operating reserve equals its $2,000 starting cash, and the dividend is paid
+  at the end of each 7-day period to drivers with at least 20 Coop
+  completions in that period.
