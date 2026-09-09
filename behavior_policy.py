@@ -398,7 +398,7 @@ class RiderPolicyV2(RiderPolicy):
     order is untouched, so a default-trait @2 rider consumes the same draws in the same order."""
     declaration = Declaration('rider_search', '2', RiderTraitsV2,
         ('now', 'intent', 'quotes', 'usable_apps', 'preferred_app', 'scores', 'announced',
-         'failures', 'known_launched_apps', 'sticky_preference'),
+         'failures', 'known_launched_apps', 'sticky_preference', 'installed_apps'),
         (OpenApp, OrderQuote, Download, SwitchPreferred, Cancel, Stop, Wait), 1,
         ('decide', 'progress'), RiderPolicy.declaration.memory_schema)
 
@@ -415,14 +415,18 @@ class RiderPolicyV2(RiderPolicy):
             return Decision(Stop('search patience exhausted'), m, 'Intent search deadline reached')
         if sum(m['attempts'].values()) >= t.max_order_attempts:
             return Decision(Stop('order budget exhausted'), m, 'Finite order attempts exhausted')
-        # Fatigue switch: reads only the *current* preferred app's failure counter, which is 0 for
-        # the newly chosen platform, so this cannot oscillate on the very next decision.
+        # Fatigue switch: only steps to a platform with strictly fewer recorded failures than the
+        # *current* preferred app. failures is never reset by a switch itself (only by an on-time
+        # completion), so without this check two equally-fatigued apps would ping-pong forever;
+        # requiring strict improvement makes consecutive switches a strictly decreasing sequence
+        # bounded below by zero, so this cannot oscillate.
         if t.fatigue_threshold and context.failures.get(context.preferred_app, 0) >= t.fatigue_threshold:
             others = [p for p in context.usable_apps if p != context.preferred_app]
             best_other = (ranked_apps(others, context.preferred_app, context.scores, context.announced)[0]
                          if others else context.preferred_app)
             target = t.fatigue_target if t.fatigue_target != 'best_other' else best_other
-            if target != context.preferred_app and target in context.usable_apps:
+            if (target != context.preferred_app and target in context.usable_apps
+                    and context.failures.get(target, 0) < context.failures.get(context.preferred_app, 0)):
                 return Decision(SwitchPreferred(target, t.sticky), m, 'Consecutive failures on the preferred app')
         available = [p for p in context.usable_apps if m['attempts'].get(p, 0) < t.attempts_per_app]
         unseen = [p for p in available if p not in m['visited']]
@@ -446,11 +450,13 @@ class RiderPolicyV2(RiderPolicy):
 
         if (t.install_trigger_eta_seconds > 0 and latest is not None and latest.eta_seconds is not None
                 and latest.eta_seconds > t.install_trigger_eta_seconds):
-            install_candidates = [p for p in context.known_launched_apps if p not in context.usable_apps]
+            install_candidates = [p for p in context.known_launched_apps if p not in context.installed_apps]
             if install_candidates:
                 target = ranked_apps(install_candidates, context.preferred_app, context.scores, context.announced)[0]
-                # One install per intent per target: the target leaves known_launched_apps-minus-usable
-                # once installed anyway, but this also guards against a runtime-refused install.
+                # One install per intent per target: the target leaves known_launched_apps-minus-installed
+                # once installed anyway; this is a belt-and-suspenders cap, not a workaround for a
+                # runtime refusal (installed_apps, not usable_apps, is exactly what the runtime's Download
+                # branch rejects on, so a filtered candidate is never runtime-refused as already-installed).
                 if target not in m.setdefault('downloaded', []):
                     m['downloaded'].append(target)
                     return Decision(Download(target), m, 'Quoted pickup ETA exceeds the install trigger threshold')
@@ -609,7 +615,12 @@ class DriverPolicyV2(DriverPolicy):
                 wait = min((context.estimated_wait_seconds.get(p, {}).get('idle', math.inf)
                             for p in context.open_apps if p != context.offer.platform_id), default=math.inf)
                 eligible = wait <= t.hold_max_wait_seconds
-            if eligible and offer_value(mine, t.response_objective, context.speed_kmh) < reservation:
+            # Both reservation forms (reservation_payout_minor and the learned-wait
+            # reference_payout_minor) are always an absolute total payout in minor units, never a
+            # rate -- so this comparison hard-codes 'total_payout' regardless of response_objective,
+            # which only affects how *pending offers rank against each other* above, not what this
+            # offer is worth against the reservation.
+            if eligible and offer_value(mine, 'total_payout', context.speed_kmh) < reservation:
                 probability, explanation = 0, 'holding out for a better offer'
         accept = random.uniform('accept') < probability
         return Decision(Respond(context.offer.id, accept, probability, context.offer.eta_seconds,

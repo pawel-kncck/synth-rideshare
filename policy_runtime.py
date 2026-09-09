@@ -242,7 +242,14 @@ class PolicyRuntime:
                        'announced': self.announced('rider', intent.rider_id),
                        'failures': s.get('failures', {}), 'sticky_preference': s.get('sticky_preference', False),
                        'known_launched_apps': [p for p in profile.awareness
-                                               if p in self.engine.platforms and self.engine.platforms[p].launched]})
+                                               if p in self.engine.platforms and self.engine.platforms[p].launched],
+                       # rider_search@2 install trigger (behavior_policy.RiderPolicyV2.decide): this
+                       # rider's own installed apps, deliberately not usable_apps (apps & accounts &
+                       # launched, above) -- an installed app the rider has no account on yet
+                       # (accounts may be an authored subset of apps; scenario._check_access permits
+                       # it) is not usable, but must not be re-offered as a Download candidate. This
+                       # is exactly what the Download branch below rejects as already-installed.
+                       'installed_apps': sorted(self.engine.riders[intent.rider_id].apps)})
 
     def driver_context(self, driver_id, **extra):
         view, s = self.engine.driver_view(driver_id), self.state('driver', driver_id)

@@ -223,7 +223,7 @@ random draw order -- shipped presets keep selecting `@1` through
 | `response_rule` | `'independent'` | `'best_pending'` compares this offer's value against every other currently-pending offer to the same driver before the `@1` logistic result stands |
 | `response_objective` | `'total_payout'` | `'payout_per_minute'` divides by `private_eta_seconds` plus the destination leg at `speed_kmh` |
 | `hold_for_better` | `False` | while idle with a free slot, decline an offer below a reservation value |
-| `reservation_payout_minor` | `0` | explicit reservation; `0` selects the learned-wait form (below) |
+| `reservation_payout_minor` | `0` | explicit reservation, always an absolute total payout in minor units regardless of `response_objective` (below); `0` selects the learned-wait form (below) |
 | `hold_max_wait_seconds` | `0` | learned-wait form only: hold only if some other open platform's learned idle wait is at most this |
 | `cancel_rule` | `'patience'` | `'private_eta'` adds an ETA/penalty-exposure cancel ahead of the inherited elapsed-patience branch |
 | `cancel_eta_threshold_seconds` | `3600` | private-ETA form: cancel only once the private pickup ETA exceeds this |
@@ -258,7 +258,11 @@ parsed explanation string, is what a fixture checks:
    must never change (moving it would move every `@1` acceptance draw and
    fail the seed-0 gate).
 3. `hold_for_better`, only while idle with a free slot and no exit
-   requested: reject when this offer's value is below the reservation.
+   requested: reject when this offer's *total payout* (`offer_value(...,
+   'total_payout', ...)`, always the absolute payout -- deliberately not
+   `response_objective`, which governs only how stage 2 ranks pending
+   offers against each other, not what a reservation means) is below the
+   reservation.
 
 **`progress`** adds, before the inherited `@1` elapsed-patience branch: when
 `cancel_rule='private_eta'` and boarding has not happened, value a lockout
@@ -319,23 +323,36 @@ same draws in the same order as `@1`:
 
 1. **Fatigue switch**, right after the patience/order-budget guards, before
    any app is opened: if the *current* preferred app's failure count (below)
-   is at or above `fatigue_threshold`, switch to `fatigue_target` (falling
-   back to the ranked-best other usable app for `'best_other'`) and re-queue
-   the intent. Reading only the current preferred app's own counter -- which
-   is `0` for the newly-chosen platform -- means this cannot oscillate on the
-   very next decision. If a named `fatigue_target` platform is not currently
-   usable, this is not a compile-time-checkable condition (traits do not
-   know the platform table); the policy simply does not switch, and no
-   `SwitchPreferred` is proposed.
+   is at or above `fatigue_threshold`, propose switching to `fatigue_target`
+   (falling back to the ranked-best other usable app for `'best_other'`)
+   *only if* that target's own failure count is strictly lower than the
+   current preferred app's. `failures` is never reset by a switch itself
+   (only by an on-time completion on that platform), so two apps sitting at
+   the same failure count -- or a target that is itself at or past
+   `fatigue_threshold` and no better than the app just left -- must never be
+   proposed, or repeated decisions on an unresolved intent (no new failure
+   arrives between them) would swap `preferred_app` back and forth forever.
+   Requiring strict improvement instead makes any run of consecutive
+   switches a strictly decreasing sequence of failure counts bounded below
+   by zero, which must terminate. If a named `fatigue_target` platform is
+   not currently usable, this is not a compile-time-checkable condition
+   (traits do not know the platform table); the policy simply does not
+   switch, and no `SwitchPreferred` is proposed.
 2. **`compare_all_apps`**: `inspect` also becomes true whenever any usable
    app remains unseen, independent of price/ETA dissatisfaction.
 3. **`install_trigger_eta_seconds`**: once the latest quote's ETA exceeds
-   the threshold, download the best-ranked known, launched, not-yet-usable
-   app (`Download`, applied by the runtime like a checkpoint's own
-   download) and re-queue -- a mid-intent install changes `usable_apps`, so
-   the policy never acts on the new app within the same decision, only on
-   a later one. A per-intent memory list caps this at one download per
-   target per intent.
+   the threshold, download the best-ranked known, launched, not-yet-*installed*
+   app (`Download`, applied by the runtime like a checkpoint's own download)
+   and re-queue -- a mid-intent install changes `usable_apps`, so the policy
+   never acts on the new app within the same decision, only on a later one.
+   The candidate filter is against `context.installed_apps` (the rider's own
+   `apps`), deliberately *not* `usable_apps`: `usable_apps` also excludes an
+   installed app the rider has no *account* on yet, and `accounts` may be an
+   authored strict subset of `apps` (`scenario.person`/`segment` accept it),
+   so filtering on `usable_apps` would offer an already-installed app as a
+   "candidate" and the runtime's Download branch rejects exactly that as an
+   already-installed app. A per-intent memory list caps this at one download
+   per target per intent.
 4. **`choice_rule='lexicographic'`**: replaces only the *selection* of
    `best` among viable quotes -- narrow to survivors within `tolerance` of
    the tightest value at each `choice_keys` entry in order (price first by
@@ -370,7 +387,9 @@ exceeds `failure_wait_seconds`; a completion within that bound resets it to
 (`{cause: 'canceled'|'long_wait', consecutive}`) so a fixture can assert on
 the counter without reading private memory. `rider_context` exposes it as
 `failures`, alongside `known_launched_apps` (aware, launched apps, whether
-or not usable) and `sticky_preference`.
+or not usable), `installed_apps` (this rider's own `apps` -- the
+install-trigger candidate filter above, independent of `fatigue_threshold`)
+and `sticky_preference`.
 
 **`Download`** (rider `decide`) and **`SwitchPreferred`** (rider `decide`,
 `platform_id` + `sticky`) are applied by the runtime in `_rider_decide`
