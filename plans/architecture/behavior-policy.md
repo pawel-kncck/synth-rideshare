@@ -127,25 +127,34 @@ acceptance as a confirmed assignment.
 `"cancel_queued"` additionally requests cancellation of queued orders. The
 engine remains responsible for service promotion, occupancy and final shift exit.
 
-Two or more platforms' offers to the same multihoming driver are never
-compared jointly: each `offer_received` independently schedules its own
-`policy.driver.respond` after `response_seconds`, and each is evaluated on
-its own terms whenever its event fires, in the scheduler's own (FIFO)
-processing order. There is no cross-platform tie-break and no lookahead, so
-whichever offer happens to reach its response instant first is answered
-first, regardless of payout, even when a driver would clearly prefer the
-other on reflection (`scenarios/reviews/s01_driver_supply_elasticity.py`'s
-check 2 demonstrates and documents this). "Accepting" (`_driver_accepting`,
-used to build every platform's candidate list) means on shift, no exit
-requested, the app open, and the assigned car registered and the platform
-launched -- not physically idle: a driver mid-ride is still `accepting` on
-every app with a free commitment slot. There is no repositioning (a driver
-never travels without an active or queued commitment) and no memory of past
-rejections, cancellations, or failed pickups carried into future decisions;
+This is `driver_participation@1`'s behavior; every statement in this paragraph
+is conditional on that implementation. Two or more platforms' offers to the
+same multihoming driver are never compared jointly: each `offer_received`
+independently schedules its own `policy.driver.respond` after
+`response_seconds`, and each is evaluated on its own terms whenever its
+event fires, in the scheduler's own (FIFO) processing order. There is no
+cross-platform tie-break and no lookahead, so whichever offer happens to
+reach its response instant first is answered first, regardless of payout,
+even when a driver would clearly prefer the other on reflection
+(`scenarios/reviews/s01_driver_supply_elasticity.py`'s check 2 demonstrates
+and documents this -- and names `driver_participation@2`'s
+`response_rule='best_pending'`, below, as what compares them).
+"Accepting" (`_driver_accepting`, used to build every platform's candidate
+list) means on shift, no exit requested, the app open and not paused, and
+the assigned car registered and the platform launched -- not physically
+idle: a driver mid-ride is still `accepting` on every app with a free
+commitment slot. There is no repositioning (a driver never travels without
+an active or queued commitment) and, at `@1`, no memory of past rejections,
+cancellations, or failed pickups carried into future decisions;
 `pickup_eta_revised` notifications are emitted (`revise_pickup_eta`,
 [marketplace-engine.md](marketplace-engine.md)) but `rider_search@1` does
 not consume them, so a rider's cancellation decision never reacts to a
-revised (only the original) ETA.
+revised (only the original) ETA. "Participant policies v2" below names the
+`@2` traits that change each of these: `response_rule`/`hold_for_better`
+compare pending offers and hold out for a better one; `availability` adds
+`accepting=False` while paused; `cancel_rule='private_eta'` and
+`eta_drift_cancel_seconds` add exactly the private-ETA and revised-ETA
+memory this paragraph says `@1` lacks.
 
 Personal diagnostics retain phase-specific `opportunity_exposure`,
 `personal_offer`, `opportunity_wait_censored`, `commitment_wait`,
@@ -194,6 +203,255 @@ exposure, pending decisions, interventions and random identities. A general
 custom-policy registry and scenario compiler remain separate roadmap work;
 initial restore binds the shipped implementations. Validate the behavior contracts
 with scenario runs and throwaway scripts; there is no unit test suite.
+
+### Participant policies v2
+
+`driver_participation@2`, `rider_search@2` and `personal_evolution@2`
+(AST-209, plan section 4.D/4.E) are additive registered implementations,
+each a Python subclass of its `@1` counterpart with a trait dataclass that
+subclasses the `@1` traits (`register_policy`'s `issubclass` check requires
+this). Every new trait defaults to today's `@1` value or behavior, so a `@2`
+selection with default traits reproduces `@1` byte-for-byte, including the
+random draw order -- shipped presets keep selecting `@1` through
+`BUILTIN_IMPLEMENTATIONS`, so nothing changes without an explicit selection.
+
+**`DriverTraitsV2`** (subclasses `DriverTraits`):
+
+| Trait | Default (= `@1`) | Meaning |
+| --- | --- | --- |
+| `open_apps_at_start` | `'preferred'` | `'all'` opens every usable app at shift start instead of just the preferred one |
+| `response_rule` | `'independent'` | `'best_pending'` compares this offer's value against every other currently-pending offer to the same driver before the `@1` logistic result stands |
+| `response_objective` | `'total_payout'` | `'payout_per_minute'` divides by `private_eta_seconds` plus the destination leg at `speed_kmh` |
+| `hold_for_better` | `False` | while idle with a free slot, decline an offer below a reservation value |
+| `reservation_payout_minor` | `0` | explicit reservation, always an absolute total payout in minor units regardless of `response_objective` (below); `0` selects the learned-wait form (below) |
+| `hold_max_wait_seconds` | `0` | learned-wait form only: hold only if some other open platform's learned idle wait is at most this |
+| `cancel_rule` | `'patience'` | `'private_eta'` adds an ETA/penalty-exposure cancel ahead of the inherited elapsed-patience branch |
+| `cancel_eta_threshold_seconds` | `3600` | private-ETA form: cancel only once the private pickup ETA exceeds this |
+| `cancel_check_seconds` | `0` | `0` = off; else the runtime's re-check cadence for the private-ETA rule |
+| `penalty_tolerance_minor` | `0` | private-ETA form: cancel only when declared exposure is at or below this |
+| `availability` | `'always_open'` | `'pause_when_full'` / `'pause_while_serving_other'` (below) |
+| `tie_break` | `'stable'` | tie-break for `response_rule='best_pending'`: `'stable'` (smallest `(platform_id, offer_id)`) or `'random'` |
+
+**`respond`** layers three stages on the unchanged `@1` logistic (same
+score, same `RandomValues(('response', driver_id, platform_id, offer_id))`
+draw, drawn exactly once at the end), so a default-trait `@2` driver decides
+byte-for-byte like `@1`. Each stage may force `probability=0`
+deterministically -- the `Respond` proposal's `probability` field, not a
+parsed explanation string, is what a fixture checks:
+
+1. The `@1` score, second-order scaling and hard zeros (no free slot, exit
+   requested, private ETA past `max_private_pickup_seconds`).
+2. `response_rule='best_pending'`: build `value(o)` (per `response_objective`)
+   over `context.pending_offers` (an id-sorted, enriched view of this
+   driver's own unresolved offers, each with a runtime-computed
+   `private_eta_seconds` -- sorted because the underlying engine set's
+   iteration order can change across a snapshot/restore cycle, and a policy
+   comparing offers must see the same order either way). Reject when this
+   offer's value is below the best pending value; when several tie exactly,
+   `tie_break` picks the winner from the tied offers sorted by
+   `(platform_id, offer_id)` -- `'stable'` takes the first, `'random'` takes
+   `tied[int(context.tie_draw * len(tied))]`. `tie_draw` is a *separate*,
+   runtime-supplied symmetric draw keyed to `('tie_break', 'driver',
+   driver_id)` over the sorted pending offer ids -- deliberately not derived
+   from the per-offer acceptance draw above, whose identity contains the
+   offer id and therefore cannot agree between two co-pending offers, and
+   must never change (moving it would move every `@1` acceptance draw and
+   fail the seed-0 gate).
+3. `hold_for_better`, only while idle with a free slot and no exit
+   requested: reject when this offer's *total payout* (`offer_value(...,
+   'total_payout', ...)`, always the absolute payout -- deliberately not
+   `response_objective`, which governs only how stage 2 ranks pending
+   offers against each other, not what a reservation means) is below the
+   reservation.
+
+**`progress`** adds, before the inherited `@1` elapsed-patience branch: when
+`cancel_rule='private_eta'` and boarding has not happened, value a lockout
+at `lockout_seconds * reference_payout_minor / 600` (the same
+money-per-second scale `driver_reward` already uses), add the platform's
+declared `cancellation_penalty_minor`, and cancel when the private pickup
+ETA exceeds `cancel_eta_threshold_seconds` *and* that total exposure is at
+or below `penalty_tolerance_minor`. `context.terms` (`{platform_id,
+cancellation_penalty_minor, lockout_seconds, guarantee}`) is the offer's (or
+order's) platform's terms *resolved against this driver's own `visible`
+dict* -- exactly what a real app would show this driver on this platform,
+never another person's terms or a competitor's.
+
+`open_apps_at_start` and `availability` are applied by the *runtime*, not
+proposed by the policy -- the same precedent `after_service='preferred'`
+already set. `open_apps_at_start='all'` is applied once, in the
+`shift_started` branch of `on_notification`. `availability` is applied by
+`PolicyRuntime.apply_availability`, called unconditionally as the last
+statement of `sync_driver` (one call site, so no branch can forget it),
+using the new engine commands `pause_app`/`resume_app`
+([marketplace-engine.md](marketplace-engine.md)): the app stays open (so it
+still counts toward commitments and the "open apps" observed elsewhere) but
+`accepting=False`, that platform's pending offers to the driver are
+canceled, and the existing `driver_availability` notification is published
+-- which `MarketplacePolicy.observe` already maps to guarantee-window online
+time, so a paused driver correctly stops accruing that platform's online
+seconds (plan section 5's S9 tension). `pause_while_serving_other` pauses
+every open app except the one(s) the driver currently has an accepted
+commitment on; `pause_when_full` pauses every open app once commitments
+reach `MAX_COMMITMENTS`. `apply_availability` never pauses an app the driver
+has not opened, and a re-entrancy guard (`_pausing`, transient, deliberately
+not snapshotted) stops the `driver_availability` notification it publishes
+from recursing back into itself through `sync_driver`. This is the
+participant-side answer to the competitor-occupancy boundary (plan section
+5): a platform still never learns another platform's commitment count or
+service; a driver can only *disclose* busyness through its own pause.
+
+**`RiderTraitsV2`** (subclasses `RiderTraits`):
+
+| Trait | Default (= `@1`) | Meaning |
+| --- | --- | --- |
+| `choice_rule` | `'utility'` | `'lexicographic'` (below) |
+| `choice_keys` | `(('price', 50), ('eta', 0))` | ordered `(key, tolerance)` pairs for the lexicographic rule |
+| `compare_all_apps` | `False` | visit every usable app before deciding, within the existing visit/opening budgets |
+| `tie_break` | `'stable'` | lexicographic survivor tie-break |
+| `failure_wait_seconds` | `720` | a completion whose pickup wait exceeds this counts as a failure (below) |
+| `fatigue_threshold` | `0` | `0` = off; else consecutive same-platform failures that trigger a preferred-app switch |
+| `fatigue_target` | `'best_other'` | the ranked-best other usable app, or an explicit platform id |
+| `sticky` | `False` | recorded on a fatigue switch; personal_evolution@2 honors it (below) |
+| `eta_drift_cancel_seconds` | `0` | `0` = off; else cancel when the predicted pickup arrival instant drifts past the offer's promise by more than this |
+| `install_trigger_eta_seconds` | `0` | `0` = off; else `decide` may download a known app when the current quote's ETA exceeds this |
+
+`decide` inserts four gated blocks into the unchanged `@1` body, in this
+order, so that with default traits the memory-seeding and random-draw order
+(`visited`, `attempts`, `refreshes`, `outside_draw`, `taste`,
+`inspection_draw`) is untouched and a default-trait `@2` rider consumes the
+same draws in the same order as `@1`:
+
+1. **Fatigue switch**, right after the patience/order-budget guards, before
+   any app is opened: if the *current* preferred app's failure count (below)
+   is at or above `fatigue_threshold`, propose switching to `fatigue_target`
+   (falling back to the ranked-best other usable app for `'best_other'`)
+   *only if* that target's own failure count is strictly lower than the
+   current preferred app's. `failures` is never reset by a switch itself
+   (only by an on-time completion on that platform), so two apps sitting at
+   the same failure count -- or a target that is itself at or past
+   `fatigue_threshold` and no better than the app just left -- must never be
+   proposed, or repeated decisions on an unresolved intent (no new failure
+   arrives between them) would swap `preferred_app` back and forth forever.
+   Requiring strict improvement instead makes any run of consecutive
+   switches a strictly decreasing sequence of failure counts bounded below
+   by zero, which must terminate. If a named `fatigue_target` platform is
+   not currently usable, this is not a compile-time-checkable condition
+   (traits do not know the platform table); the policy simply does not
+   switch, and no `SwitchPreferred` is proposed.
+2. **`compare_all_apps`**: `inspect` also becomes true whenever any usable
+   app remains unseen, independent of price/ETA dissatisfaction.
+3. **`install_trigger_eta_seconds`**: once the latest quote's ETA exceeds
+   the threshold, download the best-ranked known, launched, not-yet-*installed*
+   app (`Download`, applied by the runtime like a checkpoint's own download)
+   and re-queue -- a mid-intent install changes `usable_apps`, so the policy
+   never acts on the new app within the same decision, only on a later one.
+   The candidate filter is against `context.installed_apps` (the rider's own
+   `apps`), deliberately *not* `usable_apps`: `usable_apps` also excludes an
+   installed app the rider has no *account* on yet, and `accounts` may be an
+   authored strict subset of `apps` (`scenario.person`/`segment` accept it),
+   so filtering on `usable_apps` would offer an already-installed app as a
+   "candidate" and the runtime's Download branch rejects exactly that as an
+   already-installed app. A per-intent memory list caps this at one download
+   per target per intent.
+4. **`choice_rule='lexicographic'`**: replaces only the *selection* of
+   `best` among viable quotes -- narrow to survivors within `tolerance` of
+   the tightest value at each `choice_keys` entry in order (price first by
+   default), then pick by `tie_break`. The outside-option purchase gate
+   (`utility(best) >= outside`) is unchanged, so a lexicographic rider can
+   still decline; only the ranking among viable quotes changes.
+
+`progress` adds, before the inherited `@1` elapsed-patience branch: when
+`eta_drift_cancel_seconds` is set and boarding has not happened, compare the
+*predicted arrival instant* (`at + eta_seconds`) of the order's first
+`source='offer'` prediction (the original promise) against its last
+`source='revision'` prediction (the latest re-estimate); cancel with reason
+`'pickup eta drift'` once the difference exceeds the threshold. Comparing
+predicted arrival *instants*, not raw ETA values, is deliberate: pure
+elapsed time must never look like an improving estimate. The runtime
+re-queues `policy.rider.progress` (a zero-delay schedule, so the decision
+stays at an event boundary) on every `pickup_eta_revised` notification when
+this trait is set, and separately schedules a bounded periodic
+`policy.revise` for an assigned, not-yet-arrived order when the owning
+platform's `revise_interval_seconds` (marketplace-policy.md) is positive --
+without it, nothing would ever *produce* a revision for the drift check to
+react to, since a platform only revises today on its own
+assignment/completion events.
+
+**Outcome memory** (runtime-owned, in `PolicyRuntime.people`, gated on
+`fatigue_threshold > 0` so an `@1` rider's state dict never gains the key):
+`failures[platform_id]` increments on an `order_canceled` with `by != 'rider'`
+(a rider's own cancellation is not the platform failing) and on an
+`order_completed` whose pickup wait (`timeline['arrived'] - created_at`)
+exceeds `failure_wait_seconds`; a completion within that bound resets it to
+`0`. Each increment also appends a `service_failure` observation
+(`{cause: 'canceled'|'long_wait', consecutive}`) so a fixture can assert on
+the counter without reading private memory. `rider_context` exposes it as
+`failures`, alongside `known_launched_apps` (aware, launched apps, whether
+or not usable), `installed_apps` (this rider's own `apps` -- the
+install-trigger candidate filter above, independent of `fatigue_threshold`)
+and `sticky_preference`.
+
+**`Download`** (rider `decide`) and **`SwitchPreferred`** (rider `decide`,
+`platform_id` + `sticky`) are applied by the runtime in `_rider_decide`
+exactly like the existing typed actions: `Download` installs the app,
+activates its account, and re-queues; `SwitchPreferred` sets
+`preferred_app` and `sticky_preference` in the rider's own state, records a
+`preference_switched` observation, and re-queues. A `preference_change`
+intervention (marketplace-policy.md's cousin, scenario-definition.md) also
+clears `sticky_preference` back to `False` when it applies a new
+`preferred_app` -- stickiness blocks only *learning-driven* reversion, never
+an operator's explicit preference change, and a further fatigue switch
+still fires normally once the *new* preferred platform accumulates its own
+failures.
+
+**`EvolutionTraitsV2`** (subclasses `EvolutionTraits`):
+
+| Trait | Default (= `@1`) | Meaning |
+| --- | --- | --- |
+| `install_trigger_peer_share` | `0` | `0` = off; else the neighbor-installed-share threshold for the peer cascade (below) |
+| `vicinity_km` | `2` | neighbor radius for the peer cascade and `neighbor_install_share` |
+| `adoption_phase` | `'any'` | `'idle'` restricts the checkpoint's own hazard download to idle-phase drivers |
+
+`personal_evolution@2.checkpoint` calls the inherited `@1` body unchanged
+(identical random draw order -- the hazard draw is always consumed, even
+when its result is about to be discarded) and applies three overrides to
+the returned `Evolve`, reusing the parent's memory as-is:
+
+1. **Sticky preference**: if `context.sticky_preference` is set, the
+   returned `preferred_app` is forced back to `context.preferred_app` --
+   learning-driven switching is suppressed. Fatigue switching is unaffected
+   because it runs entirely in the rider policy's `decide`, not here: the
+   two mechanisms own two different halves of "who changes
+   `preferred_app` and when" (the rider switches on fatigue; evolution is
+   the one that can be blocked from switching back).
+2. **`adoption_phase='idle'`**: if the person's current phase (drivers only;
+   riders are always `'off'` for this purpose) is not `'idle'`, the
+   checkpoint's own download is discarded (forced to `None`) -- after the
+   hazard draw already ran, so the random stream does not shift with phase.
+3. **Peer cascade**: independent of the checkpoint's own hazard and
+   deterministic (no draw): if `install_trigger_peer_share > 0` and no
+   download is already selected, install the lowest-id known, launched,
+   not-yet-installed app whose `neighbor_install_share` is at or above the
+   threshold.
+
+`neighbor_install_share` (`PolicyRuntime.neighbor_install_shares`, computed
+once per checkpoint per role, and only when some person's
+`install_trigger_peer_share` is actually positive -- otherwise an empty
+dict, no O(n^2) work) is participant knowledge, computed entirely by the
+runtime from participant positions and installed apps; no platform ever
+receives it (plan section 5.3). A "neighbor" is another person of the *same
+role* with a known position (`position_of`, falling back to `Rider.location`
+for a rider not currently onboard) within `vicinity_km`, excluding the
+person themself; the share for an app is the fraction of those neighbors
+who have it installed, `0` (an empty dict, read as `0` for every app) when
+there are no positioned neighbors.
+
+`scenario.py`'s population segments/explicit people now resolve each
+family's trait schema from the *selected* implementation's declaration
+(`trait_schema`, scenario-definition.md), not from a fixed `@1` table, so
+every `@2` trait above is authorable exactly like an `@1` one -- through
+`behavior.<family>.parameters`, a population segment, or an explicit
+person.
 
 ## Decision contract and information
 

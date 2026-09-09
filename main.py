@@ -53,7 +53,7 @@ class Simulation:
                                      starting_cash_minor=platform.starting_cash_minor)
         profiles = {}
         for person in inputs.people:
-            profile = load_profile(person['profile'])
+            profile = load_profile(person['profile'], plan.implementations)
             profiles[PolicyRuntime.key(person['role'], person['id'])] = profile
             if person['role'] == 'driver':
                 self.engine.add_car(person['car']['id'], person['car']['registrations'])
@@ -142,7 +142,8 @@ class Simulation:
         configs = {p: PlatformPolicy.compile(overrides=c['parameters'], rules=c['rules'], campaigns=c['campaigns'],
                     programs=c.get('programs', ()), version=c['version'], fallback=c['fallback'])
                   for p, c in snapshot['policies']['platforms'].items()}
-        profiles = {key: load_profile(values) for key, values in snapshot['profiles'].items()}
+        implementations = snapshot['policies']['implementations']
+        profiles = {key: load_profile(values, implementations) for key, values in snapshot['profiles'].items()}
         sim.policies = PolicyRuntime(sim.engine, registry, sim.seed, configs, profiles,
                                      implementations=snapshot['policies']['implementations'],
                                      zones=snapshot['scenario']['resolved'].get('world', {}).get('zones', {}))

@@ -401,14 +401,41 @@ never authors a coordinate directly. Replacing `platforms.<id>` (a full
 `Table` entry, via `with_changes` or `platform()`)
 requires every policy parameter, the same as any other complete preset value;
 a `policy_change` intervention instead **merges** onto the platform's current
-policy, so it can move just the fields it names. A custom (non-`@1`) rider,
-driver or evolution policy implementation must still accept exactly the
-shipped `RiderTraits`/`DriverTraits`/`EvolutionTraits` dataclasses: `scenario.py`'s
-`TRAITS` mapping that binds segment/person trait dicts is fixed to those three
-schemas regardless of which implementation a scenario selects, so a custom
-policy cannot introduce its own trait fields through population segments yet
-(deriving `TRAITS` from each implementation's own declaration is future work,
-plan section 4.D/4.E).
+policy, so it can move just the fields it names. A rider, driver or evolution
+policy implementation's trait schema must still subclass the shipped
+`RiderTraits`/`DriverTraits`/`EvolutionTraits` dataclasses
+(`policy_runtime.register_policy`'s `issubclass` check enforces this), but
+(AST-209; this was a known trap through phase 4) it need not be exactly
+`RiderTraits`/`DriverTraits`/`EvolutionTraits`: population segments, explicit
+people and behavior defaults resolve each family's trait schema from the
+*selected* implementation's own declaration (`trait_schema(implementations,
+family)`, consulted everywhere `TRAITS[family]` used to be assumed -- population
+segment/person schemas, `_check_access`, `_realize_person`, and profile
+(re)construction in `_profile`/`load_profile`), not from a fixed `@1` table.
+`rider_search@2`/`driver_participation@2`/`personal_evolution@2`
+(behavior-policy.md's "Participant policies v2") are the first implementations
+to exercise this: their additive traits (e.g. `choice_rule`,
+`response_rule`, `install_trigger_peer_share`) are authorable through a
+segment or an explicit person exactly like an `@1` trait, once
+`behavior.<family>.implementation` names the `@2` version. Because the
+trait schema lives in a different part of the definition tree than
+`behavior.<family>.implementation`, and `Spec.check`/`Spec.descend` have no
+document context to consult it from, the whole scenario spec is a cached
+factory, `scenario_spec(implementations)`, keyed by the selected
+rider/driver/evolution identifiers; `Scenario.resolve()` pre-scans `self
+.base()` and any `('set', ...)` change touching `behavior` for that
+selection *before* the first `spec.check`, defensively (a malformed or
+unregistered id is silently ignored at that point -- the ordinary
+`Implementation.check` against the resulting spec then reports it at its
+exact path, same as today), and uses the resulting `scenario_spec(selection)`
+for both `check` calls, for `leaves`, and for every `('set'|'add'|'remove',
+path, ...)` change. With every shipped preset's all-`@1` selection this is
+structurally identical to the single tree every earlier release built once
+at import; that all-`@1` tree is kept, as the module-level `SCENARIO`, for
+`diff_plans` and the typed builders below, none of which resolves a trait
+schema. `Implementation.schema_for` (used for `behavior.<family>.parameters`
+itself) already resolved from the declaration before this change; this
+closes the same gap for population segments and explicit people.
 
 Validate all seven nonempty rider/driver app combinations, conditional preferred
 apps, car registration sets, and one-car-per-driver initial bindings. People and

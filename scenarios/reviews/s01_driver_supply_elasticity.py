@@ -36,8 +36,10 @@ for seed 0 to realize a nonzero, non-trivial pair count; the realized count
 is printed by --check. Under driver_participation@1, offers are evaluated
 one at a time in FIFO order (plans/architecture/behavior-policy.md), not
 jointly across platforms, so a FAIL on check 2 is the expected, documented
-result -- phase 5 (driver_participation@2, plan section 4.D) is what would
-let a driver compare two live offers before responding.
+result -- this script deliberately keeps @1; driver_participation@2's
+response_rule='best_pending' (AST-209, plan section 4.D) is what compares
+pending offers before responding, and scenarios/fixture_v2_two_offers.py
+demonstrates it directly.
 """
 from decimal import Decimal
 
@@ -138,7 +140,8 @@ def evaluate(header, initial, final, footer):
     else:
         checks.verdict("s1.2 simultaneous cross-platform dispatch", beta_wins == pairs,
                        f"driver accepted beta over a co-pending alpha offer in {beta_wins}/{pairs} pairs "
-                       "(driver_participation@1 evaluates offers FIFO, not jointly; phase 5 owns joint comparison)")
+                       "(driver_participation@1 evaluates offers FIFO, not jointly; this script deliberately "
+                       "keeps @1 -- driver_participation@2's response_rule='best_pending' (AST-209) compares them)")
 
     # Check 3: no dispatch to a driver with no free slot.
     violations3, failed_no_slot = [], 0

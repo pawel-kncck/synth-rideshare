@@ -70,6 +70,26 @@ state and the observe hook" and "Pricing, incentives, and commitments", and
 [Marketplace engine](plans/architecture/marketplace-engine.md)'s
 "Regulation" section.
 
+Phase 5 adds participant policies v2 (`driver_participation@2`,
+`rider_search@2`, `personal_evolution@2`), every one an additive registered
+implementation that reproduces `@1` byte-for-byte at its default traits:
+drivers can compare co-pending offers before responding
+(`response_rule='best_pending'`), hold out for a better one
+(`hold_for_better`), cancel on private pickup ETA and declared penalty
+exposure, open every usable app at shift start, and disclose "I'm busy"
+per platform through the new engine commands `pause_app`/`resume_app`
+(`availability`); riders can rank quotes lexicographically, visit every
+usable app first, switch preferred apps after consecutive failures
+(`fatigue_threshold`, with a `sticky` flag evolution honors), cancel on
+pickup-ETA drift, and install an app mid-search on a slow quote or a
+neighbor-installed-share peer cascade. See
+[Behavior policy](plans/architecture/behavior-policy.md)'s "Participant
+policies v2" and [Marketplace engine](plans/architecture/marketplace-engine.md)'s
+`pause_app`/`resume_app` rows. Population segments and explicit people now
+resolve trait schemas from whichever implementation `behavior.<family>
+.implementation` selects, not a fixed `@1` table, so every `@2` trait above
+is authorable exactly like an `@1` one (scenario-definition.md).
+
 Platform IDs are free strings: nothing requires `rebu`/`blot`/`flyt`, and
 `market-blank@1` starts with no platforms and no segments so a script can
 build any market it names. `platform(id, **parameters)` returns one complete

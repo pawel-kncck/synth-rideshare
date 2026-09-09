@@ -249,6 +249,7 @@ class Driver:
     commitments: list = field(default_factory=list)  # accepted order ids in service order
     service_id: Optional[int] = None  # the physical service currently performed
     accounts: set = field(default_factory=set)
+    paused_apps: set = field(default_factory=set)  # subset of open_apps: open for commitments, not accepting
 
 
 @dataclass
@@ -533,9 +534,12 @@ class PlatformView:
             yield DriverPresence(
                 driver_id,
                 cars[driver.car_id].motion.position_at(now),
-                # An open app already implies a shift, a registered car, and a
-                # launched platform; only an exit request withdraws the driver.
-                shifts[driver.shift_id].exit_requested_at is None,
+                # An open app already implies a shift, a registered car, and a launched platform;
+                # an exit request withdraws the driver, and a paused app (pause_app) withdraws it
+                # from this platform specifically while commitments survive. `not driver.paused_apps`
+                # short-circuits the common (empty) case without a membership test.
+                shifts[driver.shift_id].exit_requested_at is None
+                and (not driver.paused_apps or platform_id not in driver.paused_apps),
                 tuple(order_id for order_id in commitments
                       if orders[order_id].platform_id == platform_id) if commitments else (),
                 tuple(offer_id for offer_id in pending
@@ -591,6 +595,23 @@ class CommitmentView:
     payout_minor: int
 
 
+@dataclass(frozen=True)
+class PendingOfferView:
+    """One of this driver's unresolved offers, as the driver's own app would show it -- pickup and
+    destination are already disclosed by the `offer_received` notification, so this adds no
+    information (behavior_policy.py driver_participation@2)."""
+    offer_id: int
+    platform_id: str
+    order_id: int
+    created_at: float
+    expires_at: float
+    payout_minor: int
+    bonus_minor: int
+    eta_seconds: Optional[float]
+    pickup: tuple
+    destination: tuple
+
+
 class DriverView:
     """What a driver knows: their own position, shift, apps, and cross-app work."""
 
@@ -635,8 +656,19 @@ class DriverView:
         return result
 
     def pending_offers(self):
-        return [freeze(self._engine.offers[offer_id])
-                for offer_id in self._engine._pending_offers_to_driver(self.driver_id)]
+        """This driver's unresolved offers, ordered by offer id. Ordering is explicit because
+        `_pending_by_driver` is a set, whose iteration order a snapshot/restore cycle can change; a
+        policy comparing pending offers (driver_participation@2 response_rule='best_pending') must
+        see the same order either way, or a restored run's tie-break could disagree with the
+        continuous one."""
+        result = []
+        for offer_id in sorted(self._engine._pending_offers_to_driver(self.driver_id)):
+            offer = self._engine.offers[offer_id]
+            order = self._engine.orders[offer.order_id]
+            result.append(PendingOfferView(offer.id, offer.platform_id, offer.order_id, offer.created_at,
+                                           offer.expires_at, offer.payout.payout_minor, offer.payout.bonus_minor,
+                                           offer.eta_seconds, order.pickup, order.destination))
+        return result
 
 
 class RiderView:
@@ -878,6 +910,7 @@ class MarketplaceEngine:
             self.platforms[platform_id].open_driver_ids.discard(driver.id)
             self._notify("platform", platform_id, "driver_app_closed", driver_id=driver.id)
         driver.open_apps.clear()
+        driver.paused_apps.clear()
         self._notify("driver", driver.id, "shift_ended", shift_id=shift.id,
                      location=self.position_of("driver", driver.id))
 
@@ -919,6 +952,7 @@ class MarketplaceEngine:
             person.open_apps.discard(platform_id)
             if role == "driver":
                 platform.open_driver_ids.discard(person_id)
+                person.paused_apps.discard(platform_id)  # closing clears a pause; a later re-open is not silently paused
                 for offer_id in list(self._pending_offers_to_driver(person_id)):
                     offer = self.offers[offer_id]
                     if offer.platform_id == platform_id:
@@ -928,11 +962,45 @@ class MarketplaceEngine:
                 platform.open_rider_ids.discard(person_id)
                 self._notify("platform", platform_id, "rider_app_closed", rider_id=person_id)
 
+    def pause_app(self, driver_id, platform_id):
+        """Stop accepting on one open app without closing it: commitments, and the obligation to
+        serve them, survive. Pending offers on that platform close as canceled, exactly as
+        close_app does. Participant-side answer to plan section 5's competitor-occupancy
+        boundary (behavior_policy.DriverTraitsV2.availability)."""
+        driver = self._driver(driver_id)
+        self._platform(platform_id)
+        if platform_id not in driver.open_apps:
+            raise CommandRejected(f"Driver {driver_id!r} does not have {platform_id!r} open")
+        if platform_id in driver.paused_apps:
+            return
+        with self._transition():
+            driver.paused_apps.add(platform_id)
+            for offer_id in list(self._pending_offers_to_driver(driver_id)):
+                offer = self.offers[offer_id]
+                if offer.platform_id == platform_id:
+                    self._resolve_offer(offer, "canceled", "driver_unavailable")
+            self._notify("platform", platform_id, "driver_availability",
+                         driver_id=driver_id, accepting=False)
+
+    def resume_app(self, driver_id, platform_id):
+        """Resume accepting on a paused app. Publishes the *computed* availability, so resuming
+        while an exit is requested (or another reason the driver would not actually be accepting)
+        does not announce a driver as accepting."""
+        driver = self._driver(driver_id)
+        self._platform(platform_id)
+        if platform_id not in driver.paused_apps:
+            return
+        with self._transition():
+            driver.paused_apps.discard(platform_id)
+            self._notify("platform", platform_id, "driver_availability", driver_id=driver_id,
+                         accepting=self._driver_accepting(driver, platform_id))
+
     def _driver_accepting(self, driver, platform_id):
         shift = self.shifts.get(driver.shift_id)
         return (
             shift is not None and shift.exit_requested_at is None
-            and platform_id in driver.open_apps and platform_id in driver.accounts
+            and platform_id in driver.open_apps and platform_id not in driver.paused_apps
+            and platform_id in driver.accounts
             and platform_id in self.cars[driver.car_id].registrations
             and self.platforms[platform_id].launched
         )
@@ -1663,8 +1731,11 @@ def _car(item):
 
 
 def _driver(item):
+    # .get, not [...]: a snapshot taken before paused_apps existed still restores, with no
+    # driver paused -- same tolerance as TripIntent.source_id / Platform.starting_cash_minor.
     return Driver(item["id"], set(item["apps"]), item["car_id"], set(item["open_apps"]),
-                  item["shift_id"], list(item["commitments"]), item["service_id"], set(item["accounts"]))
+                  item["shift_id"], list(item["commitments"]), item["service_id"], set(item["accounts"]),
+                  set(item.get("paused_apps", ())))
 
 
 def _rider(item):

@@ -110,6 +110,7 @@ class MarketplaceParameters:
     commission_binding: str = 'offer'        # 'offer' (today) or 'quote'
     driver_lockout_seconds: float = 0        # 0 = off; set on a driver-initiated cancel
     guarantee_window_seconds: float = 0      # 0 = off; the platform's single record-keeping/window-close cadence
+    revise_interval_seconds: float = 0       # 0 = off; bounded periodic re-revision of an assigned order's pickup ETA
     announce_terms: bool = False
     service_area: object = None              # None | zone id str (pre-compile) | ((x0,y0),(x1,y1)) (compiled)
 
@@ -127,7 +128,7 @@ class MarketplaceParameters:
                      'offer_seconds', 'quote_seconds'):
             finite_number(getattr(self, name), name, strictly_positive=True)
         for name in ('multiplier', 'estimated_boarding_seconds', 'back_to_back_within_seconds',
-                     'driver_lockout_seconds', 'guarantee_window_seconds'):
+                     'driver_lockout_seconds', 'guarantee_window_seconds', 'revise_interval_seconds'):
             finite_number(getattr(self, name), name)
         finite_number(self.commission_fraction, 'commission_fraction', maximum=1)
         finite_number(self.surcharge_driver_share, 'surcharge_driver_share', maximum=1)

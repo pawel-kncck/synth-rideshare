@@ -90,6 +90,20 @@ and transport. It cannot trigger arrival or change committed payments. Physical
 leg origins are chosen by the engine when service actually starts. Exports keep
 estimated trip distance and actual completed transport distance separately.
 
+`revise_interval_seconds` (default `0`, off; AST-209, plan section 4.E) adds a
+third, *time-driven* trigger alongside assignment and preceding-completion: while
+positive, `PolicyRuntime` re-revises an assigned, not-yet-arrived order every
+`revise_interval_seconds` seconds (started at `order_assigned`, rescheduling
+itself until the order arrives or ends) using the platform's own `revise()`
+hook and estimator, unchanged. This is what lets a rider's
+`eta_drift_cancel_seconds` (behavior-policy.md) see drift on a ride the
+platform is not otherwise re-estimating -- without it, nothing would ever
+*produce* a revision for that check to react to. Like
+`guarantee_window_seconds`, the runtime reads only the platform's **base**
+parameter, never a rule-resolved value, so the cadence cannot silently vary
+by segment; it is nonetheless a `MarketplaceParameters` field like any
+other, so `platform()`/`policy_change` author it identically.
+
 `rider_cancellation_fee_minor` and
 `driver_cancellation_compensation_minor` configure separate cancellation
 settlements for rider requests before boarding; defaults are zero. Driver and

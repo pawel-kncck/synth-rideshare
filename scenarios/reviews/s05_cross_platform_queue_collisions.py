@@ -8,13 +8,18 @@ removed the same way (taste_scale=0, saturating purchase/acceptance bias).
 This reliably realizes the queue-promotion collision, unlike S1 check 2's
 emergent (and often vacuous) co-pending pairs.
 
-Approximations (`notes` below): drivers disclosing "queue full" across
-platforms (`pause_when_full`) does not exist yet -- today a platform simply
-cannot see a competitor's commitments at all, a *stronger* boundary than
-the review assumes (plan section 5), so the check as literally asked
-(Blue observing Green's queue slot) is NOT-EVALUABLE; check 1 (the capacity
-cap itself) is fully answerable instead. `pickup_eta_revised` is emitted
-(marketplace-engine.md) but rider_search@1 does not consume it.
+Approximations (`notes` below): this script keeps `@1` throughout, under
+which a platform simply cannot see a competitor's commitments at all -- a
+*stronger* boundary than the review assumes (plan section 5) -- so the
+check as literally asked (Blue observing Green's queue slot) is
+NOT-EVALUABLE; check 1 (the capacity cap itself) is fully answerable
+instead. `pickup_eta_revised` is emitted (marketplace-engine.md) but
+rider_search@1 does not consume it. Both mechanisms now exist as of AST-209
+(driver_participation@2's `availability='pause_when_full'` and
+rider_search@2's `eta_drift_cancel_seconds`) and are demonstrated directly
+in scenarios/fixture_v2_availability.py and
+scenarios/fixture_v2_eta_drift.py; this script is left on `@1` per the
+house rule to implement only the assigned issue.
 """
 from harness import cli
 from metrics import Checks
@@ -25,8 +30,9 @@ NOTES = {
     "assumption": "Blue and Green are policy-identical two_platform() defaults; only the fixture's explicit "
                   "trips create the collision.",
     "approximation": "No platform ever sees a competitor's queue state (a stronger boundary than "
-                      "'pause_when_full' disclosure, which does not exist yet -- plan section 5, phase 5); "
-                      "pickup_eta_revised is logged but not consumed by riders (behavior-policy.md, phase 5).",
+                      "'pause_when_full' disclosure, which driver_participation@2 now implements -- plan "
+                      "section 5, AST-209); this script keeps @1, so pickup_eta_revised is logged but not "
+                      "consumed here -- rider_search@2's eta_drift_cancel_seconds (AST-209) is what consumes it.",
     "source": "plans/scenario-readiness-plan.md section 7 (S5 row) and section 10",
 }
 
@@ -77,7 +83,10 @@ def evaluate(header, initial, final, footer):
                    f"(MAX_COMMITMENTS={MAX_COMMITMENTS}); {len(orders)} orders total")
     checks.not_evaluable("s5.2 both platforms register a driver's queue slot as locked",
                          "a platform never observes a competitor's commitments at all -- a stronger boundary "
-                         "than the disclosure mechanism this asks for (plan section 5; pause_when_full is phase 5)")
+                         "than the disclosure mechanism this asks for (plan section 5); this script keeps @1, "
+                         "and driver_participation@2's availability='pause_when_full' (AST-209) is the "
+                         "driver-disclosed mechanism, demonstrated directly in "
+                         "scenarios/fixture_v2_availability.py --full")
 
     services = sorted((s for s in final["engine"]["services"] if s["driver_id"] == "d1"), key=lambda s: s["started_at"])
     mismatches = [(p["id"], n["id"], p["end_position"], n["legs"][0]["origin"]) for p, n in zip(services, services[1:])
@@ -87,8 +96,9 @@ def evaluate(header, initial, final, footer):
                    + (f"; mismatches {mismatches}" if mismatches else "(each queued pickup originates exactly "
                                                                        "where the prior ride actually ended)"))
     checks.not_evaluable("s5.4 Green's cancellation logic re-evaluates live projected ETA",
-                         "rider_search@1 does not consume pickup_eta_revised notifications yet "
-                         "(behavior-policy.md; plan section 4.D/4.E, phase 5)")
+                         "rider_search@1 does not consume pickup_eta_revised notifications; this script "
+                         "keeps @1 -- rider_search@2's eta_drift_cancel_seconds (behavior-policy.md; AST-209) "
+                         "is what consumes them, demonstrated directly in scenarios/fixture_v2_eta_drift.py")
     return checks
 
 
