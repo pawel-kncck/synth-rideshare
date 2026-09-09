@@ -1459,7 +1459,12 @@ class MarketplaceEngine:
         engine = cls(World(**snapshot["world"]), registry)
         for name, factory in _TABLES.items():
             table = getattr(engine, name)
-            for item in snapshot[name]:
+            # .get(name, []), not snapshot[name]: _TABLES gained "transfers" in phase 3 while
+            # SNAPSHOT_SCHEMA_VERSION stayed 2 (additive), so a pre-phase-3 snapshot has no
+            # "transfers" key at all -- same tolerance metrics.py's _tables() and _platform()
+            # below already extend to individual fields. An absent table restores empty and
+            # _rebuild_accounts() then derives correct zero-transfer balances from it.
+            for item in snapshot.get(name, []):
                 record = factory(item)
                 table[record.id] = record
         for name, value in snapshot["sequences"].items():

@@ -152,8 +152,9 @@ metric formulas.
 ### Phase-1 metric families (`metrics.py`)
 
 These offline, opt-in families (`--windows`/`--platform-detail`/
-`--first-choice-days`) define the semantics any later exporter or report must
-reuse rather than recompute:
+`--first-choice-days`/`--ledger`/`--ledger-drivers`, the last two added
+phase 3) define the semantics any later exporter or report must reuse rather
+than recompute:
 
 - **Window boundaries** are hour offsets from the run's own start (not
   calendar hours), producing consecutive half-open windows plus a final
@@ -189,27 +190,88 @@ reuse rather than recompute:
   `eta_predictions` entry; it is `null` when the platform had no supply at
   quote time. A positive drift means the platform ran later than first
   promised.
-- **Transfers**: `settlement_breakdown`'s `transfers` block is always
-  `{"count": 0, "by_reason": {}, "party_delta_minor": 0}` today -- a
-  documented placeholder for the `Transfer` record phase 3 (section 4.A of
-  the [readiness plan](../scenario-readiness-plan.md)) adds and populates,
-  not a claim that a transfer mechanism exists yet.
+- **Transfers** (`_transfer_rows`, phase 3, section 4.A of the [readiness
+  plan](../scenario-readiness-plan.md)): `settlement_breakdown`'s `transfers`
+  block reports, for the settlement/transfer cohort it was built from,
+  `by_reason[r]["platform_delta_minor"]` as `-sum(amount_minor)` over that
+  reason's *platform-counterparty* transfers only (the debit posted to the
+  funding platform) -- an external transfer (lease, operating cost) has no
+  platform side and contributes nothing to any `platform_delta_minor`.
+  `party_delta_minor` sums `amount_minor` over every *external* transfer in
+  the cohort: a platform-counterparty transfer's person/platform deltas net
+  to zero by construction, so only the external total ever moves this off
+  `0`. Because an external transfer's `platform_id` is always `None`,
+  `money_by_platform`'s per-platform transfers sections do not sum back to
+  `settlement_breakdown`'s global transfers section whenever the run has any
+  external transfer; that gap is the external total itself
+  (`conservation()`'s `transfer_party_delta_minor`), not a bucketing bug to
+  fix by inventing a platform attribution. With no transfers in the cohort
+  (every pre-phase-3 caller, and any run before phase 3's mechanisms fire)
+  the block is still exactly `{"count": 0, "by_reason": {},
+  "party_delta_minor": 0}`, the shape phase 1 published.
 - **Settlement split**: `settlement_breakdown`/`money_by_platform` decompose
   a settlement into `driver_base_minor`/`driver_bonus_minor` and
-  `rider_gross_minor`/`rider_discount_minor` from the order's frozen quote
-  fare and the accepted offer's frozen payout terms only for a
-  `completed_ride` settlement, because only there are those frozen terms
-  what the settlement actually paid (`rider_payment_minor` and
-  `driver_payout_minor` are themselves defined from them). Any other reason
-  (today: `cancellation_fee`) settles an amount those frozen terms do not
-  describe, so its row instead reports what actually moved:
-  `driver_base_minor` equals the settlement's own `driver_payout_minor`
-  (`driver_bonus_minor` 0) and `rider_gross_minor` equals its own
-  `rider_payment_minor` (`rider_discount_minor` 0). This makes
-  `driver_base_minor + driver_bonus_minor == driver_payout_minor` and
-  `rider_gross_minor - rider_discount_minor == rider_payment_minor` a
+  `rider_gross_minor`/`rider_discount_minor`. The rider half still comes
+  from the order's frozen quote fare (`fare.gross_minor`/`discount_minor`)
+  only for a `completed_ride` settlement with an assignment, because only
+  there is the frozen fare what the settlement actually charged
+  (`rider_payment_minor` is itself defined from it); any other case (today:
+  `cancellation_fee`, and a `completed_ride` with no assignment) reports
+  `rider_gross_minor` as the settlement's own `rider_payment_minor`
+  (`rider_discount_minor` 0) -- that half is unchanged by phase 3. The
+  driver half (phase 3) now reads the settlement's OWN `bonus_minor` field
+  directly instead of joining the assignment: `driver_base_minor` is
+  `driver_payout_minor - bonus_minor` for every reason, not just
+  `completed_ride` (a `cancellation_fee` settlement's `bonus_minor` is
+  always `0`, so `driver_base_minor` there is just `driver_payout_minor`, as
+  before this field existed). The only fallback is a settlement dict with no
+  `bonus_minor` key at all -- a log written before `Settlement.bonus_minor`
+  existed -- which instead reads the accepted offer's frozen payout
+  `bonus_minor` for a `completed_ride` settlement with an assignment, else
+  `0`; this reproduces the exact same integer, because the engine has always
+  settled a completed ride with `bonus_minor` equal to that same frozen
+  offer term, so the two sources agree bit for bit -- a source change for
+  the same numbers on every log written by this engine, not a new estimate.
+  This makes `driver_base_minor + driver_bonus_minor == driver_payout_minor`
+  and `rider_gross_minor - rider_discount_minor == rider_payment_minor` a
   per-settlement identity for every reason, which `conservation()`'s
   `settlement_split_reconciles` checks on every `settlement_breakdown` row.
+- **Ledger** (`ledger_section`, phase 3, `--ledger`/`--ledger-drivers`):
+  per-platform `cash_start_minor`/`cash_end_minor` read that platform's own
+  `Account.balance_minor` from the initial/final boundary snapshot (`None`
+  when `starting_cash_minor` is `None` -- untracked, though its flows still
+  post and are reported); `ride_contribution_minor` sums
+  `platform_contribution_minor` over settlements new in this run, and
+  `transfers_minor` sums the debit of this run's new platform-counterparty
+  transfers funded by that platform, both broken out by `reason` too
+  (`transfers_by_reason`). These are two independently derived numbers --
+  one from boundary balances, one from replaying new records -- so
+  `cash_end_minor - cash_start_minor == ride_contribution_minor +
+  transfers_minor` is a real offline cross-check, not a tautology,
+  mirroring `marketplace_engine.restore`'s own `_rebuild_accounts`
+  conservation property (see marketplace-engine.md). The top-level
+  `transfers` section is global (`_transfer_rows`'s shape plus, per reason,
+  an `external_minor` -- that reason's own external-transfer total, the same
+  formula `party_delta_minor` uses but scoped to one reason instead of the
+  whole cohort). `unattributed_driver_payout_minor`
+  names settlements whose `driver_payout_minor` has no `driver_id` to post
+  to at all (reachable today: a rider cancels an unassigned order under a
+  nonzero `driver_cancellation_compensation_minor`); it is `0` whenever a
+  run never exercises that combination, and is reported rather than
+  silenced by an engine-side rejection, which would change legality for
+  scenarios that already authored that parameter. `--ledger-drivers`
+  (implies `--ledger`) adds one row per driver (`payout_minor`,
+  `transfers_minor`, `balance_start_minor`/`balance_end_minor`,
+  `transfers_by_reason`). `conservation()` gains three phase-3 keys
+  alongside `settlement_split_reconciles`: `transfer_party_delta_minor` (the
+  same quantity as `settlement_breakdown`'s global `party_delta_minor`, over
+  every transfer new in this run), `unattributed_driver_payout_minor` (the
+  same quantity `ledger_section` reports), and `account_deltas_match_records`
+  -- the offline twin of `marketplace_engine.restore`'s `_rebuild_accounts`
+  check: every account's `settlement_minor`/`transfer_minor` delta between
+  the boundary snapshots must equal that party's own leg summed over the
+  records new in this run, replayed here from the raw log rather than from
+  `engine.accounts`.
 
 ## Comparison and interpretation
 
