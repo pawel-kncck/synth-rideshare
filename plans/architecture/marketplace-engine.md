@@ -45,7 +45,7 @@ occupancy legality does not change with them.
 | --- | --- |
 | `Platform` | Identity, launch state, the sets of driver/rider ids with its app open, and `starting_cash_minor` (seeds its cash `Account`; `None` = untracked). |
 | `Rider` | Installed apps, open apps, location when not onboard, live trip intent, and the service they are onboard. |
-| `Driver` | Installed apps, open apps, car binding, current shift, ordered accepted commitments, and current physical service. |
+| `Driver` | Installed apps, open apps, car binding, current shift, ordered accepted commitments, current physical service, and (AST-209) `paused_apps` -- a subset of open apps that stays open (for commitments) but is not accepting. |
 | `Car` | Registrations, the controlling driver, and one `Motion` (origin, destination, start, arrival) resolving position at any time. |
 | `Shift` | A driver's physical presence: start, exit request, and actual end. |
 | `TripIntent` | One rider's desired trip across platform attempts: quotes, orders, once-only conversion time, terminal outcome, and the originating scenario session id (`source_id`, optional). |
@@ -121,7 +121,8 @@ being delivered; they always observe a completed transition.
 | --- | --- |
 | `add_platform`, `add_car`, `add_driver`, `add_rider`, `install_app`, `register_car`, `launch_platform` | Population and access. Memberships must be nonempty. |
 | `start_shift(driver, location)`, `end_shift(driver)` | Physical presence. Ending is a request: new acceptance stops now, pending offers close as `canceled`, and the shift ends once commitments are drained. |
-| `open_app(role, person, platform)`, `close_app(...)` | App participation. Drivers need a shift and a registered car. Closing cancels that platform's pending offers; accepted orders survive. |
+| `open_app(role, person, platform)`, `close_app(...)` | App participation. Drivers need a shift and a registered car. Closing cancels that platform's pending offers; accepted orders survive; closing also clears any pause on that app, so a later re-open is never silently paused. |
+| `pause_app(driver, platform)`, `resume_app(...)` (AST-209) | A driver-initiated, per-platform "I'm busy": stops accepting on an *open* app without closing it, so accepted commitments and the obligation to serve them survive. Pausing cancels that platform's pending offers to the driver (exactly like `close_app`) and publishes the existing `driver_availability` notification with `accepting=False`; resuming publishes it with the *computed* `accepting` value, so resuming while an exit is requested (or another reason the driver would not actually be accepting) does not announce the driver as accepting. Raises if the app is not open; a no-op if already in the requested pause state. |
 | `begin_intent(rider, origin, destination, source_id=None)`, `end_intent(intent, reason)` | A rider's trip across attempts. An intent with a live order cannot be ended. |
 | `issue_quote(platform, intent, gross, discount, distance_km=, duration_seconds=, eta_seconds=)` | Frozen rider terms for an open app session. |
 | `place_order(intent, quote)` | Creates the platform order and converts the intent once. One live order per intent. |
@@ -161,8 +162,8 @@ only refuses a second pending offer from the same driver for the same order.
 
 Acceptance validates in order: pending and unexpired (`now < expires_at`,
 half-open), order still `open`, driver accepting on that platform (on shift,
-no exit requested, app open, car registered, platform launched), and fewer
-than two commitments. It then resolves the offer as `accepted`, binds the
+no exit requested, app open and not paused, car registered, platform
+launched), and fewer than two commitments. It then resolves the offer as `accepted`, binds the
 `Assignment` with the offered terms, appends the commitment, and closes the
 order's other pending offers as `canceled` (`order_assigned`), all in one
 transition. A first commitment starts pickup service at once; a second is
@@ -201,6 +202,20 @@ platform the driver is no longer accepting, and finalizes the shift when the
 last commitment ends, closing the apps then. `close_app` withdraws from new
 offers on one platform only; an order accepted there must still be served or
 explicitly canceled.
+
+`pause_app`/`resume_app` (AST-209) are a third, narrower level between these
+two: `close_app` withdraws membership from a platform entirely (no longer in
+`open_apps`, no longer counted anywhere as participating); `end_shift`
+withdraws from every platform at once and eventually ends the shift itself;
+`pause_app` withdraws only *new acceptance* on one already-open platform --
+the app stays in `open_apps`, still counts toward that platform's observed
+participation, and a `queue_expansion` for a different, not-yet-opened app
+is unaffected -- while existing and future commitments on it are served
+exactly as if it were never paused. All three cancel that platform's
+pending offers to the driver identically (`driver_unavailable`). A paused
+app resumes automatically only when a policy (via `PolicyRuntime
+.apply_availability`, behavior-policy.md) decides the pausing condition no
+longer holds; the engine itself never un-pauses on a timer.
 
 `cancel_order` is permitted before boarding and rejected once the rider is
 onboard. A queued order frees its commitment without touching current motion;
@@ -245,10 +260,20 @@ and `transfer_posted` when credited or debited) -- an external `lease` is
 private to the driver; the platform is never told about it. `PlatformView`
 exposes own orders, offers, quotes, rider requests, and `DriverPresence`
 observations (position, accepting, own accepted orders, own pending offers)
-for drivers with that app open. `DriverView` shows a driver's cross-app
-commitments and their physical phase; `RiderView` shows the intent, quotes,
-and live order. The engine's tables are the privileged experiment observer.
-Views are API contracts for trusted extensions, not a sandbox.
+for drivers with that app open. `DriverPresence.accepting` is `shift not
+exit-requested` **and** (AST-209) `not paused on this platform` -- the same
+two conditions `_driver_accepting` checks, so a platform's own candidate
+list and the engine's own acceptance validation never disagree about who is
+accepting. `DriverView` shows a driver's cross-app commitments and their
+physical phase, and (AST-209) `pending_offers()`: this driver's own
+unresolved offers as an id-sorted list of `PendingOfferView`s (offer,
+platform, order, terms, ETA, pickup/destination) -- sorted because the
+engine's internal `_pending_by_driver` is a set whose iteration order a
+snapshot/restore cycle can change, and a policy comparing pending offers
+must see the same order continuously or restored. `RiderView` shows the
+intent, quotes, and live order. The engine's tables are the privileged
+experiment observer. Views are API contracts for trusted extensions, not a
+sandbox.
 
 ## Validation
 
@@ -328,6 +353,23 @@ scenarios whenever the engine changed:
   event (see marketplace-policy.md) restores and continues to identical
   records once `policy_runtime.PolicyRuntime` (which owns that handler) is
   constructed before `Scheduler.restore`.
+- (AST-209) `pause_app` on an open app makes `_driver_accepting` and
+  `DriverPresence.accepting` both `False` for that platform only, cancels
+  its pending offers to the driver as `driver_unavailable`, and leaves
+  accepted commitments (and the driver's other, unpaused apps) untouched;
+  `resume_app` restores `accepting` to whatever `_driver_accepting` would
+  otherwise compute (so resuming during an exit request does not announce
+  acceptance). `close_app` and `_finish_shift` both clear `paused_apps`, so
+  a later re-open is never silently paused. `SNAPSHOT_SCHEMA_VERSION` stays
+  2: `Driver.paused_apps` is additive and restores with `.get`-tolerance
+  (`set()` for a pre-AST-209 snapshot). `DriverView.pending_offers()`'s
+  explicit id sort makes a continuous run and one that snapshots mid-run and
+  restores agree on `driver_participation@2`'s `response_rule='best_pending'`
+  tie-break, across every fixture in `scenarios/fixture_v2_*.py`. Changing
+  only one platform's own pricing/campaign never changes another platform's
+  own `policy_decision` sequence, including while a driver is paused on a
+  third platform (candidate lists stay hidden-state-free under pausing,
+  exactly as without it).
 
 Measure physical active time from service intervals, never from overlapping
 accepted-order timelines; queued waiting is a separate quantity.

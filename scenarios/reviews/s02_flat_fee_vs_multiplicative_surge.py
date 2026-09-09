@@ -117,7 +117,9 @@ def evaluate(header, initial, final, footer):
     else:
         checks.verdict("s2.3 no phantom lock on Urban after a rejection", True,
                        f"driver {found[0]} rejected Urban offer {found[1]}, later accepted Urban offer {found[2]} "
-                       "(the reject-short-for-long comparison itself needs driver_participation@2, phase 5)")
+                       "(this script deliberately keeps driver_participation@1; @2's response_rule="
+                       "'best_pending' (AST-209, plan section 4.D) is what compares pending offers before "
+                       "rejecting the shorter one)")
     post = [q for q in quotes if q["at"] >= SURGE_END]
     bad_post = [q["id"] for q in post if q["fare"]["gross_minor"] != _gross(q["platform_id"], q["distance_km"], surging=False)]
     checks.verdict("s2.4 surge deactivates instantaneously at t=4h", not bad_post,

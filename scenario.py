@@ -35,6 +35,18 @@ SOURCE_FILES = ('main.py', 'scenario.py', 'marketplace_engine.py', 'event_engine
 ROLES = ('rider', 'driver')
 TRAITS = {'rider': RiderTraits, 'driver': DriverTraits, 'evolution': EvolutionTraits}
 DISTRIBUTIONS = ('uniform', 'normal', 'choice')
+
+
+def trait_schema(implementations, family):
+    """The trait dataclass the *selected* implementation declares for `family` ('rider', 'driver'
+    or 'evolution'); `TRAITS[family]` is only the `@1` default, used when nothing is selected yet
+    or the family is absent from `implementations`. A custom (non-`@1`) implementation's trait
+    schema must still subclass the shipped `RiderTraits`/`DriverTraits`/`EvolutionTraits`
+    (`policy_runtime.register_policy`'s `issubclass` check already enforces this), so every
+    existing `@1`-authored population definition keeps validating unchanged under a `@2` selection.
+    """
+    identifier = (implementations or {}).get(family)
+    return TRAITS[family] if identifier is None else policy_class(family, identifier).declaration.parameter_schema
 INTERVENTION_ORDER = {'launch': 0, 'regulation': 1, 'policy': 2, 'preference': 3}
 
 
@@ -568,13 +580,13 @@ RIDER_ACTIVITY = Map({'origin_zones': Table(Scalar('number', minimum=0)),
 DRIVER_ACTIVITY = Map({'start_zone': Scalar('string', nullable=True)}, partial=True)
 
 
-def segment_fields(role, *, explicit):
+def segment_fields(role, *, explicit, implementations=None):
     fields_ = {
         'apps': APPS, 'preferred_app': Scalar('string'), 'accounts': Seq(Scalar('string'), nullable=True),
         'awareness': APPS, 'disclosed_to': APPS,
         'initial_scores': Table(Scalar('number', minimum=-2, maximum=2)),
-        role: Params(TRAITS[role], sampled=not explicit, partial=True),
-        'evolution': Params(EvolutionTraits, sampled=not explicit, partial=True),
+        role: Params(trait_schema(implementations, role), sampled=not explicit, partial=True),
+        'evolution': Params(trait_schema(implementations, 'evolution'), sampled=not explicit, partial=True),
         'activity': RIDER_ACTIVITY if role == 'rider' else DRIVER_ACTIVITY,
     }
     if role == 'driver':
@@ -584,10 +596,10 @@ def segment_fields(role, *, explicit):
     return {'weight': Scalar('number', minimum=0, maximum=1), **fields_}
 
 
-def population_spec(role):
+def population_spec(role, implementations=None):
     return Map({'count': Scalar('integer', minimum=0),
-                'segments': Table(Map(segment_fields(role, explicit=False))),
-                'people': Keyed(Map(segment_fields(role, explicit=True), partial=True)),
+                'segments': Table(Map(segment_fields(role, explicit=False, implementations=implementations))),
+                'people': Keyed(Map(segment_fields(role, explicit=True, implementations=implementations), partial=True)),
                 'generator': Choice('kind', {'segments': Map({}), 'registered': registered_generator()})})
 
 
@@ -667,29 +679,51 @@ INTERVENTION = Choice('kind', {
                        'max_per_km_minor': Scalar('integer', minimum=0, nullable=True),
                        'max_commission_fraction': Scalar('number', minimum=0, maximum=1, nullable=True)}),
 })
-SCENARIO = Map({
-    'name': Scalar('string'),
-    'schema_version': Scalar('integer', choices=(SCHEMA_VERSION,)),
-    'preset': Scalar('string', nullable=True),
-    'calibration': Scalar('string'),
-    'notes': Table(Scalar('string')),
-    'world': Map({
-        'speed_kmh': Scalar('number', positive=True), 'boarding_seconds': Scalar('number', minimum=0),
-        'minor_units_per_major': Scalar('integer', minimum=1), 'map_km': Point(positive=True),
-        'sampling': Scalar('string', choices=('grid', 'continuous')), 'grid_step_km': Scalar('number', positive=True),
-        'zones': Table(ZONE),
-        'calendar': Map({'weekday': Scalar('integer', minimum=0, maximum=6), 'hour': Scalar('number', minimum=0, maximum=24)}),
-        'horizon_hours': POSITIVE_HOURS,
-    }),
-    'platforms': Table(PLATFORM),
-    'behavior': Map({'rider': Implementation('rider'), 'driver': Implementation('driver'),
-                     'evolution': Implementation('evolution')}),
-    'population': Map({'riders': population_spec('rider'), 'drivers': population_spec('driver')}),
-    'activity': Map({'shifts': SHIFTS, 'trips': TRIPS, 'conflicts': Scalar('string', choices=('fail',))}),
-    'evolution': Map({'checkpoint_hours': Scalar('number', positive=True, nullable=True),
-                      'first_checkpoint_hours': Scalar('number', positive=True, nullable=True)}),
-    'interventions': Keyed(INTERVENTION),
-})
+_SCENARIO_SPEC_CACHE = {}
+
+
+def scenario_spec(implementations=None):
+    """The full scenario `Map`, with `population.<role>s` trait schemas resolved from the
+    *selected* rider/driver/evolution implementations (`TRAITS` is only the `@1` default; see
+    `trait_schema`) -- this is what makes a `@2` trait authorable through segments and explicit
+    people (scenario-definition.md). Cached per selection (only rider/driver/evolution identifiers
+    matter; marketplace implementations do not affect any trait schema) so repeated compiles do not
+    rebuild the tree. With every shipped preset's all-`@1` selection this is structurally identical
+    to the single module-level tree every earlier release built once at import.
+    """
+    key = (None if not implementations else
+          tuple((implementations or {}).get(family) for family in ('rider', 'driver', 'evolution')))
+    if key not in _SCENARIO_SPEC_CACHE:
+        _SCENARIO_SPEC_CACHE[key] = Map({
+            'name': Scalar('string'),
+            'schema_version': Scalar('integer', choices=(SCHEMA_VERSION,)),
+            'preset': Scalar('string', nullable=True),
+            'calibration': Scalar('string'),
+            'notes': Table(Scalar('string')),
+            'world': Map({
+                'speed_kmh': Scalar('number', positive=True), 'boarding_seconds': Scalar('number', minimum=0),
+                'minor_units_per_major': Scalar('integer', minimum=1), 'map_km': Point(positive=True),
+                'sampling': Scalar('string', choices=('grid', 'continuous')), 'grid_step_km': Scalar('number', positive=True),
+                'zones': Table(ZONE),
+                'calendar': Map({'weekday': Scalar('integer', minimum=0, maximum=6), 'hour': Scalar('number', minimum=0, maximum=24)}),
+                'horizon_hours': POSITIVE_HOURS,
+            }),
+            'platforms': Table(PLATFORM),
+            'behavior': Map({'rider': Implementation('rider'), 'driver': Implementation('driver'),
+                             'evolution': Implementation('evolution')}),
+            'population': Map({'riders': population_spec('rider', implementations),
+                               'drivers': population_spec('driver', implementations)}),
+            'activity': Map({'shifts': SHIFTS, 'trips': TRIPS, 'conflicts': Scalar('string', choices=('fail',))}),
+            'evolution': Map({'checkpoint_hours': Scalar('number', positive=True, nullable=True),
+                              'first_checkpoint_hours': Scalar('number', positive=True, nullable=True)}),
+            'interventions': Keyed(INTERVENTION),
+        })
+    return _SCENARIO_SPEC_CACHE[key]
+
+
+# The all-`@1` default tree: used by diff_plans and the typed builders below, none of which
+# resolves a trait schema (plan section 6.2 / scenario-definition.md ambiguity A14).
+SCENARIO = scenario_spec()
 
 
 # ----------------------------------------------------------------------
@@ -860,7 +894,8 @@ MARKETPLACE_DEFAULTS_V1 = {
     'rider_cancellation_fee_minor': 0, 'driver_cancellation_compensation_minor': 0,
     'driver_cancellation_penalty_minor': 0,
     'surcharge_minor': 0, 'surcharge_driver_share': 0, 'commission_binding': 'offer',
-    'driver_lockout_seconds': 0, 'guarantee_window_seconds': 0, 'announce_terms': False, 'service_area': None,
+    'driver_lockout_seconds': 0, 'guarantee_window_seconds': 0, 'revise_interval_seconds': 0,
+    'announce_terms': False, 'service_area': None,
 }
 ALL_APPS = ['rebu', 'blot', 'flyt']
 
@@ -1077,12 +1112,49 @@ class Scenario:
             return preset_definition(self.preset)
         return copy.deepcopy(self.definition)
 
+    def _selection(self):
+        """Best-effort pre-scan of `behavior.<family>.implementation`, from `self.base()` and any
+        `('set', path, value)` change touching `behavior`, so `resolve()` can pick the trait schema
+        the definition actually names before `SCENARIO.check` exists to report it properly. `base`
+        and `changes` are unchecked at this point, so every read is defensive: a malformed or
+        unregistered id is silently ignored here -- the ordinary `Implementation.check` (against
+        `scenario_spec(selection)`) then reports it at its exact path, same as today.
+        """
+        base = self.base()
+        selection = {}
+        behavior = base.get('behavior') if isinstance(base, dict) else None
+        if isinstance(behavior, dict):
+            for family in ('rider', 'driver', 'evolution'):
+                entry = behavior.get(family)
+                if isinstance(entry, dict) and isinstance(entry.get('implementation'), str):
+                    selection[family] = entry['implementation']
+        for op, path, value in self.changes:
+            if op != 'set':
+                continue
+            segments = path.split('.')
+            if not segments or segments[0] != 'behavior':
+                continue
+            if len(segments) == 1 and isinstance(value, dict):
+                for family in ('rider', 'driver', 'evolution'):
+                    entry = value.get(family)
+                    if isinstance(entry, dict) and isinstance(entry.get('implementation'), str):
+                        selection[family] = entry['implementation']
+            elif len(segments) == 2 and segments[1] in ('rider', 'driver', 'evolution'):
+                if isinstance(value, dict) and isinstance(value.get('implementation'), str):
+                    selection[segments[1]] = value['implementation']
+            elif (len(segments) == 3 and segments[1] in ('rider', 'driver', 'evolution')
+                  and segments[2] == 'implementation' and isinstance(value, str)):
+                selection[segments[1]] = value
+        return {family: identifier for family, identifier in selection.items()
+                if identifier in POLICY_REGISTRY.get(family, {})}
+
     def resolve(self):
         """Apply preset then overrides; return (resolved definition, provenance, diagnostics)."""
         diag = Diagnostics()
         base = self.base()
         source = f'preset:{self.preset}' if self.preset is not None else 'definition'
-        resolved = SCENARIO.check(base, '', diag, complete=True)
+        spec = scenario_spec(self._selection())
+        resolved = spec.check(base, '', diag, complete=True)
         if diag.errors:
             diag.errors.insert(0, f'{source}: base definition is incomplete or invalid')
             return resolved, {}, diag
@@ -1091,7 +1163,7 @@ class Scenario:
         prefixes = []
         for index, (op, path, value) in enumerate(self.changes):
             try:
-                prefix = _apply(resolved, op, path, value, index, diag)
+                prefix = _apply(resolved, op, path, value, index, diag, spec)
             except ScenarioError as error:
                 diag.errors.append(str(error))
                 continue
@@ -1099,11 +1171,11 @@ class Scenario:
                 prefixes.append((prefix, f'change[{index}]:{op} {path}'))
         if diag.errors:
             return resolved, {}, diag
-        resolved = SCENARIO.check(resolved, '', diag, complete=True)
+        resolved = spec.check(resolved, '', diag, complete=True)
         if resolved.get('preset') != base.get('preset'):
             diag.error('preset', 'the preset identity cannot be overridden; start from another preset instead')
         provenance = {}
-        for leaf, _ in SCENARIO.leaves(resolved, ''):
+        for leaf, _ in spec.leaves(resolved, ''):
             origin = source
             for prefix, label in prefixes:
                 if leaf == prefix or leaf.startswith(prefix + '.'):
@@ -1151,12 +1223,17 @@ def two_platform(first, second, *, name=None, riders=0, drivers=0, horizon_hours
     })
 
 
-def _navigate(root, path):
-    """Walk specs and values along a dotted path; return (parent spec, parent value, last key, spec, value)."""
+def _navigate(root, path, root_spec=None):
+    """Walk specs and values along a dotted path; return (parent spec, parent value, last key, spec, value).
+
+    `root_spec` (default `SCENARIO`) is the tree to walk -- `Scenario.resolve()` passes the
+    selection-resolved `scenario_spec(...)` so a path under `population.<role>s` descends into the
+    *selected* implementation's trait schema (scenario-definition.md).
+    """
     segments = path.split('.') if path else []
     if not segments or any(not segment for segment in segments):
         raise ScenarioError(f'{path!r}: paths are nonempty dotted keys')
-    spec, value, walked = SCENARIO, root, ''
+    spec, value, walked = (SCENARIO if root_spec is None else root_spec), root, ''
     parents = []
     for segment_ in segments:
         parents.append((spec, value, segment_))
@@ -1165,8 +1242,9 @@ def _navigate(root, path):
     return parents, spec, value
 
 
-def _apply(root, op, path, value, index, diag):
-    parents, spec, current = _navigate(root, path)
+def _apply(root, op, path, value, index, diag, spec=None):
+    parents, item_spec, current = _navigate(root, path, spec)
+    spec = item_spec
     if op == 'set':
         checked = spec.check(value, path, diag, complete=False)
         _store(parents, spec.merge(current, checked))
@@ -1401,7 +1479,8 @@ def compile_scenario(scenario):
             diag.error(f'{path}.segments', f'segment weights must sum to one, got {sum(weights.values())!r}')
         segments[role] = {}
         for sid, item in section['segments'].items():
-            access = _check_access(role, item, f'{path}.segments.{sid}', platforms, launched_at, behavior, diag, sampled=True)
+            access = _check_access(role, item, f'{path}.segments.{sid}', platforms, launched_at, behavior, diag,
+                                   sampled=True, implementations=implementations)
             segments[role][sid] = {**access, 'weight': item['weight'], 'initial_scores': dict(item['initial_scores']),
                                    'activity': dict(item['activity']),
                                    'traits': {role: dict(item[role]), 'evolution': dict(item['evolution'])}}
@@ -1422,7 +1501,8 @@ def compile_scenario(scenario):
             merged, missing = _merge_person(role, item, base)
             for key in missing:
                 diag.error(f'{label}.{key}', 'required for an explicit person without a segment')
-            access = _check_access(role, merged, label, platforms, launched_at, behavior, diag, sampled=False)
+            access = _check_access(role, merged, label, platforms, launched_at, behavior, diag,
+                                   sampled=False, implementations=implementations)
             explicit_people[role].append({**access, 'id': item['id'], 'segment': item['segment'],
                                           'initial_scores': merged['initial_scores'], 'activity': merged['activity'],
                                           'traits': {role: merged[role], 'evolution': merged['evolution']}})
@@ -1671,7 +1751,7 @@ def _launch_times(plan):
     return launched_at
 
 
-def _check_access(role, item, path, platforms, launched_at, behavior, diag, *, sampled):
+def _check_access(role, item, path, platforms, launched_at, behavior, diag, *, sampled, implementations=None):
     apps = list(item.get('apps') or [])
     accounts = apps if item.get('accounts') is None else list(item['accounts'])
     registrations = accounts if item.get('registrations') is None else list(item['registrations'])
@@ -1701,7 +1781,7 @@ def _check_access(role, item, path, platforms, launched_at, behavior, diag, *, s
         scalars = {k: v for k, v in item.get(family, {}).items() if not isinstance(v, dict)}
         if family in behavior:
             try:
-                TRAITS[family](**{**behavior[family], **scalars})
+                trait_schema(implementations, family)(**{**behavior[family], **scalars})
             except (TypeError, ValueError) as error:
                 diag.error(f'{path}.{family}', str(error))
     for pid in item.get('initial_scores', {}):
@@ -2000,7 +2080,7 @@ def _realize_person(plan, role, member, seed):
             if isinstance(value, dict):
                 values[name] = _sample(value, random.Random(derive_seed(seed, ['trait', role, person_id, family, name])))
         try:
-            traits[family] = plain(TRAITS[family](**values))
+            traits[family] = plain(trait_schema(plan.implementations, family)(**values))
         except (TypeError, ValueError) as error:
             raise ScenarioError(f'population.{role}s {person_id} {family}: {error}') from None
     profile = {'apps': member['apps'], 'preferred_app': member['preferred_app'], 'accounts': member['accounts'],
@@ -2009,7 +2089,7 @@ def _realize_person(plan, role, member, seed):
                'disclosed_to': member['disclosed_to'],
                'rider': traits.get('rider', plan.behavior['rider']), 'driver': traits.get('driver', plan.behavior['driver']),
                'evolution': traits['evolution']}
-    profile = plain(_profile(profile))
+    profile = plain(_profile(profile, plan.implementations))
     record = {'role': role, 'id': person_id, 'segment': member['segment'], 'profile': profile,
               'initial_scores': dict(member['initial_scores'])}
     if role == 'driver':
@@ -2062,7 +2142,8 @@ def _realize_registered_population(role, section, plan, seed):
         merged, missing_keys = _merge_person(role, checked if isinstance(checked, dict) else {}, base)
         for key in missing_keys:
             diag.error(f'{path}.{key}', 'required for a generated person without a segment')
-        access = _check_access(role, merged, path, plan.platforms, launched_at, plan.behavior, diag, sampled=False)
+        access = _check_access(role, merged, path, plan.platforms, launched_at, plan.behavior, diag,
+                               sampled=False, implementations=plan.implementations)
         _check_segment_activity(merged['activity'], f'{path}.activity', plan.resolved['world']['zones'], plan.resolved['world'],
                                 plan.resolved['activity']['trips']['generator'], plan.resolved['activity']['shifts']['generator'], diag)
         diag.raise_errors()
@@ -2071,14 +2152,17 @@ def _realize_registered_population(role, section, plan, seed):
     return members
 
 
-def _profile(values):
-    return PersonProfile(**(values | {'rider': RiderTraits(**values['rider']), 'driver': DriverTraits(**values['driver']),
-                                      'evolution': EvolutionTraits(**values['evolution'])}))
+def _profile(values, implementations=None):
+    schemas = {family: trait_schema(implementations, family) for family in ('rider', 'driver', 'evolution')}
+    return PersonProfile(**(values | {family: schemas[family](**values[family]) for family in schemas}))
 
 
-def load_profile(values):
-    """Rebuild a typed profile from a realized (JSON) population record."""
-    return _profile(values)
+def load_profile(values, implementations=None):
+    """Rebuild a typed profile from a realized (JSON) population record. `implementations` (the
+    compiled plan's, or a restored run's own `snapshot['policies']['implementations']`) must name
+    the same rider/driver/evolution selection the record was realized under, or a `@2` trait
+    keyword raises `TypeError` against the `@1` schema (scenario-definition.md)."""
+    return _profile(values, implementations)
 
 
 def _realize_explicit_people(plan, seed, people, registered_activity=None):
@@ -2125,7 +2209,8 @@ def _realize_explicit_people(plan, seed, people, registered_activity=None):
         merged, missing = _merge_person(role, checked, base)
         for key in missing:
             diag.error(f'{label}.{key}', 'required for an explicit person without a segment')
-        access = _check_access(role, merged, label, plan.platforms, launched_at, plan.behavior, diag, sampled=False)
+        access = _check_access(role, merged, label, plan.platforms, launched_at, plan.behavior, diag,
+                               sampled=False, implementations=plan.implementations)
         _check_segment_activity(merged['activity'], f'{label}.activity', world_def['zones'], world_def,
                                 activity_def['trips']['generator'], activity_def['shifts']['generator'], diag)
         diag.raise_errors()

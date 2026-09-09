@@ -83,6 +83,34 @@ schema, never a changed value:
   default-valued, restored with `.get` tolerance); `SNAPSHOT_SCHEMA_VERSION`
   stays 2 (additive), the same precedent phase 3's `transfers` table set.
 
+Authoring restrictions added in phase 5 (AST-209; `behavior_policy.py`,
+`policy_runtime.py`, `marketplace_engine.py`, `marketplace_policy.py`,
+`scenario.py`) -- three new registered implementations plus one new
+`MarketplaceParameters` key, all default-off:
+- `driver_participation@2`, `rider_search@2`, `personal_evolution@2` each
+  declare a trait dataclass that subclasses the `@1` one
+  (`register_policy`'s `issubclass` check requires this); every new trait
+  defaults to `@1`'s value/behavior, so a `@2` selection with default
+  traits reproduces `@1` byte-for-byte, draw order included. Shipped
+  presets keep selecting `@1`.
+- `revise_interval_seconds` (default `0`) is a nonnegative
+  `MarketplaceParameters` field; the runtime reads only its base value,
+  the same treatment as `guarantee_window_seconds`.
+- `Driver` gains `paused_apps` (a `set`, additive, restored with
+  `.get`-tolerance to `set()`); `SNAPSHOT_SCHEMA_VERSION` stays 2.
+- Population segments and explicit people now resolve each family's trait
+  schema from the *selected* implementation's declaration
+  (`scenario.trait_schema`), not a fixed `@1` table -- this is what makes
+  a `@2` trait authorable through a segment or an explicit person; fixes
+  the trap `scenario-definition.md` documented through phase 4.
+- The two `@1` mechanical preconditions this needed:
+  `RiderTraits.__post_init__`/`EvolutionTraits.__post_init__` now iterate
+  their own declared `fields()` instead of `plain(self)`, so a `@2`
+  subclass can add non-numeric traits (strings, bools, tuples) without
+  those reaching `finite_number`. Behavior-identical for `@1` (same field
+  set, same order); landed and gated alone before anything else in this
+  phase.
+
 Multi-platform realism, current as of phase 1 (see the linked architecture
 docs for the normative contract):
 - Baselines: roughly 55% session-to-order with supply, 70% offer acceptance

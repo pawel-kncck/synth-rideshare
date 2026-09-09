@@ -25,8 +25,9 @@ NOTES = {
     "assumption": "'unit' is one kilometre; both platforms keep 20% commission (DESCRIPTION.md prices the guarantee, not the split).",
     "approximation": "The $30/hr guarantee's windowed acceptance-rate condition needs the phase-4 observe hook "
                       "(plan section 4.B); its top-up settlement is postable since phase 3 (section 4.A) but no "
-                      "policy here computes or posts one. The strategic idle-and-snipe exploit needs "
-                      "driver_participation@2 (section 4.D, phase 5).",
+                      "policy here computes or posts one. The strategic idle-and-snipe exploit's mechanism now "
+                      "exists as driver_participation@2's availability trait (section 4.D, AST-209), "
+                      "demonstrated in scenarios/fixture_v2_availability.py; this script keeps @1.",
     "source": "plans/scenario-readiness-plan.md section 7 (S9 row) and section 10",
 }
 
@@ -61,7 +62,8 @@ def evaluate(header, initial, final, footer):
     checks.verdict("s9.2 a driver never runs two simultaneous physical services", not overlaps,
                    f"0 of {len(final['engine']['services'])} services overlap another service of the same driver "
                    "(the strategic-hiding half -- physically positioning where Steady's algorithm cannot find "
-                   "them -- needs driver_participation@2, plan section 4.D, phase 5)"
+                   "them -- is driver_participation@2's availability trait, plan section 4.D, AST-209, "
+                   "demonstrated in scenarios/fixture_v2_availability.py; this script keeps @1)"
                    + (f"; overlaps {overlaps[:3]}" if overlaps else ""))
 
     funnel = platform_funnel(initial, final)

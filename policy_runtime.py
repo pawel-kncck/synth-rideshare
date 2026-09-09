@@ -6,11 +6,12 @@ receive detached immutable snapshots, explicit memory, and keyed random values.
 import math
 from dataclasses import asdict
 
-from behavior_policy import (DriverPolicy, EvolutionPolicy, ExpandApps, OpenApp,
-                             OrderQuote, Respond, RiderPolicy, personal_pickup_eta, rider_reward, driver_reward)
+from behavior_policy import (DriverPolicy, DriverPolicyV2, Download, EvolutionPolicy, EvolutionPolicyV2,
+                             ExpandApps, OpenApp, OrderQuote, Respond, RiderPolicy, RiderPolicyV2,
+                             SwitchPreferred, personal_pickup_eta, rider_reward, driver_reward)
 from marketplace_policy import (EtaProposal, MarketplacePolicy, OfferProposal, PlatformPolicy,
                                 QuoteProposal)
-from marketplace_engine import CommandRejected, RegulationRejected
+from marketplace_engine import MAX_COMMITMENTS, CommandRejected, RegulationRejected
 from policy_contracts import Cancel, Decision, RandomValues, Stop, Transfer, Wait, finite_number, freeze, plain
 
 
@@ -66,6 +67,12 @@ for _family, (_implementation, _) in POLICY_FAMILIES.items():
 
 BUILTIN_IMPLEMENTATIONS = {family: policy_id(implementation) for family, (implementation, _) in POLICY_FAMILIES.items()}
 
+# Participant policies v2 (AST-209): additive registered implementations. BUILTIN_IMPLEMENTATIONS
+# still names @1, so every preset and every existing scenario keeps selecting @1; register_policy's
+# issubclass(parameter_schema, ...) check passes because the V2 trait classes subclass the V1 ones.
+for _family, _implementation in (('rider', RiderPolicyV2), ('driver', DriverPolicyV2), ('evolution', EvolutionPolicyV2)):
+    register_policy(_family, _implementation)
+
 
 class PolicyRuntime:
     schema_version = 2
@@ -97,6 +104,10 @@ class PolicyRuntime:
         self.decisions = []
         self.observations = []
         self.interventions = []
+        # Transient re-entrancy guard for apply_availability (pause_app/resume_app's
+        # driver_availability notification re-enters sync_driver); always False at an event
+        # boundary, so it is deliberately not part of snapshot().
+        self._pausing = False
         for kind, handler in (
             ('policy.rider.decide', self._rider_decide), ('policy.rider.open', self._rider_open),
             ('policy.rider.progress', self._rider_progress), ('policy.rider.deadline', self._rider_deadline),
@@ -104,7 +115,7 @@ class PolicyRuntime:
             ('policy.driver.expand', self._driver_expand), ('policy.driver.respond', self._driver_respond),
             ('policy.driver.progress', self._driver_progress), ('policy.checkpoint', self._checkpoint),
             ('policy.intervention', self._intervene), ('policy.controller', self._controller),
-            ('policy.observe_window', self._observe_window),
+            ('policy.observe_window', self._observe_window), ('policy.revise', self._revise_tick),
         ):
             registry.register(kind, handler)
         engine.add_listener(self.on_notification)
@@ -223,19 +234,62 @@ class PolicyRuntime:
 
     def rider_context(self, intent):
         s = self.state('rider', intent.rider_id)
+        profile = self.profile('rider', intent.rider_id)
         return freeze({'now': self.now, 'intent': intent,
                        'quotes': self.engine.rider_view(intent.rider_id).quotes(),
                        'usable_apps': self.usable_apps('rider', intent.rider_id),
                        'preferred_app': s['preferred_app'], 'scores': s['scores'],
-                       'announced': self.announced('rider', intent.rider_id)})
+                       'announced': self.announced('rider', intent.rider_id),
+                       'failures': s.get('failures', {}), 'sticky_preference': s.get('sticky_preference', False),
+                       'known_launched_apps': [p for p in profile.awareness
+                                               if p in self.engine.platforms and self.engine.platforms[p].launched]})
 
     def driver_context(self, driver_id, **extra):
         view, s = self.engine.driver_view(driver_id), self.state('driver', driver_id)
+        pending = view.pending_offers()
         return freeze({'now': self.now, 'position': view.position, 'commitments': view.commitments(),
                        'free_slots': view.free_slots, 'exit_requested': view.exit_requested,
                        'open_apps': view.open_apps, 'usable_apps': self.usable_apps('driver', driver_id),
                        'preferred_app': s['preferred_app'], 'scores': s['scores'],
-                       'announced': self.announced('driver', driver_id), **extra})
+                       'announced': self.announced('driver', driver_id),
+                       # driver_participation@2 (plan section 4.D): an enriched, id-sorted view of
+                       # this driver's own pending offers (behind-the-scenes information already
+                       # disclosed by offer_received); @1 never reads any of these five keys.
+                       'pending_offers': tuple({'offer_id': o.offer_id, 'platform_id': o.platform_id,
+                                                'order_id': o.order_id, 'payout_minor': o.payout_minor,
+                                                'bonus_minor': o.bonus_minor, 'eta_seconds': o.eta_seconds,
+                                                'expires_at': o.expires_at, 'created_at': o.created_at,
+                                                'pickup': o.pickup, 'destination': o.destination,
+                                                'private_eta_seconds': self.private_eta(driver_id, o.pickup)}
+                                              for o in pending),
+                       'estimated_wait_seconds': s['evolution'].get('estimated_wait_seconds', {}),
+                       'speed_kmh': self.engine.world.speed_kmh,
+                       'tie_draw': self.tie_draw(driver_id, [o.offer_id for o in pending]),
+                       **extra})
+
+    def driver_terms(self, platform_id, driver_id):
+        """The terms a real app shows this driver on this platform: their own resolved
+        cancellation penalty and lockout, plus the active guarantee program. Resolution uses this
+        driver's own `visible` dict, so nothing about another person leaks (driver_participation@2,
+        plan section 4.D)."""
+        policy = self.platforms[platform_id]
+        params, _ = policy.config.resolve(self.visible(platform_id, 'driver', driver_id), self.now)
+        programs = sorted((p for p in policy.config.programs if p.kind == 'hourly_guarantee'), key=lambda p: p.id)
+        return {'platform_id': platform_id,
+                'cancellation_penalty_minor': params.driver_cancellation_penalty_minor,
+                'lockout_seconds': params.driver_lockout_seconds,
+                'guarantee': (None if not programs else
+                              {'program_id': programs[0].id, 'floor_minor': programs[0].floor_minor,
+                               'window_seconds': programs[0].window_seconds,
+                               'min_acceptance_rate': programs[0].min_acceptance_rate,
+                               'min_online_seconds': programs[0].min_online_seconds})}
+
+    def tie_draw(self, driver_id, offer_ids):
+        """A symmetric draw so two co-pending responses from the same driver agree on a coin flip
+        (driver_participation@2 response_rule='best_pending', tie_break='random'). Identity
+        excludes the offer id -- deliberately different from the per-offer acceptance RandomValues
+        identity, which must never change, or every @1 acceptance draw would move."""
+        return RandomValues(self.seed, ('tie_break', 'driver', driver_id)).uniform(sorted(offer_ids))
 
     def quote(self, platform_id, request):
         policy = self.platforms[platform_id]
@@ -309,6 +363,18 @@ class PolicyRuntime:
             self.engine.revise_pickup_eta(p, order.id, **asdict(decision.action))
         elif not isinstance(decision.action, Stop):
             raise ValueError('Unsupported ETA proposal')
+
+    def _revise_tick(self, event):
+        """A bounded periodic re-revision for one order (`revise_interval_seconds` > 0), so a
+        rider's `eta_drift_cancel_seconds` sees drift without competitor telemetry. Started from
+        order_assigned; reschedules itself only while the order is still awaiting pickup."""
+        order = self.engine.orders[event.payload['order_id']]
+        if order.terminal or not order.assignment or 'arrived' in order.timeline:
+            return
+        self.revise(order)
+        interval = self.platforms[order.platform_id].config.parameters.revise_interval_seconds
+        if interval > 0:
+            self.schedule(interval, 'policy.revise', order_id=order.id)
 
     def cancel(self, request):
         order = self.engine.orders[request.order_id]
@@ -435,6 +501,31 @@ class PolicyRuntime:
             self.engine.end_intent(intent.id, action.reason)
         elif isinstance(action, Wait):
             self.queue_rider(intent.id, action.seconds)
+        elif isinstance(action, SwitchPreferred):
+            if action.platform_id not in self.usable_apps('rider', intent.rider_id):
+                raise ValueError('Policy switched to an unusable app')
+            rs = self.state('rider', intent.rider_id)
+            rs['preferred_app'] = action.platform_id
+            rs['sticky_preference'] = bool(action.sticky)
+            self.observations.append({'type': 'preference_switched', 'at_seconds': self.now,
+                'role': 'rider', 'person_id': intent.rider_id, 'platform_id': action.platform_id,
+                'sticky': bool(action.sticky), 'cause': 'fatigue'})
+            self.queue_rider(intent.id, t.retry_seconds)
+        elif isinstance(action, Download):
+            # Installing mid-search changes usable_apps, validated on the *next* decision; always
+            # re-queue rather than acting on the new app within this same decision.
+            p = action.platform_id
+            profile = self.profile('rider', intent.rider_id)
+            if (p not in profile.awareness or p not in self.engine.platforms
+                    or not self.engine.platforms[p].launched or p in self.engine.riders[intent.rider_id].apps):
+                raise ValueError('Policy downloaded an unknown, unlaunched or already-installed app')
+            self.engine.install_app('rider', intent.rider_id, p)
+            self.observations.append({'type': 'app_installed', 'at_seconds': self.now,
+                'role': 'rider', 'person_id': intent.rider_id, 'platform_id': p})
+            self.engine.activate_account('rider', intent.rider_id, p)
+            self.observations.append({'type': 'account_activated', 'at_seconds': self.now,
+                'role': 'rider', 'person_id': intent.rider_id, 'platform_id': p})
+            self.queue_rider(intent.id, t.retry_seconds)
         else:
             raise ValueError('Unsupported rider action')
 
@@ -491,6 +582,36 @@ class PolicyRuntime:
             if s['phase'] in ('idle', 'busy'):
                 s['search'] = {'no_offer_since': self.now, 'visited': sorted(driver.open_apps)}
                 self.queue_expansion(driver_id)
+        # One call site so no branch can forget it: after_service='preferred' precedent.
+        self.apply_availability(driver_id)
+
+    def apply_availability(self, driver_id):
+        """Trait-selected app pausing (driver_participation@2 `availability`), applied by the
+        runtime exactly as `after_service='preferred'` already is. `pause_app`/`resume_app`
+        publish `driver_availability`, whose listener (`on_notification`) calls `sync_driver`,
+        which calls back here; `self._pausing` makes the re-entrant inner call a no-op so the
+        outer loop finishes the remaining apps without recursing."""
+        mode = getattr(self.profile('driver', driver_id).driver, 'availability', 'always_open')
+        if mode == 'always_open' or self._pausing:
+            return
+        driver = self.engine.drivers[driver_id]
+        open_apps = sorted(driver.open_apps)
+        if not driver.shift_id:
+            wanted = set()
+        elif mode == 'pause_when_full':
+            wanted = set(open_apps) if len(driver.commitments) >= MAX_COMMITMENTS else set()
+        else:  # pause_while_serving_other
+            serving = {self.engine.orders[o].platform_id for o in driver.commitments}
+            wanted = {p for p in open_apps if p not in serving} if driver.commitments else set()
+        self._pausing = True
+        try:
+            for p in open_apps:
+                if p in wanted and p not in driver.paused_apps:
+                    self.engine.pause_app(driver_id, p)
+                elif p not in wanted and p in driver.paused_apps:
+                    self.engine.resume_app(driver_id, p)
+        finally:
+            self._pausing = False
 
     def queue_expansion(self, driver_id, delay=None):
         s, t = self.state('driver', driver_id), self.profile('driver', driver_id).driver
@@ -544,7 +665,8 @@ class PolicyRuntime:
             return
         order = self.engine.orders[offer.order_id]
         driver_id = offer.driver_id
-        context = self.driver_context(driver_id, offer=offer, private_eta_seconds=self.private_eta(driver_id, order.pickup))
+        context = self.driver_context(driver_id, offer=offer, private_eta_seconds=self.private_eta(driver_id, order.pickup),
+                                      terms=self.driver_terms(offer.platform_id, driver_id))
         s = self.state('driver', driver_id)
         decision = self.bindings['driver'](self.profile('driver', driver_id).driver).respond(context,
                     freeze(s.get('response', {})), RandomValues(self.seed, ('response', driver_id, offer.platform_id, offer.id)))
@@ -563,14 +685,21 @@ class PolicyRuntime:
         if order.terminal or not order.assignment:
             return
         driver_id = order.assignment.driver_id
+        t = self.profile('driver', driver_id).driver
         s = self.state('driver', driver_id)
-        decision = self.bindings['driver'](self.profile('driver', driver_id).driver).progress(
-            freeze({'now': self.now, 'order': order}), freeze(s.get('progress', {})),
-            RandomValues(self.seed, ('driver_progress', driver_id, order.id)))
+        decision = self.bindings['driver'](t).progress(
+            freeze({'now': self.now, 'order': order, 'private_eta_seconds': self.private_eta(driver_id, order.pickup),
+                   'terms': self.driver_terms(order.platform_id, driver_id)}),
+            freeze(s.get('progress', {})), RandomValues(self.seed, ('driver_progress', driver_id, order.id)))
         self.record('driver', driver_id, 'progress', decision)
         s['progress'] = decision.memory
         if isinstance(decision.action, Cancel):
             self.cancel(decision.action)
+        elif (getattr(t, 'cancel_check_seconds', 0) > 0 and order.state == 'assigned'
+              and 'boarded' not in order.timeline):
+            # Bounded by the order reaching boarding or a terminal state (both re-checked here and
+            # at this handler's own top-of-function guard next time), so no generation guard is needed.
+            self.schedule(t.cancel_check_seconds, 'policy.driver.progress', order_id=order.id)
 
     def on_notification(self, n):
         e, d, kind, person_id = self.engine, n.data, n.kind, n.audience_id
@@ -588,7 +717,11 @@ class PolicyRuntime:
             elif kind == 'offer_resolved' and d['state'] != 'accepted':
                 self.queue_dispatch(d['order_id'], self.platforms[person_id].config.parameters.retry_seconds)
             elif kind == 'order_assigned':
-                self.revise(e.orders[d['order_id']])
+                order = e.orders[d['order_id']]
+                self.revise(order)
+                interval = self.platforms[person_id].config.parameters.revise_interval_seconds
+                if interval > 0:
+                    self.schedule(interval, 'policy.revise', order_id=order.id)
             elif kind == 'order_completed':
                 order = e.orders[d['order_id']]
                 completed = self.platform_memory[person_id].setdefault('completed', {})
@@ -602,7 +735,7 @@ class PolicyRuntime:
             if kind in self.observing[person_id]:
                 self.observe(person_id, kind, d)
         elif n.audience == 'rider':
-            t = self.profile('rider', person_id).rider
+            t, s = self.profile('rider', person_id).rider, self.state('rider', person_id)
             if kind == 'intent_started':
                 self.intents[str(d['intent_id'])] = {}
                 self.queue_rider(d['intent_id'], t.decision_seconds)
@@ -614,12 +747,35 @@ class PolicyRuntime:
             elif kind == 'order_canceled':
                 order = e.orders[d['order_id']]
                 self.add_reward('rider', person_id, order.platform_id, -1, 'cancellation', order.id)
+                # Outcome memory (rider_search@2 fatigue_threshold): a rider's own cancellation is
+                # not the platform failing (plan section 10, S7); gated so no @1 rider's state
+                # dict gains a 'failures' key.
+                if getattr(t, 'fatigue_threshold', 0) and d['by'] != 'rider':
+                    failures = s.setdefault('failures', {})
+                    failures[order.platform_id] = failures.get(order.platform_id, 0) + 1
+                    self.observations.append({'type': 'service_failure', 'at_seconds': self.now,
+                        'rider_id': person_id, 'platform_id': order.platform_id, 'cause': 'canceled',
+                        'consecutive': failures[order.platform_id]})
                 self.queue_rider(order.intent_id, t.retry_seconds)
             elif kind == 'order_completed':
                 order = e.orders[d['order_id']]
                 quote = e.quotes[order.quote_id]
                 reward = rider_reward(t, freeze(order), freeze(quote))
                 self.add_reward('rider', person_id, order.platform_id, reward, 'completed', order.id)
+                if getattr(t, 'fatigue_threshold', 0):
+                    failures = s.setdefault('failures', {})
+                    wait = order.timeline['arrived'] - order.created_at
+                    if wait > t.failure_wait_seconds:
+                        failures[order.platform_id] = failures.get(order.platform_id, 0) + 1
+                        self.observations.append({'type': 'service_failure', 'at_seconds': self.now,
+                            'rider_id': person_id, 'platform_id': order.platform_id, 'cause': 'long_wait',
+                            'consecutive': failures[order.platform_id]})
+                    else:
+                        failures[order.platform_id] = 0
+            elif kind == 'pickup_eta_revised' and getattr(t, 'eta_drift_cancel_seconds', 0) > 0:
+                # Zero-delay schedule keeps the decision at an event boundary rather than inside
+                # the engine's own notification drain; a terminal order's progress is a no-op.
+                self.schedule(0, 'policy.rider.progress', order_id=d['order_id'])
             elif kind == 'intent_ended':
                 for p in sorted(e.riders[person_id].open_apps):
                     e.close_app('rider', person_id, p)
@@ -628,9 +784,13 @@ class PolicyRuntime:
             self.sync_driver(person_id)
             if kind == 'shift_started':
                 apps = self.usable_apps('driver', person_id)
-                preferred = s['preferred_app'] if s['preferred_app'] in apps else (apps[0] if apps else None)
-                if preferred:
-                    e.open_app('driver', person_id, preferred)
+                if getattr(t, 'open_apps_at_start', 'preferred') == 'all':
+                    for p in apps:  # apps is already sorted (usable_apps)
+                        e.open_app('driver', person_id, p)
+                else:
+                    preferred = s['preferred_app'] if s['preferred_app'] in apps else (apps[0] if apps else None)
+                    if preferred:
+                        e.open_app('driver', person_id, preferred)
                 self.sync_driver(person_id)
                 s['search'] = {'no_offer_since': self.now, 'visited': sorted(e.drivers[person_id].open_apps)}
                 s['generation'] += 1
@@ -653,6 +813,8 @@ class PolicyRuntime:
                 self.queue_expansion(person_id)
                 order = e.orders[d['order_id']]
                 self.schedule(t.cancel_after_seconds, 'policy.driver.progress', order_id=order.id)
+                if getattr(t, 'cancel_check_seconds', 0) > 0:
+                    self.schedule(t.cancel_check_seconds, 'policy.driver.progress', order_id=order.id)
                 for p in s['apps']:
                     if p != order.platform_id:
                         self.observations.append({'type': 'opportunity_wait_censored', 'at_seconds': self.now,
@@ -764,15 +926,49 @@ class PolicyRuntime:
             if item['preferred_app'] is not None:
                 if item['preferred_app'] not in self.usable_apps(item['role'], item['person_id']):
                     raise ValueError('Intervention preference is no longer usable')
-                self.state(item['role'], item['person_id'])['preferred_app'] = item['preferred_app']
+                target_state = self.state(item['role'], item['person_id'])
+                target_state['preferred_app'] = item['preferred_app']
+                # A preference_change intervention overrides fatigue stickiness (plan section 4.E:
+                # "unless ... a preference_change intervention runs"); a no-op for an @1 person,
+                # whose state dict never reads this key.
+                target_state['sticky_preference'] = False
             item['applied'] = True
             self.observations.append({'type': 'intervention', 'at_seconds': self.now, **plain(item)})
+
+    def neighbor_install_shares(self, role):
+        """Share of same-role people within `vicinity_km` of each person who have each app
+        installed -- participant knowledge (plan section 5.3), never disclosed to a platform.
+        `{}` (no O(n^2) work) unless some person's `evolution.install_trigger_peer_share` is
+        actually positive. A person with no known position (never began an intent / never
+        started a shift) is excluded from both numerator and denominator; share is `{}` (read as
+        0 for every app, personal_evolution@2) when there are no positioned neighbours."""
+        table = self.engine.riders if role == 'rider' else self.engine.drivers
+        if not any(getattr(self.profile(role, pid).evolution, 'install_trigger_peer_share', 0) > 0 for pid in table):
+            return {}
+        positions = {pid: pos for pid in sorted(table)
+                    if (pos := self.engine.position_of(role, pid)) is not None}
+        shares = {}
+        for person_id in sorted(table):
+            origin = positions.get(person_id)
+            if origin is None:
+                shares[person_id] = {}
+                continue
+            vicinity_km = getattr(self.profile(role, person_id).evolution, 'vicinity_km', 2)
+            neighbors = [other for other, pos in positions.items()
+                        if other != person_id and math.dist(pos, origin) <= vicinity_km]
+            counts = {}
+            for other in neighbors:
+                for p in table[other].apps:
+                    counts[p] = counts.get(p, 0) + 1
+            shares[person_id] = {p: n / len(neighbors) for p, n in counts.items()} if neighbors else {}
+        return shares
 
     def _checkpoint(self, event):
         self._intervene(event)
         for driver_id in self.engine.drivers:
             self.sync_driver(driver_id)
         proposals = []
+        neighbor_shares = {role: self.neighbor_install_shares(role) for role in ('rider', 'driver')}
         for role, table in (('rider', self.engine.riders), ('driver', self.engine.drivers)):
             for person_id, person in table.items():
                 s, profile = self.state(role, person_id), self.profile(role, person_id)
@@ -782,7 +978,10 @@ class PolicyRuntime:
                     'known_launched_apps': [p for p in profile.awareness if self.engine.platforms[p].launched],
                     'apps': person.apps, 'usable_apps': self.usable_apps(role, person_id),
                     'preferred_app': s['preferred_app'], 'scores': s['scores'], 'observations': s['observations'],
-                    'exposure': s['exposure'], 'offer_counts': s['offer_counts']})
+                    'exposure': s['exposure'], 'offer_counts': s['offer_counts'],
+                    'phase': s['phase'] if role == 'driver' else 'off',
+                    'sticky_preference': s.get('sticky_preference', False),
+                    'neighbor_install_share': neighbor_shares[role].get(person_id, {})})
                 decision = self.bindings['evolution'](profile.evolution).checkpoint(context, freeze(s['evolution']),
                         RandomValues(self.seed, ('checkpoint', role, person_id, self.now)))
                 proposals.append((role, person_id, decision))
