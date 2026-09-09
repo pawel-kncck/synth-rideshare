@@ -84,13 +84,194 @@ condition again at `compile_scenario` time); the visible-field set is read
 from `marketplace_policy`, not duplicated, so it grows automatically when a
 later phase adds zone or window keys to it.
 
-Supported activity generators are `rotation`/`explicit`/`none` shifts and
-`weekly`/`explicit`/`none` trips; the only conflict policy is `fail`. Static
-checks reject crews whose shifts overlap, overlapping explicit shift windows and
-same-second trips for one rider, and warn about trips within a rider's search
-patience. Endogenous demand, queue/defer policies, unit conversion of money,
-JSON/YAML front ends beyond `Scenario.load`, and restricted formula languages
-are not implemented.
+Supported activity generators are `rotation`/`explicit`/`registered`/`none`
+shifts and `weekly`/`explicit`/`registered`/`none` trips; the only conflict
+policy is `fail`. Static checks reject crews whose shifts overlap, overlapping
+explicit shift windows and same-second trips for one rider, and warn about
+trips within a rider's search patience. Endogenous demand, queue/defer
+policies, unit conversion of money, JSON/YAML front ends beyond
+`Scenario.load`, and restricted formula languages are not implemented.
+
+## Geography: zones and per-segment trip demand
+
+`world.zones` is a `Table` of named, closed, axis-aligned boxes in kilometres
+(`{id: {"min": [x0, y0], "max": [x1, y1]}}`, built with `zone(id, min=..., max=...)`
+mirroring `platform()`). It is required (`"zones": {}` is the off state every
+preset ships) but, like `map_km`, it never reaches `World` or
+`marketplace_engine.py` -- the engine still does not fence or clip a
+coordinate, so declaring a zone changes only what the *generators* below can
+reference, never what a coordinate means at runtime. `compile_scenario`
+(`_check_zones`) rejects a box whose `max` is not strictly greater than `min`
+on both axes, warns when a box extends beyond `map_km` (a sampled point could
+then fall outside the sampling extent), and, when `world.sampling` is `grid`,
+requires a multiple of `grid_step_km` inside the box on *each* axis
+independently (sampling draws each axis separately). Overlapping zones are
+legal and undiagnosed: a point is sampled by picking a zone first, so overlap
+never double-counts, and a point on a shared edge belongs to both boxes under
+this closed-box test.
+
+`population.<role>.segments.<id>.activity` (and the same key on an explicit
+`person()`) is a `partial` map, absent by default, that gives the `weekly`
+trip generator and the `rotation` shift generator geography instead of the
+map-wide uniform draw every segment had before this mechanism existed. A
+rider's `activity` may declare `origin_zones` (weights over declared zones),
+`destination_zones` (weights *conditional on the drawn origin zone* --
+requires `origin_zones`, and every origin zone with positive weight needs a
+row), `distance_km` (a distribution; mutually exclusive with
+`destination_zones`), and `spatial_peaks` (a zone list, clock window and
+multiplier that boosts that zone's `origin_zones` weight inside the window --
+overlapping peaks combine with `max`, the same aggregation `_peak_weight`
+already uses for time-of-day surge; origins only, never destinations or
+arrival times). A driver's `activity` may declare `start_zone`. Declaring
+rider geometry while `activity.trips` is not `weekly`, or `start_zone` while
+`activity.shifts` is not `rotation`, compiles with a warning, not an error --
+the fields are simply unused by the active generator. `_check_segment_activity`
+validates every zone reference, weight sum, and (against `world.map_km`) the
+feasibility of `distance_km`'s upper bound: it must fit from the map's centre
+(`distance <= hypot(*map_km) / 2`, the worst-case origin) or compilation
+fails outright, and a warning follows if it exceeds `min(map_km)` (rejection
+sampling then discards most directions) or if `world.sampling` is `grid`
+(the drawn distance is perturbed by snapping the destination to the grid
+afterward). Trip count is never changed by any of this -- `trips_per_rider`
+remains the sole control on demand volume; geometry only changes *where* a
+trip starts and ends and, through `spatial_peaks`, *which zone it is more
+likely to start in* during a window.
+
+Realizing a trip with declared geometry draws, in order: an origin zone
+(weighted by `origin_zones`, adjusted for any matching `spatial_peaks` at
+that instant, then a point inside it); then a destination, by whichever one
+of `destination_zones` / `distance_km` / (neither) applies, redrawn while it
+equals the origin, up to 100 attempts total -- a distance-based destination
+draws its distance once and only resamples the direction on each attempt.
+Exhausting the budget is a deterministic run failure (`ScenarioError`), never
+an infinite loop; the compile-time feasibility check above exists precisely
+to make that rare. When a trip's rider (or a shift's driver) declares nothing,
+realization takes the identical, byte-for-byte unchanged map-wide
+`_sample_point` branch every scenario used before this mechanism existed --
+this is why the published `@1` presets, which declare no zones and no
+segment `activity`, produce identical seed-0 people, sessions and
+notification traces to before phase 2.
+
+## Registered generators
+
+`activity.shifts`/`activity.trips` accept a third generator kind,
+`registered`, and `population.riders`/`population.drivers` gain a
+`generator` `Choice` (`{"kind": "segments"}`, the default, or
+`{"kind": "registered", "implementation": "name@version", "parameters": {...}}`)
+alongside `count`/`segments`/`people`. Both select a trusted implementation
+by identity through a registry in `scenario.py` --
+`register_generator(family, implementation)` / `generator_class(family, id)`
+-- that mirrors `policy_runtime.register_policy`/`policy_class`'s shape,
+identity (`name@version`) and duplicate-registration rule, but lives in
+`scenario.py` rather than `policy_runtime.py`: generators are compile/prepare-time
+artifacts with no engine access, so `POLICY_FAMILIES`' hook/parameter-schema
+contract does not apply to them, and their own `parameters` are an open
+`Table(Json())` bag validated by the generator itself, not by this schema.
+Registering computes `hashlib.sha256(inspect.getsource(implementation))` once,
+at registration time; a generator whose source `inspect.getsource` cannot
+retrieve (e.g. one defined at an interactive prompt) cannot be registered,
+because there would then be nothing to hash for provenance.
+
+Call contracts, invoked with a seed-derived `random.Random` distinct per
+family and identity (`derive_seed(seed, ['activity', family, identifier])`
+for trips/shifts, `derive_seed(seed, ['population', role, identifier])` for
+population) so swapping a generator cannot silently reuse another's stream:
+
+* **trips/shifts**: `generate(*, definition, people, parameters, random) ->
+  list[dict]`. `definition` is a deep copy of `plan.resolved`, `people` a
+  deep copy of the realized population; mutating either cannot reach the
+  plan. Every returned item is validated by `_check_session` (exactly the
+  session's documented key set -- trips `{kind, id, rider, at_seconds,
+  origin, destination}`, shifts `{kind, id, driver, at_seconds,
+  shift_seconds, location}`; a known person of the right role; finite
+  times; JSON-serializable coordinates) with ids required unique only
+  within this generator's own batch (the same guarantee `explicit` items
+  get from `Keyed.check`). The produced sessions then join the built-in
+  generators' output before the existing sort and
+  `_check_realized_conflicts`, so they are covered by the same static
+  conflict checks unconditionally.
+* **population**: `generate(*, definition, role, person_ids, parameters,
+  random) -> {person_id: declaration}`. `count` still fixes the identities
+  (`role-1..role-n` in `person_ids`); the generator supplies each counted
+  id's declaration rather than inventing identities of its own -- this is
+  what keeps every compile-time cross-check that already validated against
+  `plan.person_ids` (explicit activity references, preference
+  interventions, `Inputs.reuse_for`'s controls) enforceable. The returned
+  mapping's keys must be exactly `person_ids`, reported as separate missing
+  and unexpected lists on a mismatch. Each declaration is checked with the
+  same partial `segment_fields(role, explicit=True)` schema an explicit
+  person uses, merged with its named `segment` (if any) through the same
+  `_merge_person` an explicit person goes through, and validated with the
+  same `_check_access` and `_check_segment_activity` -- so a generated
+  person has the identical shape and downstream validation, geometry
+  included, as a segment-allocated or explicit one. A registered population
+  generator only replaces segment *allocation*; `population.<role>s.people`
+  (compile-time explicit people) still layer on top of its output exactly as
+  they layer on top of segment allocation -- `plan.person_ids` already folds
+  their ids into the union regardless of generator kind, so realization must
+  too, or a compile-time-valid identity (an explicit activity reference, a
+  preference intervention target) would never be realized at `prepare()`.
+
+The manifest records identity and provenance for whichever generators are
+`registered`: `manifest()['generators']` (and `Plan.generators`) is
+`{'trips': {...}, 'shifts': {...}, 'population.rider': {...},
+'population.driver': {...}}`, each present entry
+`{'implementation': 'name@version', 'source_sha256': '...'}`. This dict
+folds into `implementation_fingerprint`, so `fingerprints['implementation']`
+and `fingerprints['plan']` change with the generator's identity *and* its
+recorded source hash, exactly like a swapped policy implementation.
+Reproducing a saved plan's fingerprint from `Scenario.load(manifest)`
+therefore requires the same generator source to be registered in the
+loading process -- the recorded hash detects that the source has drifted
+since registration, not that the generator is pure. A registered generator
+is trusted extension code exactly like a custom policy (see "Extensibility
+and limits of validation" below): one that reads the clock, a global, or an
+unseeded `random` module call can silently break `Inputs.reuse_for` and
+paired variants without its source, or its recorded hash, changing at all.
+An unknown selected identifier is a compile error
+(`activity.trips.implementation` / `activity.shifts.implementation` /
+`population.<role>s.generator.implementation`); a `registered` trips
+generator with no riders, or a `registered` population generator with
+`count == 0`, warns exactly like the built-in generators' equivalent
+no-op cases.
+
+`Inputs.explicit(plan, seed=0, *, people=None, sessions=None)` is the direct
+construction path for a throwaway fixture: a short script that wants to
+schedule a few trips or people without authoring a definition (this is the
+pre-PR-4 imperative style, restored on top of a compiled plan). Omitted
+`people`/`sessions` fall back to the plan's own `_realize_population`/
+`_realize_activity`; supplied ones are `person()`-shaped declarations (each
+needing a `role` key) or trip/shift dicts, validated through the identical
+paths a registered generator's output takes (`_merge_person`/`_check_access`/
+`_check_segment_activity`/`_realize_person` for people; `_check_session`, the
+sort, and `_check_realized_conflicts` for sessions) so a fixture's inputs
+have the same shape and the same static guarantees as a fully authored
+definition's -- a supplied person's `activity` is checked exactly like a
+segment's or an explicit person's, and, since such a person is in neither
+`plan.explicit_people` nor `plan.segments` for `_realize_activity`'s geometry
+index to find by id or by segment, its merged `activity` is threaded through
+the same `registered_activity` overlay a registered population generator's
+output uses, so a validated declaration is also the one honored at
+realization.
+There is no new `Inputs` field -- `to_dict()` and every snapshot's `inputs`
+blob keep their shape -- and no opt-out flag on `reuse_for`: preparing any
+*other* plan from these inputs' seed produces that plan's own generated
+people/sessions, which will not equal what was supplied here, so
+`reuse_for`'s existing "controlled schedules diverged despite equal
+controls" error already refuses the mismatch.
+
+`world.zones` and `population.<role>.generator` are required keys, so a
+JSON definition or saved manifest from before phase 2 fails `Scenario.load`
+with `world.zones: missing required setting` (and the same for
+`population.riders.generator` / `population.drivers.generator`); add
+`"zones": {}` and `"generator": {"kind": "segments"}` to migrate it, the
+same precedent `notes` set in phase 1. `world`/`population`/`activity` all
+remain inside `controls` (`compile_scenario` builds `controls` from exactly
+those three sections), so `fingerprints['controls']`/`['definition']` change
+for every scenario with this phase's schema addition -- expected, since
+geometry and a generator's identity genuinely are controlled inputs: they
+change realized sessions, so two variants that differ only in zones or a
+generator selection must not share prepared inputs through `Inputs.reuse_for`.
 
 Phase 3 must support compiling a definition and executing a single seeded scenario
 through the existing `Simulation` orchestration. It must not depend on the phase 4
@@ -178,10 +359,17 @@ paired variants; do not derive them from later order creation sequence.
 `world.map_km` is a sampling extent for the generators (`_sample_point`'s grid
 or continuous draw), not a physical fence: the engine never rejects or clips a
 coordinate outside it, so an explicit trip or shift can name a point beyond
-`map_km` on purpose. `population.<role>.segments`/`people` never carry trip
-geometry -- origins and destinations come only from `activity.trips`, so a
-segment shapes who travels and on what terms, never where. Replacing
-`platforms.<id>` (a full `Table` entry, via `with_changes` or `platform()`)
+`map_km` on purpose; the same is true of `world.zones` (see "Geography" above)
+-- a declared zone shapes only what a generator can reference, never what the
+engine accepts. `population.<role>.segments`/`people` never carry *trip
+identity or realized coordinates* -- `origin`/`destination` themselves are
+still exogenous per-trip values that only `activity.trips` (built-in or
+registered) produces -- but, since phase 2, a segment or explicit person
+**may** carry an `activity` geometry *preference* (`origin_zones`,
+`destination_zones`, `distance_km`, `spatial_peaks`, `start_zone`) that
+biases where the `weekly`/`rotation` generators draw from; a segment still
+never authors a coordinate directly. Replacing `platforms.<id>` (a full
+`Table` entry, via `with_changes` or `platform()`)
 requires every policy parameter, the same as any other complete preset value;
 a `policy_change` intervention instead **merges** onto the platform's current
 policy, so it can move just the fields it names. A custom (non-`@1`) rider,

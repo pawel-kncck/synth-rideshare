@@ -152,6 +152,24 @@ counts use largest-remainder rounding and a seeded assignment; traits can be
 scalars or `{"uniform": [low, high]}`, `{"normal": [mean, sd, low, high]}` and
 `{"choice": [[value, weight], ...]}` distributions sampled once per person.
 
+`world.zones` names axis-aligned boxes in km (`zone(id, min=..., max=...)`);
+`map_km`, like before, stays a sampling extent the engine never fences. A
+rider or driver segment (or explicit `person()`) may add an `activity` block
+-- `origin_zones`/`destination_zones`/`distance_km`/`spatial_peaks` for
+riders, `start_zone` for drivers -- that biases the `weekly`/`rotation`
+generators toward those zones instead of the map-wide uniform draw; omitting
+it (every segment's default) is unchanged behavior. `activity.trips`/
+`activity.shifts` also accept `{"generator": "registered", "implementation":
+"name@version", "parameters": {...}}`, and `population.<role>.generator`
+accepts `{"kind": "registered", ...}`, both resolved through
+`register_generator(family, implementation)`/`generator_class(family, id)` --
+the same identity-and-version registry `register_policy` uses for policies,
+with a source hash recorded at registration for provenance. `Inputs.explicit(
+plan, seed=0, people=[...], sessions=[...])` schedules a short fixture's own
+people/sessions directly on a compiled plan, validated the same way. See
+[Scenario definition](plans/architecture/scenario-definition.md) for the full
+validation rules, draw order and manifest fingerprint details.
+
 ## Sessions, time and checkpoints
 
 Scenario times are hours after the calendar origin; the plan and log use
