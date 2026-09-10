@@ -14,7 +14,8 @@ by dotted path (maps merge by schema, lists are replaced), `add(path, item)`
 and `remove(path, id)` edit keyed collections and ID tables, and `renamed`
 labels the variant. Typed builders (`campaign`, `rule`, `peak`, `segment`,
 `person`, `shift`, `trip`, `launch`, `policy_change`, `preference_change`,
-`platform_policy`) return complete items. Times are authored in hours after
+`platform_policy`, and, since phase 4, `program` and `regulation`) return
+complete items. Times are authored in hours after
 the calendar origin and normalized to seconds; money stays in declared minor units.
 
 `compile_scenario(scenario)` returns an immutable `Plan`: the canonical resolved
@@ -48,13 +49,258 @@ checkpoints). Both are labeled `calibration: synthetic` and write every default
 out under their version. A `scenario.ScenarioError` reports every independent
 configuration error together, each naming its path.
 
-Supported activity generators are `rotation`/`explicit`/`none` shifts and
-`weekly`/`explicit`/`none` trips; the only conflict policy is `fail`. Static
-checks reject crews whose shifts overlap, overlapping explicit shift windows and
-same-second trips for one rider, and warn about trips within a rider's search
-patience. Endogenous demand, queue/defer policies, unit conversion of money,
-JSON/YAML front ends beyond `Scenario.load`, and restricted formula languages
-are not implemented.
+A top-level `notes` table (`{id: text string}`, e.g. `{"assumption": "...",
+"approximation": "...", "source": "..."}`) holds free-form authoring notes,
+set with `.with_changes({"notes": {...}})` like any other `Table` (a merge,
+so a script can add keys without restating existing ones). It is part of the
+resolved definition -- hence of `fingerprints['definition']` and of
+`manifest()['resolved']['notes']`, and surfaced again directly at
+`manifest()['notes']` and the `Plan.notes` property for grepping -- but it is
+deliberately **not** part of `controls` (`compile_scenario` builds `controls`
+from `world`/`population`/`activity` only), so two variants that differ only
+in their notes still share prepared inputs through `Inputs.reuse_for`. A
+required key means a JSON definition or saved manifest from before this field
+existed fails `Scenario.load` with `notes: missing required setting`; add
+`"notes": {}` to migrate it. That failure is accepted, not patched with a
+silent default -- a hidden default would break the "complete definition"
+invariant and provenance the rest of this document describes. Phase 3's
+`platforms.<id>.starting_cash_minor` is the same class of required (nullable)
+key added to an existing complete `Map`: a definition or manifest saved
+before phase 3 fails `Scenario.load` with
+`platforms.<id>.starting_cash_minor: missing required setting`; add
+`"starting_cash_minor": null` per platform to migrate (see notes.md).
+
+`PRESETS['market-blank@1']` is `_base_v1` with empty `platforms` and empty
+`population.<role>.segments`: world, behavior defaults, `activity` generators
+set to `none`, evolution off. `compile_scenario` on it alone fails with
+`platforms: at least one platform is required`, which is the intended
+authoring-time signal that a script must add its own market.
+`platform(id, *, starting_cash_minor=None, **parameters)` builds one complete
+`{id: <PLATFORM entry>}` table entry over `MARKETPLACE_DEFAULTS_V1` (rejecting
+an unknown parameter name with its exact path, at authoring time, before
+`compile_scenario` would); `starting_cash_minor` is a separate explicit
+keyword, not one of `**parameters` -- it seeds the platform's cash account in
+`marketplace_engine.py` (see marketplace-engine.md "Money accounts"), not a
+`MarketplaceParameters` field, and every platform entry (phase 3) requires it
+(nullable; `None`, every preset's published default, means untracked).
+`two_platform(first, second, ...)` composes two `platform()` calls and one
+`both-apps` population segment per role into a ready `Scenario` on
+`market-blank@1`. Because `platforms` and `population.<role>.segments` are
+`Table`s (merge by ID into whatever the base already has), starting from
+`market-blank@1` is what lets a script hand these builders a whole market in
+one `with_changes`, instead of first removing a preset's existing named
+segments. `rule()` validates `when` against `marketplace_policy.VISIBLE_FIELDS`
+at authoring time (`ConditionalRule.__post_init__` enforces the same
+condition again at `compile_scenario` time); the visible-field set is read
+from `marketplace_policy`, not duplicated, so it already includes phase 4's
+`origin_zone`/`destination_zone` and grows automatically if a later phase
+adds more. `rule()` also accepts an optional `start_hours`/`end_hours`
+window (both or neither; converted to seconds by `_compile_policy` exactly
+like a campaign's), and `program(id, *, floor_minor, window_hours, ...)`
+builds one `hourly_guarantee` program entry the same way `campaign()` does
+(see "Interventions and effective time" for `regulation()`).
+
+Supported activity generators are `rotation`/`explicit`/`registered`/`none`
+shifts and `weekly`/`explicit`/`registered`/`none` trips; the only conflict
+policy is `fail`. Static checks reject crews whose shifts overlap, overlapping
+explicit shift windows and same-second trips for one rider, and warn about
+trips within a rider's search patience. Endogenous demand, queue/defer
+policies, unit conversion of money, JSON/YAML front ends beyond
+`Scenario.load`, and restricted formula languages are not implemented.
+
+## Geography: zones and per-segment trip demand
+
+`world.zones` is a `Table` of named, closed, axis-aligned boxes in kilometres
+(`{id: {"min": [x0, y0], "max": [x1, y1]}}`, built with `zone(id, min=..., max=...)`
+mirroring `platform()`). It is required (`"zones": {}` is the off state every
+preset ships) but, like `map_km`, it never reaches `World` or
+`marketplace_engine.py` -- the engine still does not fence or clip a
+coordinate, so declaring a zone changes only what the *generators* below, and
+(since phase 4) the *policy* layer, can reference, never what a coordinate
+means at runtime. Phase 4 gives `world.zones` two more consumers, both inside
+`marketplace_policy.py`/`policy_runtime.py`, never the engine: a
+`MarketplaceParameters.service_area` authored as a zone id string is resolved
+by `_compile_policy` to that zone's box (an unknown id is a compile error
+naming the declared ids; every *compiled* policy therefore holds a box or
+`None`, never an unresolved string); and a rider/order's pickup and
+destination are labelled `origin_zone`/`destination_zone`
+(`PolicyRuntime.zone_of`: the first declared id, sorted, whose closed box
+contains the point, else `None`) and merged into the *rider-side* `visible`
+dict a `rule()`'s `when` can match -- never into a driver's own `visible`,
+so a zone-conditioned rule can price or gate a ride by its geography but
+never select a driver-side parameter by it (see marketplace-policy.md's
+"Contract and segment resolution"). `compile_scenario`
+(`_check_zones`) rejects a box whose `max` is not strictly greater than `min`
+on both axes, warns when a box extends beyond `map_km` (a sampled point could
+then fall outside the sampling extent), and, when `world.sampling` is `grid`,
+requires a multiple of `grid_step_km` inside the box on *each* axis
+independently (sampling draws each axis separately). Overlapping zones are
+legal and undiagnosed: a point is sampled by picking a zone first, so overlap
+never double-counts, and a point on a shared edge belongs to both boxes under
+this closed-box test.
+
+`population.<role>.segments.<id>.activity` (and the same key on an explicit
+`person()`) is a `partial` map, absent by default, that gives the `weekly`
+trip generator and the `rotation` shift generator geography instead of the
+map-wide uniform draw every segment had before this mechanism existed. A
+rider's `activity` may declare `origin_zones` (weights over declared zones),
+`destination_zones` (weights *conditional on the drawn origin zone* --
+requires `origin_zones`, and every origin zone with positive weight needs a
+row), `distance_km` (a distribution; mutually exclusive with
+`destination_zones`), and `spatial_peaks` (a zone list, clock window and
+multiplier that boosts that zone's `origin_zones` weight inside the window --
+overlapping peaks combine with `max`, the same aggregation `_peak_weight`
+already uses for time-of-day surge; origins only, never destinations or
+arrival times). A driver's `activity` may declare `start_zone`. Declaring
+rider geometry while `activity.trips` is not `weekly`, or `start_zone` while
+`activity.shifts` is not `rotation`, compiles with a warning, not an error --
+the fields are simply unused by the active generator. `_check_segment_activity`
+validates every zone reference, weight sum, and (against `world.map_km`) the
+feasibility of `distance_km`'s upper bound: it must fit from the map's centre
+(`distance <= hypot(*map_km) / 2`, the worst-case origin) or compilation
+fails outright, and a warning follows if it exceeds `min(map_km)` (rejection
+sampling then discards most directions) or if `world.sampling` is `grid`
+(the drawn distance is perturbed by snapping the destination to the grid
+afterward). Trip count is never changed by any of this -- `trips_per_rider`
+remains the sole control on demand volume; geometry only changes *where* a
+trip starts and ends and, through `spatial_peaks`, *which zone it is more
+likely to start in* during a window.
+
+Realizing a trip with declared geometry draws, in order: an origin zone
+(weighted by `origin_zones`, adjusted for any matching `spatial_peaks` at
+that instant, then a point inside it); then a destination, by whichever one
+of `destination_zones` / `distance_km` / (neither) applies, redrawn while it
+equals the origin, up to 100 attempts total -- a distance-based destination
+draws its distance once and only resamples the direction on each attempt.
+Exhausting the budget is a deterministic run failure (`ScenarioError`), never
+an infinite loop; the compile-time feasibility check above exists precisely
+to make that rare. When a trip's rider (or a shift's driver) declares nothing,
+realization takes the identical, byte-for-byte unchanged map-wide
+`_sample_point` branch every scenario used before this mechanism existed --
+this is why the published `@1` presets, which declare no zones and no
+segment `activity`, produce identical seed-0 people, sessions and
+notification traces to before phase 2.
+
+## Registered generators
+
+`activity.shifts`/`activity.trips` accept a third generator kind,
+`registered`, and `population.riders`/`population.drivers` gain a
+`generator` `Choice` (`{"kind": "segments"}`, the default, or
+`{"kind": "registered", "implementation": "name@version", "parameters": {...}}`)
+alongside `count`/`segments`/`people`. Both select a trusted implementation
+by identity through a registry in `scenario.py` --
+`register_generator(family, implementation)` / `generator_class(family, id)`
+-- that mirrors `policy_runtime.register_policy`/`policy_class`'s shape,
+identity (`name@version`) and duplicate-registration rule, but lives in
+`scenario.py` rather than `policy_runtime.py`: generators are compile/prepare-time
+artifacts with no engine access, so `POLICY_FAMILIES`' hook/parameter-schema
+contract does not apply to them, and their own `parameters` are an open
+`Table(Json())` bag validated by the generator itself, not by this schema.
+Registering computes `hashlib.sha256(inspect.getsource(implementation))` once,
+at registration time; a generator whose source `inspect.getsource` cannot
+retrieve (e.g. one defined at an interactive prompt) cannot be registered,
+because there would then be nothing to hash for provenance.
+
+Call contracts, invoked with a seed-derived `random.Random` distinct per
+family and identity (`derive_seed(seed, ['activity', family, identifier])`
+for trips/shifts, `derive_seed(seed, ['population', role, identifier])` for
+population) so swapping a generator cannot silently reuse another's stream:
+
+* **trips/shifts**: `generate(*, definition, people, parameters, random) ->
+  list[dict]`. `definition` is a deep copy of `plan.resolved`, `people` a
+  deep copy of the realized population; mutating either cannot reach the
+  plan. Every returned item is validated by `_check_session` (exactly the
+  session's documented key set -- trips `{kind, id, rider, at_seconds,
+  origin, destination}`, shifts `{kind, id, driver, at_seconds,
+  shift_seconds, location}`; a known person of the right role; finite
+  times; JSON-serializable coordinates) with ids required unique only
+  within this generator's own batch (the same guarantee `explicit` items
+  get from `Keyed.check`). The produced sessions then join the built-in
+  generators' output before the existing sort and
+  `_check_realized_conflicts`, so they are covered by the same static
+  conflict checks unconditionally.
+* **population**: `generate(*, definition, role, person_ids, parameters,
+  random) -> {person_id: declaration}`. `count` still fixes the identities
+  (`role-1..role-n` in `person_ids`); the generator supplies each counted
+  id's declaration rather than inventing identities of its own -- this is
+  what keeps every compile-time cross-check that already validated against
+  `plan.person_ids` (explicit activity references, preference
+  interventions, `Inputs.reuse_for`'s controls) enforceable. The returned
+  mapping's keys must be exactly `person_ids`, reported as separate missing
+  and unexpected lists on a mismatch. Each declaration is checked with the
+  same partial `segment_fields(role, explicit=True)` schema an explicit
+  person uses, merged with its named `segment` (if any) through the same
+  `_merge_person` an explicit person goes through, and validated with the
+  same `_check_access` and `_check_segment_activity` -- so a generated
+  person has the identical shape and downstream validation, geometry
+  included, as a segment-allocated or explicit one. A registered population
+  generator only replaces segment *allocation*; `population.<role>s.people`
+  (compile-time explicit people) still layer on top of its output exactly as
+  they layer on top of segment allocation -- `plan.person_ids` already folds
+  their ids into the union regardless of generator kind, so realization must
+  too, or a compile-time-valid identity (an explicit activity reference, a
+  preference intervention target) would never be realized at `prepare()`.
+
+The manifest records identity and provenance for whichever generators are
+`registered`: `manifest()['generators']` (and `Plan.generators`) is
+`{'trips': {...}, 'shifts': {...}, 'population.rider': {...},
+'population.driver': {...}}`, each present entry
+`{'implementation': 'name@version', 'source_sha256': '...'}`. This dict
+folds into `implementation_fingerprint`, so `fingerprints['implementation']`
+and `fingerprints['plan']` change with the generator's identity *and* its
+recorded source hash, exactly like a swapped policy implementation.
+Reproducing a saved plan's fingerprint from `Scenario.load(manifest)`
+therefore requires the same generator source to be registered in the
+loading process -- the recorded hash detects that the source has drifted
+since registration, not that the generator is pure. A registered generator
+is trusted extension code exactly like a custom policy (see "Extensibility
+and limits of validation" below): one that reads the clock, a global, or an
+unseeded `random` module call can silently break `Inputs.reuse_for` and
+paired variants without its source, or its recorded hash, changing at all.
+An unknown selected identifier is a compile error
+(`activity.trips.implementation` / `activity.shifts.implementation` /
+`population.<role>s.generator.implementation`); a `registered` trips
+generator with no riders, or a `registered` population generator with
+`count == 0`, warns exactly like the built-in generators' equivalent
+no-op cases.
+
+`Inputs.explicit(plan, seed=0, *, people=None, sessions=None)` is the direct
+construction path for a throwaway fixture: a short script that wants to
+schedule a few trips or people without authoring a definition (this is the
+pre-PR-4 imperative style, restored on top of a compiled plan). Omitted
+`people`/`sessions` fall back to the plan's own `_realize_population`/
+`_realize_activity`; supplied ones are `person()`-shaped declarations (each
+needing a `role` key) or trip/shift dicts, validated through the identical
+paths a registered generator's output takes (`_merge_person`/`_check_access`/
+`_check_segment_activity`/`_realize_person` for people; `_check_session`, the
+sort, and `_check_realized_conflicts` for sessions) so a fixture's inputs
+have the same shape and the same static guarantees as a fully authored
+definition's -- a supplied person's `activity` is checked exactly like a
+segment's or an explicit person's, and, since such a person is in neither
+`plan.explicit_people` nor `plan.segments` for `_realize_activity`'s geometry
+index to find by id or by segment, its merged `activity` is threaded through
+the same `registered_activity` overlay a registered population generator's
+output uses, so a validated declaration is also the one honored at
+realization.
+There is no new `Inputs` field -- `to_dict()` and every snapshot's `inputs`
+blob keep their shape -- and no opt-out flag on `reuse_for`: preparing any
+*other* plan from these inputs' seed produces that plan's own generated
+people/sessions, which will not equal what was supplied here, so
+`reuse_for`'s existing "controlled schedules diverged despite equal
+controls" error already refuses the mismatch.
+
+`world.zones` and `population.<role>.generator` are required keys, so a
+JSON definition or saved manifest from before phase 2 fails `Scenario.load`
+with `world.zones: missing required setting` (and the same for
+`population.riders.generator` / `population.drivers.generator`); add
+`"zones": {}` and `"generator": {"kind": "segments"}` to migrate it, the
+same precedent `notes` set in phase 1. `world`/`population`/`activity` all
+remain inside `controls` (`compile_scenario` builds `controls` from exactly
+those three sections), so `fingerprints['controls']`/`['definition']` change
+for every scenario with this phase's schema addition -- expected, since
+geometry and a generator's identity genuinely are controlled inputs: they
+change realized sessions, so two variants that differ only in zones or a
+generator selection must not share prepared inputs through `Inputs.reuse_for`.
 
 Phase 3 must support compiling a definition and executing a single seeded scenario
 through the existing `Simulation` orchestration. It must not depend on the phase 4
@@ -139,6 +385,58 @@ Support explicit people/cars for small deterministic scenarios and seeded
 generators for scale. Person IDs and exogenous intent IDs must be stable across
 paired variants; do not derive them from later order creation sequence.
 
+`world.map_km` is a sampling extent for the generators (`_sample_point`'s grid
+or continuous draw), not a physical fence: the engine never rejects or clips a
+coordinate outside it, so an explicit trip or shift can name a point beyond
+`map_km` on purpose; the same is true of `world.zones` (see "Geography" above)
+-- a declared zone shapes only what a generator can reference, never what the
+engine accepts. `population.<role>.segments`/`people` never carry *trip
+identity or realized coordinates* -- `origin`/`destination` themselves are
+still exogenous per-trip values that only `activity.trips` (built-in or
+registered) produces -- but, since phase 2, a segment or explicit person
+**may** carry an `activity` geometry *preference* (`origin_zones`,
+`destination_zones`, `distance_km`, `spatial_peaks`, `start_zone`) that
+biases where the `weekly`/`rotation` generators draw from; a segment still
+never authors a coordinate directly. Replacing `platforms.<id>` (a full
+`Table` entry, via `with_changes` or `platform()`)
+requires every policy parameter, the same as any other complete preset value;
+a `policy_change` intervention instead **merges** onto the platform's current
+policy, so it can move just the fields it names. A rider, driver or evolution
+policy implementation's trait schema must still subclass the shipped
+`RiderTraits`/`DriverTraits`/`EvolutionTraits` dataclasses
+(`policy_runtime.register_policy`'s `issubclass` check enforces this), but
+(AST-209; this was a known trap through phase 4) it need not be exactly
+`RiderTraits`/`DriverTraits`/`EvolutionTraits`: population segments, explicit
+people and behavior defaults resolve each family's trait schema from the
+*selected* implementation's own declaration (`trait_schema(implementations,
+family)`, consulted everywhere `TRAITS[family]` used to be assumed -- population
+segment/person schemas, `_check_access`, `_realize_person`, and profile
+(re)construction in `_profile`/`load_profile`), not from a fixed `@1` table.
+`rider_search@2`/`driver_participation@2`/`personal_evolution@2`
+(behavior-policy.md's "Participant policies v2") are the first implementations
+to exercise this: their additive traits (e.g. `choice_rule`,
+`response_rule`, `install_trigger_peer_share`) are authorable through a
+segment or an explicit person exactly like an `@1` trait, once
+`behavior.<family>.implementation` names the `@2` version. Because the
+trait schema lives in a different part of the definition tree than
+`behavior.<family>.implementation`, and `Spec.check`/`Spec.descend` have no
+document context to consult it from, the whole scenario spec is a cached
+factory, `scenario_spec(implementations)`, keyed by the selected
+rider/driver/evolution identifiers; `Scenario.resolve()` pre-scans `self
+.base()` and any `('set', ...)` change touching `behavior` for that
+selection *before* the first `spec.check`, defensively (a malformed or
+unregistered id is silently ignored at that point -- the ordinary
+`Implementation.check` against the resulting spec then reports it at its
+exact path, same as today), and uses the resulting `scenario_spec(selection)`
+for both `check` calls, for `leaves`, and for every `('set'|'add'|'remove',
+path, ...)` change. With every shipped preset's all-`@1` selection this is
+structurally identical to the single tree every earlier release built once
+at import; that all-`@1` tree is kept, as the module-level `SCENARIO`, for
+`diff_plans` and the typed builders below, none of which resolves a trait
+schema. `Implementation.schema_for` (used for `behavior.<family>.parameters`
+itself) already resolved from the declaration before this change; this
+closes the same gap for population segments and explicit people.
+
 Validate all seven nonempty rider/driver app combinations, conditional preferred
 apps, car registration sets, and one-car-per-driver initial bindings. People and
 cars each retain at least one membership. Active participants must have usable
@@ -172,6 +470,35 @@ Interventions specify simulated time, target, operation, and policy/cohort
 identity. Validate windows and conflicting explicit writes to the same property
 at the same time. Use half-open tariff/campaign windows, with effective policy
 lookup at the decision time rather than depending on event insertion order.
+`INTERVENTION_ORDER` fixes same-time application order: `launch` (0), then
+(phase 4) `regulation` (1), then `policy` (2), then `preference` (3) -- a
+regulation always takes effect before any same-instant policy compliance
+update, matching plan section 5.2's "regulation first, compliance follows".
+
+`regulation(id, *, at_hours, max_base_fare_minor=None, max_per_km_minor=None,
+max_commission_fraction=None)` (phase 4) schedules a market-wide
+`marketplace_engine.Regulation` (see marketplace-engine.md): `compile_scenario`
+requires at least one cap and the two fare caps jointly set or jointly
+absent; its conflict key is `(at_seconds, "regulation")` (there is only one
+regulation state, not one per platform, so two regulation interventions at
+the same instant always conflict regardless of their caps). It carries no
+platform and posts no notification -- enforcement and reporting are
+`marketplace_engine.py`'s (the caps) and `PolicyRuntime`'s
+(`command_result: regulation_rejected`), never a disclosed intervention.
+
+A `policy_change` (`policy` kind) whose `platform` is the literal string
+`"*"` expands, after every intervention is otherwise resolved (so a same-time
+`launch` intervention is already reflected), to one entry per platform
+already launched by that instant (`launched_at[pid] is not None and
+launched_at[pid] <= at`) -- each expansion merges against *that platform's
+own* current policy, not a shared template, with id `f"{id}-{pid}"`;
+selecting no platform is a compile error. A `policy` intervention, wildcard
+or not, may not change `guarantee_window_seconds`: that cadence is scheduled
+once, from the platform's own launch-time policy, in `Simulation.__init__`
+(`PolicyRuntime.schedule_program_windows`, never from `restore`, where the
+pending window-close event is already in the scheduler snapshot), so a
+later change would silently desynchronize the schedule from the parameter --
+`compile_scenario` rejects it outright instead.
 
 At a learning checkpoint, apply due explicit interventions first, take a common
 population snapshot, compute behavioral updates, then apply them together. This
@@ -182,6 +509,76 @@ Changes affect the next permitted decision. They do not reprice accepted terms,
 teleport entities, clear a queue, or interrupt a passenger ride. A driver app
 download and car registration remain separately validated and logged even when
 one onboarding policy coordinates them.
+
+## Physical engine extensions (AST-210)
+
+Plan section 4.G. Every setting below defaults to off (`None`/`{}`/empty), so an
+existing scenario's resolved definition keeps the same *values*; only its
+*shape* grows, exactly the `starting_cash_minor` precedent above --
+`platforms.<id>.insolvency` and `platforms.<id>.dividend` are new required
+(nullable) keys on the already-complete `PLATFORM` map, so a scenario dict or
+saved manifest from before this phase fails `Scenario.load`/`from_definition`
+with `platforms.<id>.insolvency: missing required setting` (and the same for
+`dividend`); add `"insolvency": null, "dividend": null` per platform to
+migrate. `world.speed_zones` and `evolution.ledger` are the same class of
+addition to `world` and `evolution`.
+
+`world.speed_zones` (`Table(Scalar('number', positive=True))`, zone id to
+multiplier, default `{}`) is a *permanent* per-zone speed multiplier in force
+for the whole run, applied once at `t=0` (`Plan.speed_zones` resolves each
+entry against `Plan.zones` into `{'min', 'max', 'multiplier'}`, sorted by zone
+id; `Simulation.__init__` feeds each into `engine.impose_delay(..., duration_seconds=None)`
+-- see marketplace-engine.md "Delays"). `_check_zones` rejects an unknown zone
+id at `world.speed_zones.<zid>` and warns when a multiplier is `1` ("has no
+effect").
+
+The `shutdown` intervention (`Map({'id', 'at_hours', 'platform'})`,
+`INTERVENTION_ORDER['shutdown'] = 4`) retires one platform at a simulated
+time -- `shutdown(id, *, at_hours, platform)` builds it; `compile_scenario`
+rejects an unknown platform and, once every intervention's `launched_at` is
+resolved, warns (not errors: "nothing to shut down" is legal) when the target
+never launches. The `delay` intervention (`Map({'id', 'at_hours', 'zone',
+'box', 'multiplier', 'duration_hours'})`, `INTERVENTION_ORDER['delay'] = 5`)
+imposes a *temporary* speed multiplier -- `delay(id, *, at_hours, multiplier,
+zone=None, box=None, duration_hours=None)` requires exactly one of `zone`/`box`
+(a compile error otherwise); a named `zone` is resolved to its box at compile
+time (the same `_resolve_service_area` precedent used elsewhere), so the
+runtime never consults the zone table for a delay. Both kinds join the
+same-time/same-target `seen` dedupe that already covers `launch`/`policy`/
+`regulation`/`preference`: `shutdown`'s target is `(at_seconds, 'shutdown',
+platform)`; `delay`'s is `(at_seconds, 'delay', id)` -- keyed by the
+intervention's own id, not a target, because several delays (different zones
+or boxes) may legitimately coexist at one instant.
+
+`platforms.<id>.insolvency` (`Scalar('string', choices=('shutdown',),
+nullable=True)`, default `None`) and `platforms.<id>.dividend`
+(`Map({'reserve_minor', 'period_hours', 'min_completed_rides'}, nullable=True)`,
+default `None`) are both authored through `platform(id, *, insolvency=None,
+dividend=None, **parameters)`. Either one without a tracked
+`starting_cash_minor` is a compile error ("needs a tracked cash balance
+(starting_cash_minor)") -- both need a real balance to test or pay from,
+never an untracked (`None`) one. A `dividend.period_hours * HOUR` exceeding
+the horizon warns ("no dividend period closes within the horizon"); see
+marketplace-engine.md "Insolvency" for what `insolvency='shutdown'` actually
+does at runtime.
+
+`evolution.ledger` (`Map({'driver_lease_minor', 'lease_hours',
+'driver_bankruptcy_minor'}, nullable=True)`, default `None`) schedules a
+recurring, market-wide (not per-platform) driver lease posting: every
+`lease_hours`, `driver_lease_minor` (an integer `>= 0`) posts an external
+`lease` `Transfer` debiting every not-yet-deactivated driver, and, when
+`driver_bankruptcy_minor` is set, deactivates (`marketplace_engine
+.deactivate_driver`, reason `"bankruptcy"`) any driver whose account balance
+is then below it -- the lease cadence *is* the bankruptcy posting cadence, so
+`compile_scenario` requires `lease_hours` whenever `driver_lease_minor > 0` or
+`driver_bankruptcy_minor` is set (two separate errors, both naming
+`evolution.ledger.lease_hours`), and warns when `lease_hours * HOUR` exceeds
+the horizon ("no lease posting occurs within the horizon"). `Plan.ledger`
+converts `lease_hours` to `lease_seconds` (the `controller` precedent), so
+`main.py` schedules `PolicyRuntime.schedule_ledger` with no further unit math;
+all of a ledger's or a dividend's configuration travels in the scheduled
+event's own payload, never through `PolicyRuntime.snapshot()`, so a restored
+run continues the whole recurring schedule from the scheduler snapshot alone.
 
 ## Compiler pipeline and output
 

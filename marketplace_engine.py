@@ -35,10 +35,23 @@ SNAPSHOT_SCHEMA_VERSION = 2
 ROLES = ("rider", "driver")
 CANCELLATION_PARTIES = ("rider", "driver", "platform")
 OFFER_DISPOSITIONS = ("accepted", "rejected", "expired", "canceled", "acceptance_failed")
+TRANSFER_REASONS = ("driver_penalty", "guarantee_topup", "lease", "dividend", "operating_cost", "grant")
+TRANSFER_COUNTERPARTIES = ("platform", "external")
+ACCOUNT_ROLES = ("platform", "driver", "rider")
 
 
 class CommandRejected(ValueError):
     """A command violated access, lifecycle, or value rules. Nothing changed."""
+
+
+class RegulationRejected(CommandRejected):
+    """A command violated the in-force Regulation's cap. Nothing changed.
+
+    A subclass of CommandRejected, so nothing that catches the broad
+    exception changes behavior; the runtime catches exactly this one to
+    report command_result: regulation_rejected instead of the generic
+    offer_unavailable/crash path (plans/architecture/marketplace-engine.md).
+    """
 
 
 # ----------------------------------------------------------------------
@@ -58,10 +71,14 @@ def point(value, name="point"):
 
 
 def minor_units(value, name, minimum=0):
-    """An integer amount of minor currency units (cents), never a float."""
+    """An integer amount of minor currency units (cents), never a float.
+
+    minimum=None accepts any sign (a Transfer's signed amount_minor); every
+    existing caller passes the default 0, so their behavior is unchanged.
+    """
     if isinstance(value, bool) or not isinstance(value, int):
         raise CommandRejected(f"{name} must be an integer number of minor currency units")
-    if value < minimum:
+    if minimum is not None and value < minimum:
         raise CommandRejected(f"{name} must be at least {minimum}")
     return value
 
@@ -180,6 +197,27 @@ class Platform:
     launched: bool = True
     open_driver_ids: set = field(default_factory=set)
     open_rider_ids: set = field(default_factory=set)
+    starting_cash_minor: Optional[int] = None  # seeds the platform's cash account; None = not tracked
+    insolvency: Optional[str] = None  # None | "shutdown" (AST-210): shut down when tracked cash reaches zero
+
+
+@dataclass(frozen=True)
+class Regulation:
+    """A market-wide price/commission cap, effective from `at` until superseded.
+
+    Enforced by the engine (issue_quote/create_offer) and visible to every
+    platform equally; a platform's compliance is its own scheduled
+    policy_change (plan section 5.2). Records accumulate in
+    MarketplaceEngine.regulations, each with a fresh id and at = now, so the
+    record with the greatest id is always the one in force (see the
+    `regulation` property) -- restore needs no cached "current" pointer.
+    """
+
+    id: int
+    at: float
+    max_base_fare_minor: Optional[int] = None
+    max_per_km_minor: Optional[int] = None
+    max_commission_fraction: Optional[float] = None
 
 
 @dataclass
@@ -212,6 +250,10 @@ class Driver:
     commitments: list = field(default_factory=list)  # accepted order ids in service order
     service_id: Optional[int] = None  # the physical service currently performed
     accounts: set = field(default_factory=set)
+    paused_apps: set = field(default_factory=set)  # subset of open_apps: open for commitments, not accepting
+    relocation_id: Optional[int] = None  # AST-210: the live Relocation, if any
+    deactivated_at: Optional[float] = None  # AST-210: set once; refuses any later start_shift
+    deactivation_reason: Optional[str] = None
 
 
 @dataclass
@@ -241,6 +283,7 @@ class TripIntent:
     ended_at: Optional[float] = None
     outcome: Optional[str] = None  # completed or abandoned
     reason: Optional[str] = None
+    source_id: Optional[str] = None  # the scenario session that started this intent, if any
 
     @property
     def live(self):
@@ -262,6 +305,8 @@ class Quote:
     policy_version: str
     selected_rule: str
     campaign_id: Optional[str] = None
+    commission_fraction: Optional[float] = None  # binds the offer-time commission when not None
+    driver_surcharge_minor: int = 0  # commission-exempt flat share of a surcharge folded into gross_minor
 
     @property
     def drivers_available(self):
@@ -364,6 +409,38 @@ class Service:
     end_position: Optional[tuple] = None
 
 
+@dataclass
+class Relocation:
+    """A service-free repositioning move (AST-210): no order, no settlement, no platform.
+
+    `legs` mirrors `Service.legs` -- append-only, exactly one `Leg(kind="reposition", ...)` -- so
+    `metrics.driver_distance`'s cohorting rule (identity, never a time filter) applies unchanged.
+    `end_reason` is one of "arrived" (reached destination), "interrupted" (an accepted order
+    started pickup from wherever the car actually was), "shift_ended", or "deactivated".
+    """
+    id: int
+    driver_id: Any
+    car_id: Any
+    started_at: float
+    legs: list = field(default_factory=list)
+    ended_at: Optional[float] = None
+    end_reason: Optional[str] = None
+    end_position: Optional[tuple] = None
+
+
+@dataclass(frozen=True)
+class SpeedZone:
+    """A closed box whose speed multiplier applies to legs BEGINNING inside it while active
+    (AST-210). A static `world.speed_zones` entry has no end time; a `delay` intervention sets
+    `ends_at`. A leg already in progress keeps its planned end -- `_begin_leg` computes it once."""
+    id: int
+    at: float
+    min: tuple
+    max: tuple
+    multiplier: float
+    ends_at: Optional[float] = None  # None = until the run ends
+
+
 @dataclass(frozen=True)
 class Settlement:
     id: int
@@ -376,6 +453,54 @@ class Settlement:
     rider_payment_minor: int
     driver_payout_minor: int
     platform_contribution_minor: int  # the residual, so conservation is exact
+    bonus_minor: int = 0  # the accepted offer's bonus on completed_ride; 0 on cancellation_fee
+
+
+@dataclass(frozen=True)
+class Transfer:
+    """Money moved outside a ride. amount_minor is signed: positive credits the person.
+
+    A platform counterparty debits that platform's account by the same
+    amount (party deltas sum to zero); an external counterparty (lease,
+    operating cost) has no platform side, so the person's delta alone IS the
+    declared external amount. reason is one of TRANSFER_REASONS; role/person_id
+    name the credited or debited rider or driver.
+    """
+    id: int
+    at: float
+    reason: str
+    platform_id: Optional[str]     # None for an external counterparty
+    role: str                      # rider or driver
+    person_id: Any
+    amount_minor: int              # signed, never zero
+    order_id: Optional[int] = None
+    program_id: Optional[str] = None
+    counterparty: str = "platform"  # platform or external
+
+
+@dataclass
+class Account:
+    """A money balance the engine derives from settlements and transfers.
+
+    Keyed by (role, id) in MarketplaceEngine.accounts -- unrelated to a
+    person's platform *app* accounts (Driver.accounts/Rider.accounts,
+    activate_account), which are membership, not money. opening_minor is
+    None for a platform with no starting_cash_minor: settlement_minor and
+    transfer_minor still accumulate (so a ledger can report contribution and
+    transfers), but there is no absolute cash figure, so balance_minor is
+    None too. restore() always rebuilds this from the tables (_rebuild_accounts),
+    never from a snapshot's stored totals, so a restored run's own balances
+    are proof of conservation, not an assumption.
+    """
+    role: str            # platform, driver or rider
+    id: Any
+    opening_minor: Optional[int] = 0
+    settlement_minor: int = 0
+    transfer_minor: int = 0
+
+    @property
+    def balance_minor(self):
+        return None if self.opening_minor is None else self.opening_minor + self.settlement_minor + self.transfer_minor
 
 
 @dataclass(frozen=True)
@@ -445,9 +570,12 @@ class PlatformView:
             yield DriverPresence(
                 driver_id,
                 cars[driver.car_id].motion.position_at(now),
-                # An open app already implies a shift, a registered car, and a
-                # launched platform; only an exit request withdraws the driver.
-                shifts[driver.shift_id].exit_requested_at is None,
+                # An open app already implies a shift, a registered car, and a launched platform;
+                # an exit request withdraws the driver, and a paused app (pause_app) withdraws it
+                # from this platform specifically while commitments survive. `not driver.paused_apps`
+                # short-circuits the common (empty) case without a membership test.
+                shifts[driver.shift_id].exit_requested_at is None
+                and (not driver.paused_apps or platform_id not in driver.paused_apps),
                 tuple(order_id for order_id in commitments
                       if orders[order_id].platform_id == platform_id) if commitments else (),
                 tuple(offer_id for offer_id in pending
@@ -503,6 +631,23 @@ class CommitmentView:
     payout_minor: int
 
 
+@dataclass(frozen=True)
+class PendingOfferView:
+    """One of this driver's unresolved offers, as the driver's own app would show it -- pickup and
+    destination are already disclosed by the `offer_received` notification, so this adds no
+    information (behavior_policy.py driver_participation@2)."""
+    offer_id: int
+    platform_id: str
+    order_id: int
+    created_at: float
+    expires_at: float
+    payout_minor: int
+    bonus_minor: int
+    eta_seconds: Optional[float]
+    pickup: tuple
+    destination: tuple
+
+
 class DriverView:
     """What a driver knows: their own position, shift, apps, and cross-app work."""
 
@@ -547,8 +692,19 @@ class DriverView:
         return result
 
     def pending_offers(self):
-        return [freeze(self._engine.offers[offer_id])
-                for offer_id in self._engine._pending_offers_to_driver(self.driver_id)]
+        """This driver's unresolved offers, ordered by offer id. Ordering is explicit because
+        `_pending_by_driver` is a set, whose iteration order a snapshot/restore cycle can change; a
+        policy comparing pending offers (driver_participation@2 response_rule='best_pending') must
+        see the same order either way, or a restored run's tie-break could disagree with the
+        continuous one."""
+        result = []
+        for offer_id in sorted(self._engine._pending_offers_to_driver(self.driver_id)):
+            offer = self._engine.offers[offer_id]
+            order = self._engine.orders[offer.order_id]
+            result.append(PendingOfferView(offer.id, offer.platform_id, offer.order_id, offer.created_at,
+                                           offer.expires_at, offer.payout.payout_minor, offer.payout.bonus_minor,
+                                           offer.eta_seconds, order.pickup, order.destination))
+        return result
 
 
 class RiderView:
@@ -595,7 +751,7 @@ class MarketplaceEngine:
     listeners reacting with further commands always see a consistent market.
     """
 
-    EVENT_KINDS = ("offer.expire", "service.advance")
+    EVENT_KINDS = ("offer.expire", "service.advance", "relocation.advance", "platform.insolvency")
 
     def __init__(self, world, registry):
         self.world = world
@@ -603,6 +759,8 @@ class MarketplaceEngine:
         self.scheduler = None
         registry.register("offer.expire", self._on_offer_expiry)
         registry.register("service.advance", self._on_service_advance)
+        registry.register("relocation.advance", self._on_relocation_advance)
+        registry.register("platform.insolvency", self._on_platform_insolvency)
         self.platforms = {}
         self.riders = {}
         self.drivers = {}
@@ -613,11 +771,17 @@ class MarketplaceEngine:
         self.orders = {}
         self.offers = {}
         self.services = {}
+        self.relocations = {}
         self.settlements = {}
+        self.transfers = {}
+        self.regulations = {}
+        self.speed_zones = {}
         self._sequences = {
             name: itertools.count(1)
-            for name in ("shift", "intent", "quote", "order", "offer", "service", "settlement")
+            for name in ("shift", "intent", "quote", "order", "offer", "service", "relocation", "settlement",
+                        "transfer", "regulation", "speed_zone")
         }
+        self.accounts = {}  # (role, id) -> Account; derived, never decoded from a snapshot (see restore())
         self._pending_by_order = {}  # order id -> set of pending offer ids
         self._pending_by_driver = {}  # driver id -> set of pending offer ids
         self._listeners = []
@@ -671,10 +835,18 @@ class MarketplaceEngine:
     # Population and access
     # ----------------------------------------------------------------------
 
-    def add_platform(self, platform_id, name=None, launched=True):
+    def add_platform(self, platform_id, name=None, launched=True, *, starting_cash_minor=None, insolvency=None):
         if platform_id in self.platforms:
             raise CommandRejected(f"Platform {platform_id!r} already exists")
-        self.platforms[platform_id] = Platform(platform_id, name or platform_id, launched)
+        if starting_cash_minor is not None:
+            minor_units(starting_cash_minor, "starting_cash_minor")
+        if insolvency not in (None, "shutdown"):
+            raise CommandRejected("insolvency must be None or 'shutdown'")
+        if insolvency is not None and starting_cash_minor is None:
+            raise CommandRejected("insolvency requires a tracked starting_cash_minor")
+        self.platforms[platform_id] = Platform(platform_id, name or platform_id, launched,
+                                                starting_cash_minor=starting_cash_minor, insolvency=insolvency)
+        self._open_account("platform", platform_id, starting_cash_minor)
         return self.platforms[platform_id]
 
     def launch_platform(self, platform_id):
@@ -698,6 +870,7 @@ class MarketplaceEngine:
             raise CommandRejected('Accounts require installed apps')
         car.driver_id = driver_id
         self.drivers[driver_id] = driver
+        self._open_account("driver", driver_id, 0)
         return driver
 
     def add_rider(self, rider_id, apps, location=None, *, accounts=None):
@@ -709,6 +882,7 @@ class MarketplaceEngine:
         if not rider.accounts <= rider.apps:
             raise CommandRejected('Accounts require installed apps')
         self.riders[rider_id] = rider
+        self._open_account("rider", rider_id, 0)
         return rider
 
     def install_app(self, role, person_id, platform_id):
@@ -741,6 +915,8 @@ class MarketplaceEngine:
     def start_shift(self, driver_id, location):
         driver = self._driver(driver_id)
         location = point(location, "Location")
+        if driver.deactivated_at is not None:
+            raise CommandRejected(f"Driver {driver_id!r} was deactivated ({driver.deactivation_reason})")
         if driver.shift_id is not None:
             raise CommandRejected(f"Driver {driver_id!r} is already on shift")
         with self._transition():
@@ -773,6 +949,8 @@ class MarketplaceEngine:
         return shift
 
     def _finish_shift(self, driver, shift):
+        if driver.relocation_id is not None:
+            self._end_relocation(self.relocations[driver.relocation_id], "shift_ended")
         assert driver.service_id is None and not driver.commitments
         shift.ended_at = self.now
         driver.shift_id = None
@@ -780,6 +958,7 @@ class MarketplaceEngine:
             self.platforms[platform_id].open_driver_ids.discard(driver.id)
             self._notify("platform", platform_id, "driver_app_closed", driver_id=driver.id)
         driver.open_apps.clear()
+        driver.paused_apps.clear()
         self._notify("driver", driver.id, "shift_ended", shift_id=shift.id,
                      location=self.position_of("driver", driver.id))
 
@@ -821,6 +1000,7 @@ class MarketplaceEngine:
             person.open_apps.discard(platform_id)
             if role == "driver":
                 platform.open_driver_ids.discard(person_id)
+                person.paused_apps.discard(platform_id)  # closing clears a pause; a later re-open is not silently paused
                 for offer_id in list(self._pending_offers_to_driver(person_id)):
                     offer = self.offers[offer_id]
                     if offer.platform_id == platform_id:
@@ -830,28 +1010,130 @@ class MarketplaceEngine:
                 platform.open_rider_ids.discard(person_id)
                 self._notify("platform", platform_id, "rider_app_closed", rider_id=person_id)
 
+    def pause_app(self, driver_id, platform_id):
+        """Stop accepting on one open app without closing it: commitments, and the obligation to
+        serve them, survive. Pending offers on that platform close as canceled, exactly as
+        close_app does. Participant-side answer to plan section 5's competitor-occupancy
+        boundary (behavior_policy.DriverTraitsV2.availability)."""
+        driver = self._driver(driver_id)
+        self._platform(platform_id)
+        if platform_id not in driver.open_apps:
+            raise CommandRejected(f"Driver {driver_id!r} does not have {platform_id!r} open")
+        if platform_id in driver.paused_apps:
+            return
+        with self._transition():
+            driver.paused_apps.add(platform_id)
+            for offer_id in list(self._pending_offers_to_driver(driver_id)):
+                offer = self.offers[offer_id]
+                if offer.platform_id == platform_id:
+                    self._resolve_offer(offer, "canceled", "driver_unavailable")
+            self._notify("platform", platform_id, "driver_availability",
+                         driver_id=driver_id, accepting=False)
+
+    def resume_app(self, driver_id, platform_id):
+        """Resume accepting on a paused app. Publishes the *computed* availability, so resuming
+        while an exit is requested (or another reason the driver would not actually be accepting)
+        does not announce a driver as accepting."""
+        driver = self._driver(driver_id)
+        self._platform(platform_id)
+        if platform_id not in driver.paused_apps:
+            return
+        with self._transition():
+            driver.paused_apps.discard(platform_id)
+            self._notify("platform", platform_id, "driver_availability", driver_id=driver_id,
+                         accepting=self._driver_accepting(driver, platform_id))
+
     def _driver_accepting(self, driver, platform_id):
         shift = self.shifts.get(driver.shift_id)
         return (
             shift is not None and shift.exit_requested_at is None
-            and platform_id in driver.open_apps and platform_id in driver.accounts
+            and platform_id in driver.open_apps and platform_id not in driver.paused_apps
+            and platform_id in driver.accounts
             and platform_id in self.cars[driver.car_id].registrations
             and self.platforms[platform_id].launched
         )
+
+    def deactivate_driver(self, driver_id, reason):
+        """Permanently retire a driver (AST-210): every not-yet-boarded commitment is canceled, a
+        boarded ride finishes on frozen terms, and any later `start_shift` is refused. Reuses
+        `end_shift` for the presence side (exit request, pending-offer sweep, `driver_availability`
+        notifications, and the eventual `_finish_shift` once commitments drain) so a boarded ride's
+        own drop-off closes the apps exactly as an ordinary shift end would. Idempotent --
+        deactivating an already-deactivated driver changes nothing and notifies nothing."""
+        driver = self._driver(driver_id)
+        if driver.deactivated_at is not None:
+            return driver
+        if not isinstance(reason, str) or not reason:
+            raise CommandRejected("A deactivation needs a reason")
+        with self._transition():
+            driver.deactivated_at = self.now
+            driver.deactivation_reason = reason
+            if driver.relocation_id is not None:
+                self._end_relocation(self.relocations[driver.relocation_id], "deactivated")
+            if driver.shift_id is not None:
+                self.end_shift(driver_id)
+            for order_id in list(driver.commitments):
+                order = self.orders[order_id]
+                service = self.services.get(order.service_id)
+                if service is not None and service.ended_at is None and service.phase == "transport":
+                    continue  # an onboard ride completes first, on frozen terms
+                self.cancel_order(order_id, "driver", "driver_deactivated")
+            self._notify("driver", driver_id, "driver_deactivated", reason=reason,
+                         remaining_commitments=len(driver.commitments))
+        return driver
+
+    # ----------------------------------------------------------------------
+    # Regulation
+    # ----------------------------------------------------------------------
+
+    @property
+    def regulation(self):
+        """The Regulation currently in force, or None. Nothing is cached: restore needs only the table."""
+        return self.regulations[max(self.regulations)] if self.regulations else None
+
+    def impose_regulation(self, max_base_fare_minor=None, max_per_km_minor=None, max_commission_fraction=None):
+        """A market-wide price/commission cap, effective immediately and until superseded.
+
+        No notification: regulation is engine-enforced and public by
+        construction (every platform's issue_quote/create_offer is bound by
+        it equally); a platform's compliance is its own scheduled
+        policy_change, audited through command_result: regulation_rejected
+        rather than a disclosed intervention (plan section 5.2).
+        """
+        if max_base_fare_minor is None and max_per_km_minor is None and max_commission_fraction is None:
+            raise CommandRejected("A regulation needs at least one cap")
+        if (max_base_fare_minor is None) != (max_per_km_minor is None):
+            raise CommandRejected("max_base_fare_minor and max_per_km_minor must be set together")
+        if max_base_fare_minor is not None:
+            minor_units(max_base_fare_minor, "max_base_fare_minor")
+            minor_units(max_per_km_minor, "max_per_km_minor")
+        if max_commission_fraction is not None:
+            finite(max_commission_fraction, "max_commission_fraction", minimum=0)
+            if max_commission_fraction > 1:
+                raise CommandRejected("max_commission_fraction must be at most 1")
+        with self._transition():
+            record = Regulation(self._next_id("regulation"), self.now, max_base_fare_minor,
+                                max_per_km_minor, max_commission_fraction)
+            self.regulations[record.id] = record
+        return record
 
     # ----------------------------------------------------------------------
     # Trip intents, quotes, and orders
     # ----------------------------------------------------------------------
 
-    def begin_intent(self, rider_id, origin, destination):
+    def begin_intent(self, rider_id, origin, destination, source_id=None):
+        """source_id is scenario metadata (which session started this intent), not a rider observation:
+        it is not disclosed in the intent_started notification."""
         rider = self._rider(rider_id)
         origin, destination = point(origin, "Origin"), point(destination, "Destination")
+        if not (source_id is None or (isinstance(source_id, str) and source_id)):
+            raise CommandRejected("source_id must be a nonempty string or None")
         if rider.intent_id is not None:
             raise CommandRejected(f"Rider {rider_id!r} already has a live trip intent")
         if rider.service_id is not None:
             raise CommandRejected(f"Rider {rider_id!r} is onboard a ride")
         with self._transition():
-            intent = TripIntent(self._next_id("intent"), rider_id, origin, destination, self.now)
+            intent = TripIntent(self._next_id("intent"), rider_id, origin, destination, self.now, source_id=source_id)
             self.intents[intent.id] = intent
             rider.intent_id = intent.id
             rider.location = origin
@@ -879,8 +1161,17 @@ class MarketplaceEngine:
 
     def issue_quote(self, platform_id, intent_id, gross_minor, discount_minor=0, *,
                     distance_km, duration_seconds, eta_seconds, expires_at,
-                    policy_version='direct-v1', selected_rule='default', campaign_id=None):
-        """A platform's frozen price and supply estimate for a rider's request."""
+                    policy_version='direct-v1', selected_rule='default', campaign_id=None,
+                    commission_fraction=None, driver_surcharge_minor=0):
+        """A platform's frozen price and supply estimate for a rider's request.
+
+        commission_fraction, when not None, binds the offer-time commission
+        to this quote (MarketplaceParameters.commission_binding='quote');
+        driver_surcharge_minor is the flat, commission-exempt share of a
+        surcharge already folded into gross_minor, added back to the driver
+        payout at offer time (see dispatch/create_offer and
+        plans/architecture/marketplace-policy.md).
+        """
         platform = self._platform(platform_id)
         intent = self._intent(intent_id)
         rider = self.riders[intent.rider_id]
@@ -891,16 +1182,30 @@ class MarketplaceEngine:
         finite(distance_km, "distance_km", minimum=0)
         finite(duration_seconds, "duration_seconds", minimum=0)
         finite(eta_seconds, "eta_seconds", minimum=0, allow_none=True)
+        minor_units(driver_surcharge_minor, "driver_surcharge_minor")
+        if commission_fraction is not None:
+            finite(commission_fraction, "commission_fraction", minimum=0)
+            if commission_fraction > 1:
+                raise CommandRejected("commission_fraction must be at most 1")
         if not platform.launched:
             raise CommandRejected(f"Platform {platform_id!r} has not launched")
         if platform_id not in rider.open_apps:
             raise CommandRejected(f"Rider {rider.id!r} does not have {platform_id!r} open")
         if not intent.live:
             raise CommandRejected(f"Trip intent {intent_id} has ended")
+        reg = self.regulation
+        if reg is not None and reg.max_base_fare_minor is not None:
+            cap_minor = int((Decimal(reg.max_base_fare_minor)
+                             + Decimal(reg.max_per_km_minor) * Decimal(str(distance_km))
+                             ).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+            if gross_minor > cap_minor:
+                raise RegulationRejected(
+                    f"gross_minor {gross_minor} exceeds the in-force regulation cap {cap_minor} "
+                    f"for {distance_km:g} km")
         with self._transition():
             quote = Quote(self._next_id("quote"), platform_id, intent_id, rider.id, self.now,
                           fare, distance_km, duration_seconds, eta_seconds, expires_at,
-                          policy_version, selected_rule, campaign_id)
+                          policy_version, selected_rule, campaign_id, commission_fraction, driver_surcharge_minor)
             self.quotes[quote.id] = quote
             intent.quote_ids.append(quote.id)
             self._notify("rider", rider.id, "quote_received", quote_id=quote.id,
@@ -967,6 +1272,15 @@ class MarketplaceEngine:
         for offer_id in self._pending_by_order.get(order_id, ()):
             if self.offers[offer_id].driver_id == driver_id:
                 raise CommandRejected(f"Driver {driver_id!r} already has a pending offer for order {order_id}")
+        reg = self.regulation
+        if reg is not None and reg.max_commission_fraction is not None:
+            floor_minor = int((Decimal(order.fare.gross_minor)
+                               * (Decimal(1) - Decimal(str(reg.max_commission_fraction)))
+                               ).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+            if payout.payout_minor < floor_minor:
+                raise RegulationRejected(
+                    f"payout_minor {payout.payout_minor} is below the in-force regulation floor {floor_minor} "
+                    f"(commission cap {reg.max_commission_fraction:g})")
         with self._transition():
             offer = Offer(self._next_id("offer"), platform_id, order_id, driver_id, self.now,
                           expires_at, payout, eta_seconds, policy_version=policy_version,
@@ -1088,6 +1402,10 @@ class MarketplaceEngine:
         driver = self.drivers[order.assignment.driver_id]
         car = self.cars[driver.car_id]
         assert driver.service_id is None and driver.commitments[0] == order.id
+        if driver.relocation_id is not None:
+            # An accepted order interrupts a live reposition: pickup starts from wherever the car
+            # actually was (the position_at read below), never the relocation's planned destination.
+            self._end_relocation(self.relocations[driver.relocation_id], "interrupted")
         origin = car.motion.position_at(self.now)
         service = Service(self._next_id("service"), order.id, order.platform_id, driver.id,
                           car.id, order.rider_id, self.now)
@@ -1103,7 +1421,7 @@ class MarketplaceEngine:
         if kind == "boarding":
             duration = self.world.boarding_seconds
         else:
-            duration = self.world.travel_seconds(math.dist(origin, destination))
+            duration = self.travel_seconds(math.dist(origin, destination), origin)
         leg = Leg(kind, origin, destination, self.now, self.now + duration)
         service.legs.append(leg)
         self.cars[service.car_id].motion = Motion(origin, destination, self.now, self.now + duration)
@@ -1165,7 +1483,8 @@ class MarketplaceEngine:
         intent = self.intents[order.intent_id]
         intent.live_order_id = None
         settlement = self._settle(order, "completed_ride", order.fare.rider_payment_minor,
-                                  order.assignment.payout.driver_payout_minor)
+                                  order.assignment.payout.driver_payout_minor,
+                                  order.assignment.payout.bonus_minor)
         self._notify("platform", order.platform_id, "order_completed", order_id=order.id,
                      settlement_id=settlement.id)
         self._notify("rider", order.rider_id, "order_completed", order_id=order.id,
@@ -1195,10 +1514,156 @@ class MarketplaceEngine:
                     self._finish_shift(driver, shift)
 
     # ----------------------------------------------------------------------
+    # Repositioning and delays (AST-210)
+    # ----------------------------------------------------------------------
+
+    def travel_seconds(self, distance_km, origin):
+        """Travel time for a leg beginning at `origin`, at today's effective speed there. Early
+        returns the identical expression `self.world.travel_seconds(distance_km)` when no speed
+        zone exists -- not an equivalent one -- so every seed-0 `@1` run stays byte-identical."""
+        if not self.speed_zones:
+            return self.world.travel_seconds(distance_km)
+        return distance_km / self.speed_kmh_at(origin) * 3600
+
+    def speed_kmh_at(self, position, at_seconds=None):
+        """`world.speed_kmh` times the multiplier of every active speed zone (in id order, for
+        float determinism) whose closed box contains `position`. A static `world.speed_zones`
+        entry has no end time; a `delay` intervention's ends when its duration elapses."""
+        at_seconds = self.now if at_seconds is None else at_seconds
+        speed = self.world.speed_kmh
+        for record in sorted(self.speed_zones.values(), key=lambda r: r.id):
+            if (record.at <= at_seconds and (record.ends_at is None or at_seconds < record.ends_at)
+                    and record.min[0] <= position[0] <= record.max[0]
+                    and record.min[1] <= position[1] <= record.max[1]):
+                speed *= record.multiplier
+        return speed
+
+    def impose_delay(self, box_min, box_max, multiplier, duration_seconds=None):
+        """A physical speed multiplier over a closed box, from now until `duration_seconds` later
+        (`None` = until the run ends). Legs already in progress are unaffected -- `planned_end` is
+        computed once, in `_begin_leg`. No notification: a delay is physical and public by
+        construction, exactly like `impose_regulation`."""
+        box_min, box_max = point(box_min, "min"), point(box_max, "max")
+        finite(multiplier, "multiplier", strictly_positive=True)
+        if box_max[0] <= box_min[0] or box_max[1] <= box_min[1]:
+            raise CommandRejected("A delay box needs max greater than min on both axes")
+        finite(duration_seconds, "duration_seconds", strictly_positive=True, allow_none=True)
+        with self._transition():
+            record = SpeedZone(self._next_id("speed_zone"), self.now, box_min, box_max, multiplier,
+                               None if duration_seconds is None else self.now + duration_seconds)
+            self.speed_zones[record.id] = record
+        return record
+
+    def reposition(self, driver_id, destination):
+        """Move a driver without any accepted work, to build supply where policy expects it. No
+        settlement, no platform side at all: the only notifications are driver-audience
+        `reposition_started`/`reposition_ended`. A repositioning driver stays `accepting` (unless
+        paused) and is exactly as visible to every platform as a moving on-service driver --
+        `PlatformView.drivers()` reads `car.motion.position_at(now)` either way -- so this leaks
+        nothing into a hidden-state-free candidate list."""
+        driver = self._driver(driver_id)
+        destination = point(destination, "Destination")
+        if driver.shift_id is None:
+            raise CommandRejected(f"Driver {driver_id!r} is not on shift")
+        if driver.deactivated_at is not None:
+            raise CommandRejected(f"Driver {driver_id!r} was deactivated ({driver.deactivation_reason})")
+        if driver.commitments or driver.service_id is not None:
+            raise CommandRejected(f"Driver {driver_id!r} cannot reposition while committed to work")
+        if driver.relocation_id is not None:
+            raise CommandRejected(f"Driver {driver_id!r} is already repositioning")
+        car = self.cars[driver.car_id]
+        origin = car.motion.position_at(self.now)
+        duration = self.travel_seconds(math.dist(origin, destination), origin)
+        with self._transition():
+            record = Relocation(self._next_id("relocation"), driver_id, car.id, self.now)
+            record.legs.append(Leg("reposition", origin, destination, self.now, self.now + duration))
+            self.relocations[record.id] = record
+            driver.relocation_id = record.id
+            car.motion = Motion(origin, destination, self.now, self.now + duration)
+            self.scheduler.schedule_after(duration, "relocation.advance", {"relocation_id": record.id, "leg": 0})
+            self._notify("driver", driver_id, "reposition_started", relocation_id=record.id, origin=origin,
+                         destination=destination, arrives_at=self.now + duration)
+        return record
+
+    def _end_relocation(self, relocation, reason):
+        """End a live relocation wherever the car actually is. Called from `_on_relocation_advance`
+        ("arrived"), `_start_service` ("interrupted" -- an accepted order starts pickup from here),
+        `_finish_shift` ("shift_ended"), and `deactivate_driver` ("deactivated"). Always invoked
+        from inside an already-open transition, exactly like `_end_service`."""
+        driver = self.drivers[relocation.driver_id]
+        car = self.cars[relocation.car_id]
+        position = car.motion.position_at(self.now)
+        relocation.ended_at = self.now
+        relocation.end_reason = reason
+        relocation.end_position = position
+        driver.relocation_id = None
+        car.motion = Motion.idle(position, self.now)
+        self._notify("driver", driver.id, "reposition_ended", relocation_id=relocation.id, reason=reason,
+                     position=position)
+
+    def _on_relocation_advance(self, event):
+        relocation = self.relocations.get(event.payload["relocation_id"])
+        if relocation is None or relocation.ended_at is not None or event.payload["leg"] != len(relocation.legs) - 1:
+            return
+        leg = relocation.legs[-1]
+        if self.now < leg.planned_end:
+            return
+        with self._transition():
+            self._end_relocation(relocation, "arrived")
+
+    # ----------------------------------------------------------------------
     # Cancellation and money
     # ----------------------------------------------------------------------
 
-    def cancel_order(self, order_id, by, reason, *, rider_fee_minor=0, driver_compensation_minor=0):
+    def account(self, role, person_id):
+        """The money account for one platform, driver or rider. Read-only for callers."""
+        return self._lookup(self.accounts, (role, person_id), "Account")
+
+    def _open_account(self, role, person_id, opening_minor=0):
+        self.accounts[(role, person_id)] = Account(role, person_id, opening_minor)
+
+    def _post(self, role, person_id, field, amount_minor):
+        account = self.accounts[(role, person_id)]
+        setattr(account, field, getattr(account, field) + amount_minor)
+
+    def _post_settlement(self, settlement):
+        self._post("platform", settlement.platform_id, "settlement_minor", settlement.platform_contribution_minor)
+        self._post("rider", settlement.rider_id, "settlement_minor", -settlement.rider_payment_minor)
+        if settlement.driver_id is not None:
+            self._post("driver", settlement.driver_id, "settlement_minor", settlement.driver_payout_minor)
+        # else: an assignment-less driver payout has nowhere to post (see metrics.ledger's
+        # unattributed_driver_payout_minor) -- reachable today via a rider cancelling an
+        # unassigned order under driver_cancellation_compensation_minor > 0; rejecting it here
+        # would change legality for scenarios that already authored that parameter.
+
+    def _post_transfer_record(self, transfer):
+        self._post(transfer.role, transfer.person_id, "transfer_minor", transfer.amount_minor)
+        if transfer.counterparty == "platform":
+            self._post("platform", transfer.platform_id, "transfer_minor", -transfer.amount_minor)
+
+    def _rebuild_accounts(self):
+        """Derive every balance from settlements and transfers, never from stored totals.
+
+        Called only by restore(); a continuous run's accounts are already
+        correct from posting as commands executed. Comparing a restored
+        engine's snapshot() (which re-emits accounts from this) against the
+        continuous run's own is therefore a real conservation check, not a
+        tautology -- see plans/architecture/marketplace-engine.md.
+        """
+        self.accounts = {}
+        for platform in self.platforms.values():
+            self._open_account("platform", platform.id, platform.starting_cash_minor)
+        for driver_id in self.drivers:
+            self._open_account("driver", driver_id, 0)
+        for rider_id in self.riders:
+            self._open_account("rider", rider_id, 0)
+        for settlement in sorted(self.settlements.values(), key=lambda s: s.id):
+            self._post_settlement(settlement)
+        for transfer in sorted(self.transfers.values(), key=lambda t: t.id):
+            self._post_transfer_record(transfer)
+
+    def cancel_order(self, order_id, by, reason, *, rider_fee_minor=0, driver_compensation_minor=0,
+                     driver_penalty_minor=0):
         """End an order before boarding. The platform decides permission and fees;
         the engine performs the physical ending and frees only this commitment."""
         order = self._order(order_id)
@@ -1206,6 +1671,9 @@ class MarketplaceEngine:
             raise CommandRejected(f"Cancellation party must be one of {CANCELLATION_PARTIES}")
         minor_units(rider_fee_minor, "rider_fee_minor")
         minor_units(driver_compensation_minor, "driver_compensation_minor")
+        minor_units(driver_penalty_minor, "driver_penalty_minor")
+        if driver_penalty_minor and by != "driver":
+            raise CommandRejected("A cancellation penalty applies only to a driver cancellation")
         if order.terminal:
             raise CommandRejected(f"Order {order_id} is already {order.state}")
         service = self.services.get(order.service_id)
@@ -1237,18 +1705,125 @@ class MarketplaceEngine:
             if driver is not None:
                 self._notify("driver", driver.id, "order_canceled", order_id=order.id,
                              platform_id=order.platform_id, by=by, reason=reason)
+                if driver_penalty_minor:
+                    self.post_transfer("driver_penalty", "driver", driver.id, -driver_penalty_minor,
+                                       platform_id=order.platform_id, order_id=order.id)
                 self._release_commitment(driver, order, "canceled")
         return order
 
-    def _settle(self, order, reason, rider_payment_minor, driver_payout_minor):
+    def _settle(self, order, reason, rider_payment_minor, driver_payout_minor, bonus_minor=0):
+        minor_units(bonus_minor, "bonus_minor")
+        if bonus_minor > driver_payout_minor:
+            raise CommandRejected("bonus_minor cannot exceed the driver payout")
         settlement = Settlement(
             self._next_id("settlement"), self.now, order.id, order.platform_id, order.rider_id,
             order.assignment.driver_id if order.assignment else None, reason,
             rider_payment_minor, driver_payout_minor, rider_payment_minor - driver_payout_minor,
+            bonus_minor,
         )
         self.settlements[settlement.id] = settlement
         order.settlement_ids.append(settlement.id)
+        self._post_settlement(settlement)
+        self._check_solvency(order.platform_id)
         return settlement
+
+    def post_transfer(self, reason, role, person_id, amount_minor, *, platform_id=None,
+                      counterparty="platform", order_id=None, program_id=None):
+        """Move money outside a ride. amount_minor is signed: positive credits the person.
+
+        A platform counterparty debits that platform's account by the same amount, so the
+        party deltas sum to zero; an external counterparty has no platform side and the
+        person's delta IS the declared external amount. Emits no account-balance
+        notification -- only a transfer_posted to the credited person and, for a platform
+        counterparty, to the funding platform (see "Money and observation boundaries").
+        """
+        if reason not in TRANSFER_REASONS:
+            raise CommandRejected(f"Transfer reason must be one of {TRANSFER_REASONS}")
+        if role not in ROLES:
+            raise CommandRejected(f"Transfer role must be one of {ROLES}")
+        self._person(role, person_id)  # existence, CommandRejected on miss
+        minor_units(amount_minor, "amount_minor", minimum=None)
+        if amount_minor == 0:
+            raise CommandRejected("amount_minor must be a nonzero number of minor currency units")
+        if counterparty not in TRANSFER_COUNTERPARTIES:
+            raise CommandRejected(f"Transfer counterparty must be one of {TRANSFER_COUNTERPARTIES}")
+        if counterparty == "platform":
+            self._platform(platform_id)  # rejects None and unknown ids
+        elif platform_id is not None:
+            raise CommandRejected("An external transfer has no platform side")
+        if order_id is not None:
+            order = self._order(order_id)
+            if platform_id is not None and order.platform_id != platform_id:
+                raise CommandRejected(f"Order {order_id} does not belong to platform {platform_id!r}")
+        if program_id is not None and (not isinstance(program_id, str) or not program_id):
+            raise CommandRejected("program_id must be a nonempty string")
+        with self._transition():
+            transfer = Transfer(self._next_id("transfer"), self.now, reason, platform_id, role, person_id,
+                                amount_minor, order_id, program_id, counterparty)
+            self.transfers[transfer.id] = transfer
+            self._post_transfer_record(transfer)
+            self._notify(role, person_id, "transfer_posted", transfer_id=transfer.id, reason=reason,
+                         amount_minor=amount_minor, platform_id=platform_id, order_id=order_id,
+                         program_id=program_id, counterparty=counterparty)
+            if counterparty == "platform":
+                self._notify("platform", platform_id, "transfer_posted", transfer_id=transfer.id, reason=reason,
+                             role=role, person_id=person_id, amount_minor=amount_minor, order_id=order_id,
+                             program_id=program_id)
+                self._check_solvency(platform_id)
+        return transfer
+
+    def shutdown_platform(self, platform_id, reason="platform_shutdown"):
+        """Retire a platform (AST-210): no more launches, quotes, or offers -- `issue_quote`,
+        `place_order`, and `create_offer`/`respond_to_offer` (through `_driver_accepting`) already
+        check `platform.launched`. Every not-yet-boarded order of this platform is canceled and
+        every pending offer resolved (offers first, so an order's own cancellation finds nothing
+        left over to resolve with the wrong reason); every open app session is closed. A boarded
+        ride finishes on frozen terms. Idempotent -- shutting down an already-shut-down platform
+        changes nothing and notifies nothing."""
+        platform = self._platform(platform_id)
+        if not platform.launched:
+            return platform
+        with self._transition():
+            platform.launched = False
+            for offer_id in sorted(oid for oid, o in self.offers.items()
+                                   if o.platform_id == platform_id and o.state == "pending"):
+                self._resolve_offer(self.offers[offer_id], "canceled", reason)
+            for order in sorted((o for o in self.orders.values() if o.platform_id == platform_id and not o.terminal),
+                                key=lambda o: o.id):
+                service = self.services.get(order.service_id)
+                if service is not None and service.ended_at is None and service.phase == "transport":
+                    continue  # a boarded ride finishes on frozen terms
+                self.cancel_order(order.id, "platform", reason)
+            for driver_id in sorted(platform.open_driver_ids):
+                self.close_app("driver", driver_id, platform_id)
+            for rider_id in sorted(platform.open_rider_ids):
+                self.close_app("rider", rider_id, platform_id)
+            self._notify("platform", platform_id, "platform_shutdown", reason=reason)
+        return platform
+
+    def _check_solvency(self, platform_id):
+        """Schedule a zero-delay `platform.insolvency` when a tracked cash balance reaches zero
+        under the `insolvency='shutdown'` rule -- never execute the shutdown inline: `_settle` and
+        `post_transfer` call this from inside `_drop_off`'s or their own transition, and cancelling
+        orders in the middle of one would re-enter a half-applied transition. Scheduling instead
+        runs `shutdown_platform`'s cascade at the same clock instant but outside it. Default-off:
+        with `Platform.insolvency is None` (every preset, every scenario without the rule) this
+        returns on its first line, schedules nothing, and notifies nothing."""
+        platform = self.platforms[platform_id]
+        if platform.insolvency != "shutdown" or not platform.launched:
+            return
+        balance = self.accounts[("platform", platform_id)].balance_minor
+        if balance is not None and balance <= 0:
+            self.scheduler.schedule_after(0, "platform.insolvency", {"platform_id": platform_id})
+
+    def _on_platform_insolvency(self, event):
+        platform_id = event.payload["platform_id"]
+        platform = self.platforms[platform_id]
+        if platform.insolvency != "shutdown" or not platform.launched:
+            return  # already shut down by an earlier same-instant event, or the rule was removed
+        balance = self.accounts[("platform", platform_id)].balance_minor
+        if balance is not None and balance <= 0:
+            self.shutdown_platform(platform_id, "insolvency")
 
     # ----------------------------------------------------------------------
     # Serialization. A market snapshot plus the scheduler's snapshot, taken
@@ -1265,6 +1840,16 @@ class MarketplaceEngine:
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
             "world": asdict(self.world),
             "sequences": {name: next(copy.copy(counter)) for name, counter in self._sequences.items()},
+            # Derived, not authoritative: restore() ignores this list and calls _rebuild_accounts()
+            # instead, so a restored run's own balances are the conservation proof, not an assumption.
+            # Sorted so insertion order (which a snapshot/restore cycle can reorder) never changes the
+            # emitted bytes -- otherwise a continuous run and a restored one could disagree cosmetically.
+            "accounts": [
+                {"role": a.role, "id": a.id, "opening_minor": a.opening_minor,
+                 "settlement_minor": a.settlement_minor, "transfer_minor": a.transfer_minor,
+                 "balance_minor": a.balance_minor}
+                for a in sorted(self.accounts.values(), key=lambda a: (a.role, type(a.id).__name__, str(a.id)))
+            ],
             **tables,
         }
 
@@ -1276,7 +1861,12 @@ class MarketplaceEngine:
         engine = cls(World(**snapshot["world"]), registry)
         for name, factory in _TABLES.items():
             table = getattr(engine, name)
-            for item in snapshot[name]:
+            # .get(name, []), not snapshot[name]: _TABLES gained "transfers" in phase 3 while
+            # SNAPSHOT_SCHEMA_VERSION stayed 2 (additive), so a pre-phase-3 snapshot has no
+            # "transfers" key at all -- same tolerance metrics.py's _tables() and _platform()
+            # below already extend to individual fields. An absent table restores empty and
+            # _rebuild_accounts() then derives correct zero-transfer balances from it.
+            for item in snapshot.get(name, []):
                 record = factory(item)
                 table[record.id] = record
         for name, value in snapshot["sequences"].items():
@@ -1285,6 +1875,7 @@ class MarketplaceEngine:
             if offer.state == "pending":
                 engine._pending_by_order.setdefault(offer.order_id, set()).add(offer.id)
                 engine._pending_by_driver.setdefault(offer.driver_id, set()).add(offer.id)
+        engine._rebuild_accounts()  # derived from settlements/transfers, never from snapshot["accounts"]
         return engine
 
     # ----------------------------------------------------------------------
@@ -1363,8 +1954,12 @@ def _motion(value):
 
 
 def _platform(item):
+    # .get, not [...]: a snapshot taken before starting_cash_minor/insolvency existed still
+    # restores, with the platform's cash untracked (None) and no insolvency rule -- the
+    # TripIntent.source_id precedent.
     return Platform(item["id"], item["name"], item["launched"],
-                    set(item["open_driver_ids"]), set(item["open_rider_ids"]))
+                    set(item["open_driver_ids"]), set(item["open_rider_ids"]), item.get("starting_cash_minor"),
+                    item.get("insolvency"))
 
 
 def _car(item):
@@ -1372,8 +1967,13 @@ def _car(item):
 
 
 def _driver(item):
+    # .get, not [...]: a snapshot taken before paused_apps/relocation_id/deactivated_at existed
+    # still restores, with no driver paused, repositioning, or deactivated -- same tolerance as
+    # TripIntent.source_id / Platform.starting_cash_minor.
     return Driver(item["id"], set(item["apps"]), item["car_id"], set(item["open_apps"]),
-                  item["shift_id"], list(item["commitments"]), item["service_id"], set(item["accounts"]))
+                  item["shift_id"], list(item["commitments"]), item["service_id"], set(item["accounts"]),
+                  set(item.get("paused_apps", ())), item.get("relocation_id"), item.get("deactivated_at"),
+                  item.get("deactivation_reason"))
 
 
 def _rider(item):
@@ -1387,16 +1987,20 @@ def _shift(item):
 
 
 def _intent(item):
+    # .get, not [...]: a snapshot taken before source_id existed still restores, with source_id None.
     return TripIntent(item["id"], item["rider_id"], tuple(item["origin"]), tuple(item["destination"]),
                       item["created_at"], list(item["quote_ids"]), list(item["order_ids"]),
                       item["live_order_id"], item["converted_at"], item["ended_at"],
-                      item["outcome"], item["reason"])
+                      item["outcome"], item["reason"], item.get("source_id"))
 
 
 def _quote(item):
+    # .get, not [...]: a pre-phase-4 snapshot has neither key -- same tolerance as
+    # TripIntent.source_id / Platform.starting_cash_minor above.
     return Quote(item["id"], item["platform_id"], item["intent_id"], item["rider_id"], item["at"],
                  FareTerms(**item["fare"]), item["distance_km"], item["duration_seconds"], item["eta_seconds"],
-                 item["expires_at"], item["policy_version"], item["selected_rule"], item["campaign_id"])
+                 item["expires_at"], item["policy_version"], item["selected_rule"], item["campaign_id"],
+                 item.get("commission_fraction"), item.get("driver_surcharge_minor", 0))
 
 
 def _order(item):
@@ -1424,12 +2028,33 @@ def _service(item):
                    item["boarded_at"], item["ended_at"], item["end_reason"], _opt_point(item["end_position"]))
 
 
+def _relocation(item):
+    legs = [Leg(leg["kind"], tuple(leg["origin"]), tuple(leg["destination"]), leg["started_at"], leg["planned_end"])
+            for leg in item["legs"]]
+    return Relocation(item["id"], item["driver_id"], item["car_id"], item["started_at"], legs,
+                      item["ended_at"], item["end_reason"], _opt_point(item["end_position"]))
+
+
 def _settlement(item):
     return Settlement(**item)
+
+
+def _transfer(item):
+    return Transfer(**item)
+
+
+def _regulation(item):
+    return Regulation(**item)
+
+
+def _speed_zone(item):
+    return SpeedZone(item["id"], item["at"], tuple(item["min"]), tuple(item["max"]), item["multiplier"],
+                     item["ends_at"])
 
 
 _TABLES = {
     "platforms": _platform, "cars": _car, "drivers": _driver, "riders": _rider, "shifts": _shift,
     "intents": _intent, "quotes": _quote, "orders": _order, "offers": _offer, "services": _service,
-    "settlements": _settlement,
+    "relocations": _relocation, "settlements": _settlement, "transfers": _transfer, "regulations": _regulation,
+    "speed_zones": _speed_zone,
 }
